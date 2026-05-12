@@ -37,15 +37,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
-
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release --module src:zh:Dongmanmanhua
+          python ./.github/scripts/generate-build-matrices.py "HEAD~1" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
@@ -92,6 +87,9 @@ jobs:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
           retention-days: 7
+
+      - name: Clean up CI files
+        run: rm signingkey.jks
 
   publish:
     name: Publish extension repo
