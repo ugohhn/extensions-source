@@ -45,7 +45,7 @@ jobs:
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release --module src:zh:Dongmanmanhua
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
@@ -87,19 +87,16 @@ jobs:
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "github.repository == 'keiyoushi/extensions-source'"
+        if: "true"
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
-          retention-days: 1
-
-      - name: Clean up CI files
-        run: rm signingkey.jks
+          retention-days: 7
 
   publish:
     name: Publish extension repo
     needs: [prepare, build]
-    if: "github.repository == 'keiyoushi/extensions-source'"
+    if: "false"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
