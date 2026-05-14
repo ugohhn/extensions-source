@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -9,7 +10,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.tryParse
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
@@ -21,12 +22,16 @@ class DongmanManhua : HttpSource() {
 
     override val name = "Dongman Manhua"
     override val lang get() = "zh-Hans"
-    override val id get() = 7275979680702931948  // 手机版 sourceId（来自 logcat）
+    override val id get() = 7275979680702931948
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+        )
 
     override val client = network.cloudflareClient
 
@@ -54,14 +59,14 @@ class DongmanManhua : HttpSource() {
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val day = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
-            Calendar.SUNDAY    -> "div._list_SUNDAY"
-            Calendar.MONDAY    -> "div._list_MONDAY"
-            Calendar.TUESDAY   -> "div._list_TUESDAY"
+            Calendar.SUNDAY -> "div._list_SUNDAY"
+            Calendar.MONDAY -> "div._list_MONDAY"
+            Calendar.TUESDAY -> "div._list_TUESDAY"
             Calendar.WEDNESDAY -> "div._list_WEDNESDAY"
-            Calendar.THURSDAY  -> "div._list_THURSDAY"
-            Calendar.FRIDAY    -> "div._list_FRIDAY"
-            Calendar.SATURDAY  -> "div._list_SATURDAY"
-            else               -> "div"
+            Calendar.THURSDAY -> "div._list_THURSDAY"
+            Calendar.FRIDAY -> "div._list_FRIDAY"
+            Calendar.SATURDAY -> "div._list_SATURDAY"
+            else -> "div"
         }
         val entries = document
             .select("div#dailyList > $day li > a, ul.daily_card li a")
@@ -71,20 +76,23 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ── 搜索 ─────────────────────────────────────────────────────────────
+    // ── 搜索（POST 请求）─────────────────────────────────────────────────
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = baseUrl.toHttpUrl().newBuilder().apply {
-            addPathSegment("search")
-            addQueryParameter("keyword", query)
-            if (page > 1) addQueryParameter("page", page.toString())
-        }.build()
-        return GET(url, headers)
+        val body = FormBody.Builder()
+            .add("searchType", "WEBTOON")
+            .add("keyword", query)
+            .build()
+        val searchHeaders = headersBuilder()
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/search")
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .build()
+        return POST("$baseUrl/search", searchHeaders, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        // 手机版搜索结果结构：ul._searchResultList li a.cleFix
         val entries = document
             .select("ul._searchResultList li a.cleFix")
             .map(::searchMangaFromElement)
@@ -106,18 +114,6 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── searchMangaFromElement（搜索结果专用）────────────────────────
-    //
-    // 手机版搜索结果 HTML 结构：
-    //   <a class="cleFix" href="//m.dongmanmanhua.cn/FANTASY/.../list?title_no=2795">
-    //     <div class="">
-    //       <div class="fl pic"><img src="https://cdn.dongmanmanhua.cn/...jpg"></div>
-    //       <div class="fl info">
-    //         <p class="subj"><span class="ellipsis">反转练习生</span></p>
-    //       </div>
-    //     </div>
-    //   </a>
-    //
-    // 注意：class="fl info" 中 Jsoup 的 .info 可以匹配（包含关系）
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
@@ -126,9 +122,6 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── 封面图提取（统一逻辑）────────────────────────────────────────
-    //
-    // 优先级：data-image-url → abs:src → data-src → data-original → style url()
-    // 修复原版 bug：原版字节码中赋值和跳转顺序反了，导致懒加载封面始终取不到
 
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img")
@@ -150,7 +143,7 @@ class DongmanManhua : HttpSource() {
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
 
-    // ── 漫画详情（从桌面版完整移植，选择器对手机版做了补充）────────
+    // ── 漫画详情 ──────────────────────────────────────────────────────
 
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
@@ -170,7 +163,7 @@ class DongmanManhua : HttpSource() {
                 when {
                     contains("更新") -> SManga.ONGOING
                     contains("完结") -> SManga.COMPLETED
-                    else             -> SManga.UNKNOWN
+                    else -> SManga.UNKNOWN
                 }
             }
             thumbnail_url = run {
@@ -187,7 +180,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // ── 章节列表（带自动翻页，从桌面版移植）─────────────────────────
+    // ── 章节列表（带自动翻页）─────────────────────────────────────────
 
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
@@ -225,4 +218,3 @@ class DongmanManhua : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 }
-
