@@ -104,7 +104,7 @@ class DongmanManhua : HttpSource() {
     // ── mangaFromElement（首页 / 最新用）─────────────────────────────
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href")) // 使用 absUrl 处理可能的协议相对路径
+        setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02",
         )?.text() ?: element.attr("title").ifEmpty {
@@ -116,12 +116,12 @@ class DongmanManhua : HttpSource() {
     // ── searchMangaFromElement（搜索结果专用）────────────────────────
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href")) // 处理协议相对路径
+        setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面图提取（增强版，支持背景图）────────────────────────────────
+    // ── 封面图提取（终极增强版）────────────────────────────────────────
 
     private fun extractThumbnailUrl(element: Element): String {
         // 1. 尝试从 img 标签获取
@@ -131,25 +131,44 @@ class DongmanManhua : HttpSource() {
             img.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
             img.absUrl("src").takeIf { it.isNotEmpty() }?.let { return it }
             img.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 2. 从父元素或当前元素的 style 中提取 background-image
+        // 2. 从当前元素的 style 中提取 background-image
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 3. 如果有 .pic 或 .thmb 容器，也检查它们的 style
+        // 3. 检查父级容器（.pic, .thmb）的 style 或其子元素
         val picDiv = element.selectFirst(".pic, .thmb")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
             if (picStyle.isNotEmpty()) {
                 extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
             }
+            // 再尝试容器内的 img
+            val picImg = picDiv.selectFirst("img")
+            if (picImg != null) {
+                picImg.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.absUrl("src").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
+                extractUrlFromStyle(picImg.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
+            }
         }
 
-        return "" // 兜底空字符串，避免 null
+        // 4. 尝试从其他可能的属性中直接获取（罕见情况）
+        element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
+
+        // 5. 最终兜底：返回空字符串，不会抛出异常
+        return ""
     }
 
     private fun extractUrlFromStyle(style: String): String {
