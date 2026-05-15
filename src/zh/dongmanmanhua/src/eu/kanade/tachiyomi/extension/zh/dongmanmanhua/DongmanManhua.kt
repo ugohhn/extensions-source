@@ -44,7 +44,7 @@ class DongmanManhua : HttpSource() {
         val document = response.asJsoup()
         val entries = document
             .select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
-            .distinctBy { it.attr("href") }
+            .distinctBy { it.absUrl("href") }
             .filter { it.attr("href").isNotEmpty() }
             .map(::mangaFromElement)
             .filter { it.title.isNotEmpty() }
@@ -104,7 +104,7 @@ class DongmanManhua : HttpSource() {
     // ── mangaFromElement（首页 / 最新用）─────────────────────────────
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.attr("href"))
+        setUrlWithoutDomain(element.absUrl("href")) // 使用 absUrl 处理可能的协议相对路径
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02",
         )?.text() ?: element.attr("title").ifEmpty {
@@ -116,29 +116,52 @@ class DongmanManhua : HttpSource() {
     // ── searchMangaFromElement（搜索结果专用）────────────────────────
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href"))
+        setUrlWithoutDomain(element.absUrl("href")) // 处理协议相对路径
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面图提取（统一逻辑）────────────────────────────────────────
+    // ── 封面图提取（增强版，支持背景图）────────────────────────────────
 
     private fun extractThumbnailUrl(element: Element): String {
-        val img = element.selectFirst(".pic img, img")
-            ?: return extractUrlFromStyle(element.attr("style"))
+        // 1. 尝试从 img 标签获取
+        val img = element.selectFirst(".pic img, img, a img")
+        if (img != null) {
+            img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
+            img.absUrl("src").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+            extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
+        }
 
-        img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
-        img.attr("abs:src").takeIf { it.isNotEmpty() }?.let { return it }
-        img.absUrl("data-src").takeIf { it.isNotEmpty() }?.let { return it }
-        img.absUrl("data-original").takeIf { it.isNotEmpty() }?.let { return it }
-        extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
-        extractUrlFromStyle(element.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
-        return ""
+        // 2. 从父元素或当前元素的 style 中提取 background-image
+        val style = element.attr("style")
+        if (style.isNotEmpty()) {
+            extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
+        }
+
+        // 3. 如果有 .pic 或 .thmb 容器，也检查它们的 style
+        val picDiv = element.selectFirst(".pic, .thmb")
+        if (picDiv != null) {
+            val picStyle = picDiv.attr("style")
+            if (picStyle.isNotEmpty()) {
+                extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
+            }
+        }
+
+        return "" // 兜底空字符串，避免 null
     }
 
     private fun extractUrlFromStyle(style: String): String {
         if (style.isEmpty()) return ""
-        val from = style.indexOf("url(").takeIf { it != -1 }?.plus("url(".length) ?: return ""
+        // 匹配 background-image: url("...") 或 url('...') 或 url(...)
+        val regex = Regex("""background-image\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
+        val match = regex.find(style)
+        if (match != null) {
+            return match.groupValues[1].trim()
+        }
+        // 普通 url(…) 提取
+        val from = style.indexOf("url(").takeIf { it != -1 }?.plus(4) ?: return ""
         val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
@@ -175,7 +198,8 @@ class DongmanManhua : HttpSource() {
                     ?.removeSurrounding("\"")
                     ?.removeSurrounding("'")
                     ?.takeUnless { it.isBlank() }
-                    ?: discoverPic?.selectFirst("img")?.attr("abs:src")
+                    ?: discoverPic?.selectFirst("img")?.absUrl("src")
+                    ?: ""
             }
         }
     }
