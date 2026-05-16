@@ -98,22 +98,27 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
-        // 获取总结果数
         val totalStr = document.select("._totalCount").attr("data-total")
         val total = totalStr.toIntOrNull() ?: 0
 
-        // 安全获取 start 参数（始终返回 Int 类型）
-        val start: Int = run {
-            val body = response.request?.body
-            if (body is FormBody) {
-                body.value("start")?.toIntOrNull() ?: 0
-            } else {
-                0
-            }
-        }
+        // 使用辅助函数获取 start，确保返回 Int 且不会被自动格式化破坏
+        val start = getStartFromResponse(response)
 
         val hasNextPage = total > 0 && (start + entries.size) < total
         return MangasPage(entries, hasNextPage)
+    }
+
+    /**
+     * 安全地从 Response 中提取搜索结果的起始索引（start 参数）
+     * 始终返回 Int，避免类型推断问题。
+     */
+    private fun getStartFromResponse(response: Response): Int {
+        val body = response.request?.body
+        if (body is FormBody) {
+            val startStr = body.value("start") ?: return 0
+            return startStr.toIntOrNull() ?: 0
+        }
+        return 0
     }
 
     // 条目构建
