@@ -99,12 +99,15 @@ class DongmanManhua : HttpSource() {
 
     private fun parseSearchJson(response: Response): MangasPage {
         val body = response.body?.string().orEmpty()
+        android.util.Log.d("DongmanSearch", "body length=${body.length}, preview=${body.take(200)}")
         if (body.isEmpty()) return MangasPage(emptyList(), false)
 
         val entries = mutableListOf<SManga>()
         try {
             val json = JSONObject(body)
+            android.util.Log.d("DongmanSearch", "json keys=${json.keys().asSequence().toList()}")
             val dataArray = json.getJSONArray("titleList")
+            android.util.Log.d("DongmanSearch", "titleList length=${dataArray.length()}")
             for (i in 0 until dataArray.length()) {
                 val item = dataArray.getJSONObject(i)
                 val titleNo = item.optString("titleNo")
@@ -123,10 +126,11 @@ class DongmanManhua : HttpSource() {
                     }
                 })
             }
-        } catch (_: Exception) {
-            // 忽略解析错误
+        } catch (e: Exception) {
+            android.util.Log.e("DongmanSearch", "parse error: ${e.message}", e)
         }
         val hasNextPage = entries.size >= 20
+        android.util.Log.d("DongmanSearch", "entries=${entries.size}, hasNextPage=$hasNextPage")
         return MangasPage(entries, hasNextPage)
     }
 
