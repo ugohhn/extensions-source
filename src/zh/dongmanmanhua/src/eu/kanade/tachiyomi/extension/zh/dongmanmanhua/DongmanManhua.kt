@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
+import android.util.Log
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -27,6 +28,9 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
+    // 存储从搜索页面提取的 CSRF token
+    private var searchToken: String? = null
+
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -41,6 +45,7 @@ class DongmanManhua : HttpSource() {
         GET("$baseUrl/?pageName=home", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
+        Log.d("DongmanDebug", "popularMangaParse: code=${response.code}")
         val document = response.asJsoup()
         val entries = document
             .select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
@@ -48,6 +53,7 @@ class DongmanManhua : HttpSource() {
             .map(::mangaFromElement)
             .filter { it.title.isNotEmpty() }
             .distinctBy { extractTitleNo(it.url) }
+        Log.d("DongmanDebug", "popularMangaParse: entries=${entries.size}")
         return MangasPage(entries, false)
     }
 
@@ -56,6 +62,7 @@ class DongmanManhua : HttpSource() {
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage {
+        Log.d("DongmanDebug", "latestUpdatesParse: code=${response.code}")
         val document = response.asJsoup()
         val day = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
             Calendar.SUNDAY -> "div._list_SUNDAY"
@@ -72,49 +79,95 @@ class DongmanManhua : HttpSource() {
             .map(::mangaFromElement)
             .distinctBy { extractTitleNo(it.url) }
             .filter { it.title.isNotEmpty() }
+        Log.d("DongmanDebug", "latestUpdatesParse: entries=${entries.size}")
         return MangasPage(entries, false)
     }
 
-    // ───────────────────────────── 搜索（支持翻页）──────────────────────────────
+    // ───────────────────────────── 搜索（先获取 token，再 POST）─────────────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val body = FormBody.Builder()
+        // 第一页或 token 为空时，先从搜索页面获取 token
+        if (page == 1 || searchToken == null) {
+            try {
+                val tokenRequest = GET("$baseUrl/search", headers)
+                val tokenResponse = client.newCall(tokenRequest).execute()
+                val doc = tokenResponse.asJsoup()
+                // 尝试多种常见的 token 字段名
+                searchToken = doc.select("input[name='_token']").attr("value")
+                    .ifEmpty { doc.select("input[name='authenticity_token']").attr("value") }
+                    .ifEmpty { doc.select("input[name='csrf_token']").attr("value") }
+                    .ifEmpty { doc.select("input[name='csrfmiddlewaretoken']").attr("value") }
+                    .ifEmpty { null }
+                Log.d("DongmanSearch", "Extracted token: $searchToken")
+                tokenResponse.close()
+            } catch (e: Exception) {
+                Log.e("DongmanSearch", "Failed to fetch token", e)
+            }
+        }
+
+        val start = (page - 1) * 20
+        val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
-            .add("start", ((page - 1) * 20).toString())
-            .build()
+            .add("display", "20")
+            .add("start", start.toString())
 
+        // 如果有 token，则添加到请求体中
+        if (!searchToken.isNullOrEmpty()) {
+            bodyBuilder.add("_token", searchToken!!)
+        }
+
+        val body = bodyBuilder.build()
         val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("Accept", "application/json, text/plain, */*")
+            .set("X-Requested-With", "XMLHttpRequest")
             .build()
 
+        Log.d("DongmanSearch", "POST $baseUrl/searchResult, page=$page, start=$start, token=${searchToken ?: "none"}")
         return POST("$baseUrl/searchResult", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
+        Log.d("DongmanSearch", "searchMangaParse: code=${response.code}")
         return parseSearchJson(response)
     }
 
     private fun parseSearchJson(response: Response): MangasPage {
         val body = response.body?.string().orEmpty()
-        if (body.isEmpty()) return MangasPage(emptyList(), false)
+        Log.d("DongmanSearch", "Response body length=${body.length}, preview=${body.take(500)}")
+
+        if (response.code != 200) {
+            Log.e("DongmanSearch", "HTTP error ${response.code}")
+            return MangasPage(emptyList(), false)
+        }
+        if (body.isEmpty() || !body.trimStart().startsWith("{")) {
+            Log.e("DongmanSearch", "Invalid response (not JSON): ${body.take(300)}")
+            return MangasPage(emptyList(), false)
+        }
 
         val entries = mutableListOf<SManga>()
-        var hasNextPage = false
         try {
             val json = JSONObject(body)
-            val total = json.optInt("total", 0)
-            val start = json.optInt("start", 0)
-            val dataArray = json.getJSONArray("titleList")
+            val dataArray = when {
+                json.has("data") -> json.getJSONArray("data")
+                json.has("titleList") -> json.getJSONArray("titleList")
+                else -> {
+                    Log.e("DongmanSearch", "No data/titleList field, keys: ${json.keys().asSequence().toList()}")
+                    return MangasPage(emptyList(), false)
+                }
+            }
+            Log.d("DongmanSearch", "Array length: ${dataArray.length()}")
             for (i in 0 until dataArray.length()) {
                 val item = dataArray.getJSONObject(i)
                 val titleNo = item.optString("titleNo")
                 val title = item.optString("title")
                 val thumbnail = item.optString("thumbnailMobile")
-
-                if (titleNo.isEmpty()) continue
-
+                if (titleNo.isEmpty()) {
+                    Log.d("DongmanSearch", "Skip item $i: titleNo empty")
+                    continue
+                }
                 entries.add(SManga.create().apply {
                     this.title = title
                     setUrlWithoutDomain("/viewer?titleNo=$titleNo&episodeNo=1")
@@ -124,11 +177,13 @@ class DongmanManhua : HttpSource() {
                         else -> ""
                     }
                 })
+                Log.d("DongmanSearch", "Added: $title (titleNo=$titleNo)")
             }
-            hasNextPage = (start + dataArray.length()) < total
-        } catch (_: Exception) {
-            // 忽略解析错误
+        } catch (e: Exception) {
+            Log.e("DongmanSearch", "JSON parse error: ${e.message}", e)
         }
+        val hasNextPage = entries.size >= 20
+        Log.d("DongmanSearch", "Parsed ${entries.size} items, hasNextPage=$hasNextPage")
         return MangasPage(entries, hasNextPage)
     }
 
@@ -143,9 +198,9 @@ class DongmanManhua : HttpSource() {
             "p.chapter-title-02",
             ".chapter-title-01"
         ).mapNotNull { element.selectFirst(it)?.text()?.takeIf { it.isNotBlank() } }
-         .firstOrNull() ?: element.attr("title").ifEmpty {
-             element.selectFirst("img")?.attr("alt") ?: ""
-         }
+            .firstOrNull() ?: element.attr("title").ifEmpty {
+                element.selectFirst("img")?.attr("alt") ?: ""
+            }
         thumbnail_url = extractThumbnailUrl(element)
     }
 
@@ -211,6 +266,7 @@ class DongmanManhua : HttpSource() {
 
     // ───────────────────────────── 漫画详情 ───────────────────────────────────
     override fun mangaDetailsParse(response: Response): SManga {
+        Log.d("DongmanDebug", "mangaDetailsParse: code=${response.code}")
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
         val infoElement = document.selectFirst("#_asideDetail")
@@ -248,6 +304,7 @@ class DongmanManhua : HttpSource() {
 
     // ───────────────────────────── 章节列表（自动翻页）─────────────────────────
     override fun chapterListParse(response: Response): List<SChapter> {
+        Log.d("DongmanDebug", "chapterListParse: code=${response.code}")
         var document = response.asJsoup()
         var continueParsing = true
         val chapters = mutableListOf<SChapter>()
@@ -261,6 +318,7 @@ class DongmanManhua : HttpSource() {
                 continueParsing = false
             }
         }
+        Log.d("DongmanDebug", "chapterListParse: chapters=${chapters.size}")
         return chapters
     }
 
@@ -274,6 +332,7 @@ class DongmanManhua : HttpSource() {
 
     // ───────────────────────────── 阅读页面 ───────────────────────────────────
     override fun pageListParse(response: Response): List<Page> {
+        Log.d("DongmanDebug", "pageListParse: code=${response.code}")
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
             Page(i, imageUrl = img.attr("data-url").ifEmpty { img.absUrl("src") })
