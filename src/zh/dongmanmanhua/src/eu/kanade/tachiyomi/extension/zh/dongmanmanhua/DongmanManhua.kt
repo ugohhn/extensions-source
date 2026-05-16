@@ -30,7 +30,7 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    // 关键：启用 Cookie 自动管理
+    // 启用 Cookie 自动管理
     override val client = network.cloudflareClient.newBuilder()
         .cookieJar(JavaNetCookieJar(CookieManager()))
         .build()
