@@ -80,8 +80,7 @@ class DongmanManhua : HttpSource() {
             .add("searchType", "WEBTOON")
             .add("keyword", query)
         if (page > 1) {
-            val start = (page - 1) * 20
-            bodyBuilder.add("start", start.toString())
+            bodyBuilder.add("start", ((page - 1) * 20).toString())
         }
         val body = bodyBuilder.build()
         val headers = headersBuilder()
@@ -99,11 +98,19 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
+        // 获取总结果数
         val totalStr = document.select("._totalCount").attr("data-total")
-        val total = if (totalStr.isNotEmpty()) totalStr.toIntOrNull() ?: 0 else 0
+        val total = totalStr.toIntOrNull() ?: 0
 
-        // ★★★ 这一行是关键，必须包含 ?.toIntOrNull() ★★★
-        val start = (response.request?.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
+        // 安全获取 start 参数（始终返回 Int 类型）
+        val start: Int = run {
+            val body = response.request?.body
+            if (body is FormBody) {
+                body.value("start")?.toIntOrNull() ?: 0
+            } else {
+                0
+            }
+        }
 
         val hasNextPage = total > 0 && (start + entries.size) < total
         return MangasPage(entries, hasNextPage)
