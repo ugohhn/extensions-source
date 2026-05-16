@@ -35,7 +35,7 @@ class DongmanManhua : HttpSource() {
 
     override val client = network.cloudflareClient
 
-    // ───────────────────────────── 首页（Popular）────────────────────────────────
+    // 首页（Popular）
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -50,7 +50,7 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ───────────────────────────── 最新更新（Latest）────────────────────────────
+    // 最新更新（Latest）
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -74,13 +74,14 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ───────────────────────────── 搜索（支持分页）──────────────────────────────
+    // 搜索（支持分页）—— 完全类型安全
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
         if (page > 1) {
-            bodyBuilder.add("start", ((page - 1) * 20).toString())
+            val start = (page - 1) * 20
+            bodyBuilder.add("start", start.toString())
         }
         val body = bodyBuilder.build()
         val headers = headersBuilder()
@@ -98,16 +99,23 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
-        // 获取总结果数
-        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
-        // 安全获取 start 参数
-        val start = (response.request.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
+        // 获取总结果数（data-total 属性）
+        val totalStr = document.select("._totalCount").attr("data-total")
+        val total = if (totalStr.isNotEmpty()) totalStr.toIntOrNull() ?: 0 else 0
 
-        val hasNextPage = total > 0 && (start + entries.size) < total
+        // 安全获取请求中的 start 参数（第一页没有则为 0）
+        val start = (response.request?.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
+
+        val hasNextPage = if (total > 0) {
+            (start + entries.size) < total
+        } else {
+            false
+        }
+
         return MangasPage(entries, hasNextPage)
     }
 
-    // ── 条目构建 ──────────────────────────────────────────────────────
+    // 条目构建
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
@@ -124,7 +132,7 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面提取（增强版）──────────────────────────────────────────────
+    // 封面提取（增强版）
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
@@ -182,7 +190,7 @@ class DongmanManhua : HttpSource() {
         return pattern.find(url)?.groupValues?.get(1) ?: url
     }
 
-    // ── 漫画详情 ──────────────────────────────────────────────────────
+    // 漫画详情
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
@@ -218,7 +226,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // ── 章节列表（自动翻页）─────────────────────────────────────────────
+    // 章节列表（自动翻页）
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -227,7 +235,7 @@ class DongmanManhua : HttpSource() {
             document.select("ul#_listUl li").forEach { chapters.add(chapterFromElement(it)) }
             val nextPage = document.select("div.paginate a[onclick] + a")
             if (nextPage.isNotEmpty()) {
-                document = client.newCall(GET(nextPage.attr("abs:href"), headers)).execute().asJsoup()
+                document = client.newCall(GET(nextPage.absUrl("href"), headers)).execute().asJsoup()
             } else {
                 continueParsing = false
             }
@@ -235,7 +243,6 @@ class DongmanManhua : HttpSource() {
         return chapters
     }
 
-    // 修复：date_upload 非空，tryParse 参数非空
     private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
         name = element.selectFirst("span.subj span")!!.text()
         setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
@@ -244,7 +251,7 @@ class DongmanManhua : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // ── 阅读页面 ──────────────────────────────────────────────────────
+    // 阅读页面
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
