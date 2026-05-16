@@ -226,7 +226,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // 章节列表（自动翻页）
+    // 章节列表（自动翻页）—— 已修复 nextPage 类型问题
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -235,7 +235,8 @@ class DongmanManhua : HttpSource() {
             document.select("ul#_listUl li").forEach { chapters.add(chapterFromElement(it)) }
             val nextPage = document.select("div.paginate a[onclick] + a")
             if (nextPage.isNotEmpty()) {
-                document = client.newCall(GET(nextPage.absUrl("href"), headers)).execute().asJsoup()
+                val nextUrl = nextPage.first()!!.absUrl("href")
+                document = client.newCall(GET(nextUrl, headers)).execute().asJsoup()
             } else {
                 continueParsing = false
             }
