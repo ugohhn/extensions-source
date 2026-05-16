@@ -27,9 +27,6 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    // 搜索分页：记录第一页实际条目数
-    private var firstPageSize = 0
-
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -50,7 +47,7 @@ class DongmanManhua : HttpSource() {
             .filter { it.attr("href").isNotEmpty() }
             .map(::mangaFromElement)
             .filter { it.title.isNotEmpty() }
-            .distinctBy { extractTitleNo(it.url) }   // 基于漫画ID去重，消除同一漫画多位置重复
+            .distinctBy { extractTitleNo(it.url) }
         return MangasPage(entries, false)
     }
 
@@ -73,60 +70,31 @@ class DongmanManhua : HttpSource() {
         val entries = document
             .select("div#dailyList > $day li > a, ul.daily_card li a")
             .map(::mangaFromElement)
-            .distinctBy { extractTitleNo(it.url) }   // 基于漫画ID去重
+            .distinctBy { extractTitleNo(it.url) }
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
 
     // ───────────────────────────── 搜索（支持翻页）──────────────────────────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        if (page == 1) firstPageSize = 0
-
-        val bodyBuilder = FormBody.Builder()
+        val body = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
             .add("display", "20")
+            .add("start", ((page - 1) * 20).toString())
+            .build()
 
-        if (page > 1) {
-            val start = if (firstPageSize > 0) {
-                firstPageSize + (page - 2) * 20
-            } else {
-                (page - 1) * 20
-            }
-            bodyBuilder.add("start", start.toString())
-        }
-
-        val body = bodyBuilder.build()
         val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
             .build()
 
-        val url = if (page == 1) "$baseUrl/search" else "$baseUrl/searchResult"
-        return POST(url, headers, body)
+        return POST("$baseUrl/searchResult", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val url = response.request.url.toString()
-        return if (url.contains("/searchResult")) {
-            parseSearchJson(response)
-        } else {
-            parseSearchHtml(response)
-        }
-    }
-
-    private fun parseSearchHtml(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val entries = document
-            .select("ul._searchResultList li a.cleFix")
-            .map(::searchMangaFromElement)
-            .filter { it.title.isNotEmpty() }
-
-        firstPageSize = entries.size
-        // 判断是否有下一页（条目达到20或存在更多按钮）
-        val hasNextPage = entries.size >= 20 || document.selectFirst("div.more_area, div.paginate a[onclick] + a") != null
-        return MangasPage(entries, hasNextPage)
+        return parseSearchJson(response)
     }
 
     private fun parseSearchJson(response: Response): MangasPage {
@@ -162,10 +130,9 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, hasNextPage)
     }
 
-    // ───────────────────────────── 漫画条目构建（首页/最新/搜索共用）────────────
+    // ───────────────────────────── 漫画条目构建（首页/最新共用）────────────────
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
-        // 安全获取标题：优先选择器，若结果为空则回退到 attr("title") 或 img.alt
         title = sequenceOf(
             "p.subj",
             ".subj .ellipsis",
@@ -180,15 +147,8 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href"))
-        title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
-        thumbnail_url = extractThumbnailUrl(element)
-    }
-
     // ───────────────────────────── 封面提取（增强版）────────────────────────────
     private fun extractThumbnailUrl(element: Element): String {
-        // 1. 从 img 标签获取
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
             img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
@@ -200,13 +160,11 @@ class DongmanManhua : HttpSource() {
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 2. 从元素自身的 style 中提取
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 3. 检查父级容器（.pic, .thmb, .chapter-img-c）的 style 或内部 img
         val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
@@ -225,7 +183,6 @@ class DongmanManhua : HttpSource() {
             }
         }
 
-        // 4. 直接提取元素属性中的图片URL（罕见情况）
         element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
         element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
         element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
@@ -235,19 +192,16 @@ class DongmanManhua : HttpSource() {
 
     private fun extractUrlFromStyle(style: String): String {
         if (style.isEmpty()) return ""
-        // 同时匹配 background 和 background-image
         val regex = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
         val match = regex.find(style)
         if (match != null) {
             return match.groupValues[1].trim()
         }
-        // 兜底：普通 url(…) 提取
         val from = style.indexOf("url(").takeIf { it != -1 }?.plus(4) ?: return ""
         val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
 
-    // 从 URL 中提取漫画真实 ID（用于去重）
     private fun extractTitleNo(url: String): String {
         val pattern = Regex("""titleNo[=:](\d+)""")
         return pattern.find(url)?.groupValues?.get(1) ?: url
