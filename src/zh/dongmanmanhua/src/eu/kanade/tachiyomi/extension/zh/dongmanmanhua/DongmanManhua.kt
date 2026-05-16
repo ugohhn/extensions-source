@@ -14,6 +14,7 @@ import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -26,6 +27,9 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
+    // 搜索分页：记录第一页实际条目数
+    private var firstPageSize = 0
+
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -36,7 +40,6 @@ class DongmanManhua : HttpSource() {
     override val client = network.cloudflareClient
 
     // ── 首页（Popular）──────────────────────────────────────────────────
-
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -52,7 +55,6 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── 最新更新（Latest）───────────────────────────────────────────────
-
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -76,37 +78,93 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ── 搜索（POST 请求）─────────────────────────────────────────────────
-
+    // ── 搜索（POST 请求，支持翻页）───────────────────────────────────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val body = FormBody.Builder()
+        if (page == 1) firstPageSize = 0
+
+        val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
-            .build()
+            .add("display", "20")
+
+        if (page > 1) {
+            val start = if (firstPageSize > 0) {
+                firstPageSize + (page - 2) * 20
+            } else {
+                (page - 1) * 20
+            }
+            bodyBuilder.add("start", start.toString())
+        }
+
+        val body = bodyBuilder.build()
         val searchHeaders = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
             .build()
-        return POST("$baseUrl/search", searchHeaders, body)
+
+        val url = if (page == 1) "$baseUrl/search" else "$baseUrl/searchResult"
+        return POST(url, searchHeaders, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
+        val url = response.request.url.toString()
+        return if (url.contains("/searchResult")) {
+            parseSearchJson(response)
+        } else {
+            parseSearchHtml(response)
+        }
+    }
+
+    private fun parseSearchHtml(response: Response): MangasPage {
         val document = response.asJsoup()
         val entries = document
             .select("ul._searchResultList li a.cleFix")
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
+
+        firstPageSize = entries.size
         val hasNextPage = document.selectFirst("div.more_area, div.paginate a[onclick] + a") != null
         return MangasPage(entries, hasNextPage)
     }
 
-    // ── mangaFromElement（首页 / 最新用）─────────────────────────────
+    private fun parseSearchJson(response: Response): MangasPage {
+        val body = response.body?.string().orEmpty()
+        if (body.isEmpty()) return MangasPage(emptyList(), false)
 
+        val entries = mutableListOf<SManga>()
+        try {
+            val json = JSONObject(body)
+            val dataArray = json.getJSONArray("data")
+            for (i in 0 until dataArray.length()) {
+                val item = dataArray.getJSONObject(i)
+                val titleNo = item.optString("titleNo")
+                val title = item.optString("title")
+                val thumbnail = item.optString("thumbnailMobile")
+
+                if (titleNo.isEmpty()) continue
+
+                entries.add(SManga.create().apply {
+                    this.title = title
+                    setUrlWithoutDomain("/viewer?titleNo=$titleNo&episodeNo=1")
+                    thumbnail_url = when {
+                        thumbnail.startsWith("http") -> thumbnail
+                        thumbnail.isNotEmpty() -> "https://cdn.dongmanmanhua.cn$thumbnail"
+                        else -> ""
+                    }
+                })
+            }
+        } catch (_: Exception) {
+        }
+        val hasNextPage = entries.size >= 20
+        return MangasPage(entries, hasNextPage)
+    }
+
+    // ── mangaFromElement（首页 / 最新用）─────────────────────────────
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
-            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02, .chapter-title-01",
+            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02",
         )?.text() ?: element.attr("title").ifEmpty {
             element.selectFirst("img")?.attr("alt") ?: ""
         }
@@ -114,58 +172,64 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── searchMangaFromElement（搜索结果专用）────────────────────────
-
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面图提取（终极版 - 兼容 background 简写）─────────────────────
-
+    // ── 封面图提取（仅修复正则，支持 background 简写）──────────────────
     private fun extractThumbnailUrl(element: Element): String {
         // 1. 尝试从 img 标签获取
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
             img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
             img.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
-            img.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
+            img.absUrl("src").takeIf { it.isNotEmpty() }?.let { return it }
             img.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 2. 从元素自身的 style 中提取（支持 background 简写）
+        // 2. 从当前元素的 style 中提取 background-image
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 3. 检查父级容器（.pic, .thmb, .chapter-img-c）的 style
-        val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
+        // 3. 检查父级容器（.pic, .thmb）的 style 或其子元素
+        val picDiv = element.selectFirst(".pic, .thmb")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
             if (picStyle.isNotEmpty()) {
                 extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
             }
-            // 再检查容器内是否有 img 标签
+            // 再尝试容器内的 img
             val picImg = picDiv.selectFirst("img")
             if (picImg != null) {
                 picImg.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
                 picImg.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
-                picImg.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
+                picImg.absUrl("src").takeIf { it.isNotEmpty() }?.let { return it }
                 picImg.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
                 extractUrlFromStyle(picImg.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
             }
         }
 
-        // 4. 兜底：返回空字符串，避免 null
+        // 4. 尝试从其他可能的属性中直接获取（罕见情况）
+        element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
+
         return ""
     }
 
     // 改进的 style 解析函数 - 同时匹配 background 和 background-image
     private fun extractUrlFromStyle(style: String): String {
         if (style.isEmpty()) return ""
-        // 匹配 background: url("...") 或 background-image: url("...") 或 url('...') 或 url(...)
+        // 匹配 background: url(...) 或 background-image: url(...)
         val regex = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
         val match = regex.find(style)
         if (match != null) {
@@ -178,7 +242,6 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── 漫画详情 ──────────────────────────────────────────────────────
-
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
@@ -216,7 +279,6 @@ class DongmanManhua : HttpSource() {
     }
 
     // ── 章节列表（带自动翻页）─────────────────────────────────────────
-
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -243,7 +305,6 @@ class DongmanManhua : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ── 阅读页面 ─────────────────────────────────────────────────────────
-
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
