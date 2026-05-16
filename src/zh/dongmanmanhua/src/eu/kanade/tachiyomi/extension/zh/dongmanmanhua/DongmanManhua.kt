@@ -76,6 +76,7 @@ class DongmanManhua : HttpSource() {
     }
 
     // 搜索：全部使用 /searchResult JSON 接口，start = (page-1) * 20
+    // 必须携带 X-Requested-With: XMLHttpRequest，否则服务器返回 500
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val start = (page - 1) * 20
         val body = FormBody.Builder()
@@ -87,6 +88,7 @@ class DongmanManhua : HttpSource() {
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("X-Requested-With", "XMLHttpRequest")
             .build()
         return POST("$baseUrl/searchResult", headers, body)
     }
@@ -114,7 +116,6 @@ class DongmanManhua : HttpSource() {
             }
         }
 
-        // 服务器返回的 start + display < total 则还有下一页
         val hasNextPage = (start + display) < total
         return MangasPage(entries, hasNextPage)
     }
