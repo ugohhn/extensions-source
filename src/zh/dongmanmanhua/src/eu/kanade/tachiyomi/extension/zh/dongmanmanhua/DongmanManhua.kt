@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
-import android.util.Log
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -15,7 +14,6 @@ import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
-import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -76,83 +74,49 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ───────────────────────────── 搜索（JSON 接口 + 分页）─────────────────────────
+    // ───────────────────────────── 搜索（支持分页）──────────────────────────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val start = (page - 1) * 20
-        val body = FormBody.Builder()
+        val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
-            .add("start", start.toString())
-            .build()
-        val headers = headersBuilder()
+        // 第二页及以后，添加 start 参数（每页20条）
+        if (page > 1) {
+            val start = (page - 1) * 20
+            bodyBuilder.add("start", start.toString())
+        }
+        val body = bodyBuilder.build()
+        val searchHeaders = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
-            .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            .set("Accept", "*/*")
-            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Content-Type", "application/x-www-form-urlencoded")
             .build()
-        Log.d("DongmanSearch", "Request page $page, start=$start")
-        return POST("$baseUrl/searchResult", headers, body)
+        return POST("$baseUrl/search", searchHeaders, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val body = response.body?.string().orEmpty()
-        Log.d("DongmanSearch", "Response code: ${response.code}, body length: ${body.length}")
-        if (response.code != 200 || body.isEmpty()) {
-            Log.e("DongmanSearch", "Empty or error response")
-            return MangasPage(emptyList(), false)
-        }
-        if (!body.trimStart().startsWith("{")) {
-            Log.e("DongmanSearch", "Not JSON, fallback to HTML")
-            val document = response.asJsoup()
-            val entries = document.select("ul._searchResultList li a.cleFix").map(::searchMangaFromElement).filter { it.title.isNotEmpty() }
-            // 降级：HTML 分页判断（保留）
-            val hasNextPage = document.selectFirst("div.more_area, div.paginate a[onclick] + a") != null
-            return MangasPage(entries, hasNextPage)
-        }
+        val document = response.asJsoup()
+        val entries = document
+            .select("ul._searchResultList li a.cleFix")
+            .map(::searchMangaFromElement)
+            .filter { it.title.isNotEmpty() }
 
-        val entries = mutableListOf<SManga>()
-        var total = 0
-        var start = 0
-        var display = 20
-        try {
-            val json = JSONObject(body)
-            total = json.optInt("total", 0)
-            start = json.optInt("start", 0)
-            display = json.optInt("display", 20)
-            Log.d("DongmanSearch", "total=$total, start=$start, display=$display")
+        // 获取总结果数（例如 <strong class="_totalCount" data-total="116">116</strong>）
+        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
 
-            val dataArray = json.optJSONArray("titleList") ?: json.optJSONArray("data")
-            if (dataArray != null) {
-                for (i in 0 until dataArray.length()) {
-                    val item = dataArray.getJSONObject(i)
-                    val titleNo = item.optString("titleNo")
-                    if (titleNo.isNotEmpty()) {
-                        entries.add(SManga.create().apply {
-                            title = item.optString("title")
-                            setUrlWithoutDomain("/viewer?titleNo=$titleNo&episodeNo=1")
-                            thumbnail_url = item.optString("thumbnailMobile").let { thumb ->
-                                when {
-                                    thumb.startsWith("http") -> thumb
-                                    thumb.isNotEmpty() -> "https://cdn.dongmanmanhua.cn$thumb"
-                                    else -> ""
-                                }
-                            }
-                        })
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e("DongmanSearch", "JSON parse error", e)
-            return MangasPage(emptyList(), false)
+        // 从请求中获取 start 参数（第一页没有 start，默认为 0）
+        val start = (response.request.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
+
+        // 判断是否有下一页：当前页起始索引 + 本页实际条目数 < 总条数
+        val hasNextPage = if (total > 0) {
+            (start + entries.size) < total
+        } else {
+            false
         }
 
-        val hasNextPage = (start + display) < total
-        Log.d("DongmanSearch", "Parsed ${entries.size} items, hasNextPage=$hasNextPage")
         return MangasPage(entries, hasNextPage)
     }
 
-    // ───────────────────────────── 漫画条目构建（首页/最新共用）────────────────
+    // ── mangaFromElement（首页 / 最新用）─────────────────────────────
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
@@ -163,47 +127,54 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
+    // ── searchMangaFromElement（搜索结果专用）────────────────────────
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
 
+    // ── 封面图提取（终极版 - 兼容 background 简写和延迟加载）────────────
     private fun extractThumbnailUrl(element: Element): String {
+        // 1. 尝试从 img 标签获取
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
             img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
             img.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
             img.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
             img.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+            img.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
+        // 2. 从元素自身的 style 中提取（支持 background 简写）
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
+        // 3. 检查父级容器（.pic, .thmb, .chapter-img-c）的 style
         val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
             if (picStyle.isNotEmpty()) {
                 extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
             }
+            // 再检查容器内是否有 img 标签
             val picImg = picDiv.selectFirst("img")
             if (picImg != null) {
                 picImg.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
                 picImg.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
                 picImg.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
                 picImg.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
+                picImg.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
                 extractUrlFromStyle(picImg.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
             }
         }
 
-        element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
-        element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
-        element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
-
+        // 4. 兜底：返回空字符串
         return ""
     }
 
@@ -211,7 +182,9 @@ class DongmanManhua : HttpSource() {
         if (style.isEmpty()) return ""
         val regex = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
         val match = regex.find(style)
-        if (match != null) return match.groupValues[1].trim()
+        if (match != null) {
+            return match.groupValues[1].trim()
+        }
         val from = style.indexOf("url(").takeIf { it != -1 }?.plus(4) ?: return ""
         val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
@@ -222,7 +195,7 @@ class DongmanManhua : HttpSource() {
         return pattern.find(url)?.groupValues?.get(1) ?: url
     }
 
-    // ───────────────────────────── 漫画详情 ───────────────────────────────────
+    // ── 漫画详情 ──────────────────────────────────────────────────────
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
@@ -258,7 +231,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // ───────────────────────────── 章节列表（自动翻页）─────────────────────────
+    // ── 章节列表（自动翻页）─────────────────────────────────────────────
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -283,7 +256,7 @@ class DongmanManhua : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // ───────────────────────────── 阅读页面 ───────────────────────────────────
+    // ── 阅读页面 ──────────────────────────────────────────────────────
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
