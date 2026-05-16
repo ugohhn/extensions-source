@@ -79,7 +79,6 @@ class DongmanManhua : HttpSource() {
         val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
-        // 第二页及以后，添加 start 参数（每页20条）
         if (page > 1) {
             val start = (page - 1) * 20
             bodyBuilder.add("start", start.toString())
@@ -100,13 +99,12 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
-        // 获取总结果数（例如 <strong class="_totalCount" data-total="116">116</strong>）
+        // 获取总结果数
         val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
 
-        // 从请求中获取 start 参数（第一页没有 start，默认为 0）
+        // 获取请求中的 start 参数（第一页没有该参数则为 0）
         val start = (response.request.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
 
-        // 判断是否有下一页：当前页起始索引 + 本页实际条目数 < 总条数
         val hasNextPage = if (total > 0) {
             (start + entries.size) < total
         } else {
@@ -134,9 +132,8 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面图提取（终极版 - 兼容 background 简写和延迟加载）────────────
+    // ── 封面图提取（终极版）───────────────────────────────────────────
     private fun extractThumbnailUrl(element: Element): String {
-        // 1. 尝试从 img 标签获取
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
             img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
@@ -148,20 +145,17 @@ class DongmanManhua : HttpSource() {
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 2. 从元素自身的 style 中提取（支持 background 简写）
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
 
-        // 3. 检查父级容器（.pic, .thmb, .chapter-img-c）的 style
         val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
             if (picStyle.isNotEmpty()) {
                 extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
             }
-            // 再检查容器内是否有 img 标签
             val picImg = picDiv.selectFirst("img")
             if (picImg != null) {
                 picImg.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
@@ -174,7 +168,10 @@ class DongmanManhua : HttpSource() {
             }
         }
 
-        // 4. 兜底：返回空字符串
+        element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
+        element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
+
         return ""
     }
 
@@ -182,9 +179,7 @@ class DongmanManhua : HttpSource() {
         if (style.isEmpty()) return ""
         val regex = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
         val match = regex.find(style)
-        if (match != null) {
-            return match.groupValues[1].trim()
-        }
+        if (match != null) return match.groupValues[1].trim()
         val from = style.indexOf("url(").takeIf { it != -1 }?.plus(4) ?: return ""
         val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
