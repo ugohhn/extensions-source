@@ -97,30 +97,9 @@ class DongmanManhua : HttpSource() {
             .select("ul._searchResultList li a.cleFix")
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
-
-        val totalStr = document.select("._totalCount").attr("data-total")
-        val total = totalStr.toIntOrNull() ?: 0
-
-        val start = getStartFromResponse(response)
-
-        val hasNextPage = total > 0 && (start + entries.size) < total
+        // 每页固定20条，拿满20条就认为有下一页
+        val hasNextPage = entries.size >= 20
         return MangasPage(entries, hasNextPage)
-    }
-
-    /**
-     * 从 FormBody 中按字段名查找 start 值。
-     * FormBody.value() 只接受 Int 下标，不接受字段名，须先用 name(i) 定位。
-     */
-    private fun getStartFromResponse(response: Response): Int {
-        val body = response.request?.body
-        if (body is FormBody) {
-            for (i in 0 until body.size) {
-                if (body.name(i) == "start") {
-                    return body.value(i).toIntOrNull() ?: 0
-                }
-            }
-        }
-        return 0
     }
 
     // 条目构建
