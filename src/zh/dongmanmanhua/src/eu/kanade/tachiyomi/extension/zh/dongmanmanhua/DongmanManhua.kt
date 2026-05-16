@@ -14,8 +14,6 @@ import keiyoushi.utils.tryParse
 import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.JavaNetCookieJar
-import java.net.CookieManager
 import org.jsoup.nodes.Element
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -30,10 +28,10 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    // 启用 Cookie 自动管理
-    override val client = network.cloudflareClient.newBuilder()
-        .cookieJar(JavaNetCookieJar(CookieManager()))
-        .build()
+    // 使用默认的 client（支持自动重定向等，但不自动管理 Cookie，我们手动管理）
+    override val client = network.cloudflareClient
+
+    private var sessionCookie: String? = null  // 存储从预热请求中获取的 Cookie
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -83,7 +81,7 @@ class DongmanManhua : HttpSource() {
 
     // ───────────────────────────── 搜索（精确模拟浏览器）─────────────────────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // 第一页：先 POST /search 建立会话
+        // 第一页：先 POST /search 建立会话并获取 Cookie
         if (page == 1) {
             try {
                 val initBody = FormBody.Builder()
@@ -96,8 +94,20 @@ class DongmanManhua : HttpSource() {
                     .set("Referer", "$baseUrl/search")
                     .build()
                 val initRequest = POST("$baseUrl/search", initHeaders, initBody)
-                client.newCall(initRequest).execute().close()
-                Log.d("DongmanSearch", "Session initialized via POST /search")
+                val initResponse = client.newCall(initRequest).execute()
+                // 提取 Cookie
+                val cookies = initResponse.headers("Set-Cookie")
+                if (cookies.isNotEmpty()) {
+                    // 只保留需要的字段（排除 JSESSIONID）
+                    val filtered = cookies.joinToString("; ") { cookie ->
+                        cookie.substringBefore(";")  // 取 name=value 部分
+                    }.split("; ")
+                        .filter { !it.startsWith("JSESSIONID=") }
+                        .joinToString("; ")
+                    sessionCookie = filtered
+                    Log.d("DongmanSearch", "Session cookie: $sessionCookie")
+                }
+                initResponse.close()
             } catch (e: Exception) {
                 Log.e("DongmanSearch", "Failed to init session", e)
             }
@@ -116,6 +126,9 @@ class DongmanManhua : HttpSource() {
             .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .set("Accept", "*/*")
             .set("X-Requested-With", "XMLHttpRequest")
+            .apply {
+                sessionCookie?.let { set("Cookie", it) }
+            }
             .build()
 
         Log.d("DongmanSearch", "POST /searchResult, start=$start")
