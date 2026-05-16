@@ -101,7 +101,6 @@ class DongmanManhua : HttpSource() {
         val totalStr = document.select("._totalCount").attr("data-total")
         val total = totalStr.toIntOrNull() ?: 0
 
-        // 使用辅助函数获取 start，确保返回 Int 且不会被自动格式化破坏
         val start = getStartFromResponse(response)
 
         val hasNextPage = total > 0 && (start + entries.size) < total
@@ -109,14 +108,17 @@ class DongmanManhua : HttpSource() {
     }
 
     /**
-     * 安全地从 Response 中提取搜索结果的起始索引（start 参数）
-     * 始终返回 Int，避免类型推断问题。
+     * 从 FormBody 中按字段名查找 start 值。
+     * FormBody.value() 只接受 Int 下标，不接受字段名，须先用 name(i) 定位。
      */
     private fun getStartFromResponse(response: Response): Int {
         val body = response.request?.body
         if (body is FormBody) {
-            val startStr = body.value("start") ?: return 0
-            return startStr.toIntOrNull() ?: 0
+            for (i in 0 until body.size) {
+                if (body.name(i) == "start") {
+                    return body.value(i).toIntOrNull() ?: 0
+                }
+            }
         }
         return 0
     }
