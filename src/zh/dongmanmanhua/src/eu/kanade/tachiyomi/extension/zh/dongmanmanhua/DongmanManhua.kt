@@ -104,7 +104,7 @@ class DongmanManhua : HttpSource() {
         val entries = mutableListOf<SManga>()
         try {
             val json = JSONObject(body)
-            val dataArray = json.getJSONArray("data")
+            val dataArray = json.getJSONArray("titleList")
             for (i in 0 until dataArray.length()) {
                 val item = dataArray.getJSONObject(i)
                 val titleNo = item.optString("titleNo")
