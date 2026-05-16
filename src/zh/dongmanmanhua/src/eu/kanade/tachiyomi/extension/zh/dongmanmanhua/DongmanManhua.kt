@@ -28,9 +28,6 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    // 存储从搜索页面提取的 CSRF token
-    private var searchToken: String? = null
-
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -83,107 +80,102 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // ───────────────────────────── 搜索（先获取 token，再 POST）─────────────────
+    // ───────────────────────────── 搜索（关键修复：无 display，无 token）─────────
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // 第一页或 token 为空时，先从搜索页面获取 token
-        if (page == 1 || searchToken == null) {
-            try {
-                val tokenRequest = GET("$baseUrl/search", headers)
-                val tokenResponse = client.newCall(tokenRequest).execute()
-                val doc = tokenResponse.asJsoup()
-                // 尝试多种常见的 token 字段名
-                searchToken = doc.select("input[name='_token']").attr("value")
-                    .ifEmpty { doc.select("input[name='authenticity_token']").attr("value") }
-                    .ifEmpty { doc.select("input[name='csrf_token']").attr("value") }
-                    .ifEmpty { doc.select("input[name='csrfmiddlewaretoken']").attr("value") }
-                    .ifEmpty { null }
-                Log.d("DongmanSearch", "Extracted token: $searchToken")
-                tokenResponse.close()
-            } catch (e: Exception) {
-                Log.e("DongmanSearch", "Failed to fetch token", e)
-            }
-        }
-
         val start = (page - 1) * 20
-        val bodyBuilder = FormBody.Builder()
+        Log.d("DongmanSearch", "searchRequest: page=$page, start=$start, query=$query")
+
+        // 严格按照抓包：只有 searchType, keyword, start，没有 display
+        val body = FormBody.Builder()
             .add("searchType", "WEBTOON")
             .add("keyword", query)
-            .add("display", "20")
             .add("start", start.toString())
+            .build()
 
-        // 如果有 token，则添加到请求体中
-        if (!searchToken.isNullOrEmpty()) {
-            bodyBuilder.add("_token", searchToken!!)
-        }
-
-        val body = bodyBuilder.build()
         val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .set("Accept", "application/json, text/plain, */*")
+            .set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+            .set("Accept", "*/*")
             .set("X-Requested-With", "XMLHttpRequest")
+            .set("If-Modified-Since", "Thu, 1 Jan 1970 00:00:00 GMT")
+            .set("sec-ch-ua", "\"Chromium\";v=\"139\", \"Not;A=Brand\";v=\"99\"")
+            .set("sec-ch-ua-mobile", "?1")
+            .set("sec-ch-ua-platform", "\"Android\"")
+            .set("Sec-Fetch-Site", "same-origin")
+            .set("Sec-Fetch-Mode", "cors")
+            .set("Sec-Fetch-Dest", "empty")
+            .set("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6")
             .build()
 
-        Log.d("DongmanSearch", "POST $baseUrl/searchResult, page=$page, start=$start, token=${searchToken ?: "none"}")
         return POST("$baseUrl/searchResult", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        Log.d("DongmanSearch", "searchMangaParse: code=${response.code}")
+        Log.d("DongmanSearch", "searchParse: code=${response.code}")
         return parseSearchJson(response)
     }
 
     private fun parseSearchJson(response: Response): MangasPage {
         val body = response.body?.string().orEmpty()
-        Log.d("DongmanSearch", "Response body length=${body.length}, preview=${body.take(500)}")
+        Log.d("DongmanSearch", "parseJson: len=${body.length}, preview=${body.take(300)}")
 
         if (response.code != 200) {
-            Log.e("DongmanSearch", "HTTP error ${response.code}")
+            Log.e("DongmanSearch", "HTTP ${response.code}")
             return MangasPage(emptyList(), false)
         }
         if (body.isEmpty() || !body.trimStart().startsWith("{")) {
-            Log.e("DongmanSearch", "Invalid response (not JSON): ${body.take(300)}")
+            Log.e("DongmanSearch", "Not JSON")
             return MangasPage(emptyList(), false)
         }
 
         val entries = mutableListOf<SManga>()
+        var total = 0
+        var start = 0
+        var display = 20
         try {
             val json = JSONObject(body)
+            total = json.optInt("total", 0)
+            start = json.optInt("start", 0)
+            display = json.optInt("display", 20)
+
             val dataArray = when {
-                json.has("data") -> json.getJSONArray("data")
                 json.has("titleList") -> json.getJSONArray("titleList")
+                json.has("data") -> json.getJSONArray("data")
                 else -> {
-                    Log.e("DongmanSearch", "No data/titleList field, keys: ${json.keys().asSequence().toList()}")
+                    Log.e("DongmanSearch", "No titleList/data")
                     return MangasPage(emptyList(), false)
                 }
             }
-            Log.d("DongmanSearch", "Array length: ${dataArray.length()}")
+            Log.d("DongmanSearch", "total=$total, start=$start, display=$display, arraySize=${dataArray.length()}")
+
             for (i in 0 until dataArray.length()) {
                 val item = dataArray.getJSONObject(i)
                 val titleNo = item.optString("titleNo")
                 val title = item.optString("title")
                 val thumbnail = item.optString("thumbnailMobile")
-                if (titleNo.isEmpty()) {
-                    Log.d("DongmanSearch", "Skip item $i: titleNo empty")
-                    continue
+                if (titleNo.isNotEmpty()) {
+                    entries.add(SManga.create().apply {
+                        this.title = title
+                        setUrlWithoutDomain("/viewer?titleNo=$titleNo&episodeNo=1")
+                        thumbnail_url = when {
+                            thumbnail.startsWith("http") -> thumbnail
+                            thumbnail.isNotEmpty() -> "https://cdn.dongmanmanhua.cn$thumbnail"
+                            else -> ""
+                        }
+                    })
                 }
-                entries.add(SManga.create().apply {
-                    this.title = title
-                    setUrlWithoutDomain("/viewer?titleNo=$titleNo&episodeNo=1")
-                    thumbnail_url = when {
-                        thumbnail.startsWith("http") -> thumbnail
-                        thumbnail.isNotEmpty() -> "https://cdn.dongmanmanhua.cn$thumbnail"
-                        else -> ""
-                    }
-                })
-                Log.d("DongmanSearch", "Added: $title (titleNo=$titleNo)")
             }
         } catch (e: Exception) {
-            Log.e("DongmanSearch", "JSON parse error: ${e.message}", e)
+            Log.e("DongmanSearch", "parse error", e)
         }
-        val hasNextPage = entries.size >= 20
-        Log.d("DongmanSearch", "Parsed ${entries.size} items, hasNextPage=$hasNextPage")
+
+        val hasNextPage = if (total > 0 && display > 0) {
+            (start + display) < total
+        } else {
+            entries.size >= 20
+        }
+        Log.d("DongmanSearch", "Parsed ${entries.size}, hasNext=$hasNextPage")
         return MangasPage(entries, hasNextPage)
     }
 
