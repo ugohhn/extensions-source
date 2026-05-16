@@ -74,7 +74,7 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 搜索（支持分页）—— 完全类型安全
+    // 搜索（支持分页）
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
@@ -99,19 +99,13 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
-        // 获取总结果数（data-total 属性）
         val totalStr = document.select("._totalCount").attr("data-total")
         val total = if (totalStr.isNotEmpty()) totalStr.toIntOrNull() ?: 0 else 0
 
-        // 安全获取请求中的 start 参数（第一页没有则为 0）
+        // ★★★ 这一行是关键，必须包含 ?.toIntOrNull() ★★★
         val start = (response.request?.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
 
-        val hasNextPage = if (total > 0) {
-            (start + entries.size) < total
-        } else {
-            false
-        }
-
+        val hasNextPage = total > 0 && (start + entries.size) < total
         return MangasPage(entries, hasNextPage)
     }
 
@@ -132,7 +126,7 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // 封面提取（增强版）
+    // 封面提取
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
@@ -144,12 +138,10 @@ class DongmanManhua : HttpSource() {
             img.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
             extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
         }
-
         val style = element.attr("style")
         if (style.isNotEmpty()) {
             extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
         }
-
         val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
         if (picDiv != null) {
             val picStyle = picDiv.attr("style")
@@ -167,11 +159,9 @@ class DongmanManhua : HttpSource() {
                 extractUrlFromStyle(picImg.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
             }
         }
-
         element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
         element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
         element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
-
         return ""
     }
 
@@ -226,7 +216,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // 章节列表（自动翻页）—— 已修复 nextPage 类型问题
+    // 章节列表（自动翻页）
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
