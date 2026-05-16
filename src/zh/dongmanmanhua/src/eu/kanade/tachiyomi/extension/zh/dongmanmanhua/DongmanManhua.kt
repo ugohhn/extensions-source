@@ -84,12 +84,12 @@ class DongmanManhua : HttpSource() {
             bodyBuilder.add("start", start.toString())
         }
         val body = bodyBuilder.build()
-        val searchHeaders = headersBuilder()
+        val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
             .build()
-        return POST("$baseUrl/search", searchHeaders, body)
+        return POST("$baseUrl/search", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -99,22 +99,24 @@ class DongmanManhua : HttpSource() {
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
 
-        // 获取总结果数
+        // 总结果数（data-total 属性）
         val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
 
-        // 获取请求中的 start 参数（第一页没有该参数则为 0）
-        val start = (response.request.body as? FormBody)?.value("start")?.toIntOrNull() ?: 0
-
-        val hasNextPage = if (total > 0) {
-            (start + entries.size) < total
-        } else {
-            false
+        // 当前页起始索引（从请求中获取 start 参数，没有则为 0）
+        val start = run {
+            val body = response.request.body
+            if (body is FormBody) {
+                body.value("start")?.toIntOrNull() ?: 0
+            } else {
+                0
+            }
         }
 
+        val hasNextPage = total > 0 && (start + entries.size) < total
         return MangasPage(entries, hasNextPage)
     }
 
-    // ── mangaFromElement（首页 / 最新用）─────────────────────────────
+    // ── 条目构建 ──────────────────────────────────────────────────────
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
@@ -125,14 +127,13 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── searchMangaFromElement（搜索结果专用）────────────────────────
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // ── 封面图提取（终极版）───────────────────────────────────────────
+    // ── 封面提取（增强版）──────────────────────────────────────────────
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
