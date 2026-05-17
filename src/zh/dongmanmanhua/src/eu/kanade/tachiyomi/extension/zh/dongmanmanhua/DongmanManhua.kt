@@ -14,6 +14,7 @@ import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -72,30 +73,49 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
+    // v3修复点：全部走/searchResult JSON接口，不再用/search HTML
+    // start=0会500，从1开始：start = 1 + (page-1)*20
+    // 必须带X-Requested-With: XMLHttpRequest
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val bodyBuilder = FormBody.Builder()
-            .add("searchType", "WEBTOON")
+        val start = 1 + (page - 1) * 20
+        val body = FormBody.Builder()
             .add("keyword", query)
-        if (page > 1) {
-            bodyBuilder.add("start", ((page - 1) * 20).toString())
-        }
-        val body = bodyBuilder.build()
+            .add("searchType", "WEBTOON")
+            .add("start", start.toString())
+            .build()
         val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("X-Requested-With", "XMLHttpRequest")
             .build()
-        return POST("$baseUrl/search", headers, body)
+        return POST("$baseUrl/searchResult", headers, body)
     }
 
-    // v2修复点：不依赖._totalCount，直接用条目数>=20判断hasNextPage
     override fun searchMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val entries = document
-            .select("ul._searchResultList li a.cleFix")
-            .map(::searchMangaFromElement)
-            .filter { it.title.isNotEmpty() }
-        val hasNextPage = entries.size >= 20
+        val json = JSONObject(response.body.string())
+        val total = json.optInt("total", 0)
+        val start = json.optInt("start", 0)
+        val titleList = json.optJSONArray("titleList")
+
+        val entries = mutableListOf<SManga>()
+        if (titleList != null) {
+            for (i in 0 until titleList.length()) {
+                val item = titleList.getJSONObject(i)
+                val manga = SManga.create().apply {
+                    val titleNo = item.optString("titleNo", "")
+                    url = "/list?title_no=$titleNo"
+                    title = item.optString("title", "")
+                    thumbnail_url = item.optString("thumbnail", "")
+                        .ifEmpty { item.optString("thumbnailMobile", "") }
+                        .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") }
+                }
+                if (manga.title.isNotEmpty()) entries.add(manga)
+            }
+        }
+
+        // start是1-based，已显示条数 = start - 1 + 本页条数
+        val hasNextPage = (start - 1 + (titleList?.length() ?: 0)) < total
         return MangasPage(entries, hasNextPage)
     }
 
