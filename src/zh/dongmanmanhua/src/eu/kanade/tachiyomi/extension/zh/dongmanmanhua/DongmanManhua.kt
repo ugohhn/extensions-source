@@ -14,7 +14,6 @@ import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
-import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -36,7 +35,6 @@ class DongmanManhua : HttpSource() {
 
     override val client = network.cloudflareClient
 
-    // 首页（Popular）
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -51,7 +49,6 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 最新更新（Latest）
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -75,52 +72,51 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 搜索：全部使用 /searchResult JSON 接口，start = (page-1) * 20
-    // 必须携带 X-Requested-With: XMLHttpRequest，否则服务器返回 500
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val start = (page - 1) * 20
-        val body = FormBody.Builder()
-            .add("keyword", query)
+        val bodyBuilder = FormBody.Builder()
             .add("searchType", "WEBTOON")
-            .add("start", start.toString())
-            .build()
+            .add("keyword", query)
+        if (page > 1) {
+            bodyBuilder.add("start", ((page - 1) * 20).toString())
+        }
+        val body = bodyBuilder.build()
         val headers = headersBuilder()
             .set("Origin", baseUrl)
             .set("Referer", "$baseUrl/search")
             .set("Content-Type", "application/x-www-form-urlencoded")
-            .set("X-Requested-With", "XMLHttpRequest")
             .build()
-        return POST("$baseUrl/searchResult", headers, body)
+        return POST("$baseUrl/search", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val json = JSONObject(response.body.string())
-        val total = json.optInt("total", 0)
-        val start = json.optInt("start", 0)
-        val display = json.optInt("display", 20)
-        val titleList = json.optJSONArray("titleList")
-
-        val entries = mutableListOf<SManga>()
-        if (titleList != null) {
-            for (i in 0 until titleList.length()) {
-                val item = titleList.getJSONObject(i)
-                val manga = SManga.create().apply {
-                    val titleNo = item.optString("titleNo", "")
-                    url = "/list?title_no=$titleNo"
-                    title = item.optString("title", "")
-                    thumbnail_url = item.optString("thumbnail", "")
-                        .ifEmpty { item.optString("thumbnailMobile", "") }
-                        .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") }
-                }
-                if (manga.title.isNotEmpty()) entries.add(manga)
-            }
+        val document = response.asJsoup()
+        val entries = document
+            .select("ul._searchResultList li a.cleFix")
+            .map(::searchMangaFromElement)
+            .filter { it.title.isNotEmpty() }
+        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
+        val hasNextPage = if (total > 0) {
+            entries.size >= 20 && entries.size < total
+        } else {
+            document.selectFirst("div.more_area, div.paginate a[onclick] + a") != null
         }
-
-        val hasNextPage = (start + display) < total
         return MangasPage(entries, hasNextPage)
     }
 
-    // 条目构建
+    // v1修复点：FormBody.value()只接受Int下标，不接受字段名String
+    // 须先用name(i)定位，再用value(i)取值
+    private fun getStartFromResponse(response: Response): Int {
+        val body = response.request?.body
+        if (body is FormBody) {
+            for (i in 0 until body.size) {
+                if (body.name(i) == "start") {
+                    return body.value(i).toIntOrNull() ?: 0
+                }
+            }
+        }
+        return 0
+    }
+
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
@@ -137,7 +133,6 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // 封面提取
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
@@ -191,7 +186,6 @@ class DongmanManhua : HttpSource() {
         return pattern.find(url)?.groupValues?.get(1) ?: url
     }
 
-    // 漫画详情
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
@@ -227,7 +221,6 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // 章节列表（自动翻页）
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -253,7 +246,6 @@ class DongmanManhua : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // 阅读页面
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
