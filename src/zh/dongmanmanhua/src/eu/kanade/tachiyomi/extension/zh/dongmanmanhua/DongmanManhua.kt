@@ -27,6 +27,8 @@ class DongmanManhua : HttpSource() {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
+    private val cdnBase = "https://cdn.dongmanmanhua.cn"
+
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -36,7 +38,6 @@ class DongmanManhua : HttpSource() {
 
     override val client = network.cloudflareClient
 
-    // 首页（Popular）
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -51,7 +52,6 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 最新更新（Latest）
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -75,16 +75,10 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 搜索
-    //
-    // 第1页：POST /search → HTML，包含小说+漫画混合，共约24条
-    // 第2页起：POST /searchResult → JSON，只含漫画（searchType=WEBTOON）
-    //   start = 上一页累计条目数（含小说）+ 1，动态维护，不能用 (page-1)*20
-    //   必须带 X-Requested-With: XMLHttpRequest，否则返回500
-    //   start=0 会500，start=1 起有效
-    //
-    // nextStartMap：key=关键词, value=下一页的start值
-    // 在 parse 时计算存入，在 request 时取出使用，避免成员变量跨搜索污染
+    // 搜索：双接口
+    // page=1  → POST /search HTML（含小说+漫画混合）
+    // page>=2 → POST /searchResult JSON（漫画，需过滤APP-only）
+    // nextStartMap：key=关键词，value=下一页start，parse时存入，request时取出
     private val nextStartMap = mutableMapOf<String, Int>()
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -125,8 +119,7 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // 解析 /search 返回的 HTML（第1页）
-    // 保留所有条目（小说+漫画），不过滤
+    // 第1页 HTML：保留所有条目（小说+漫画），封面由 extractThumbnailUrl 处理（已是完整URL）
     private fun parseSearchHtml(response: Response): MangasPage {
         val document = response.asJsoup()
         val allItems = document.select("ul._searchResultList > li")
@@ -149,44 +142,62 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, hasNextPage)
     }
 
-    // 解析 /searchResult 返回的 JSON（第2页起，只含漫画）
+    // 第2页起 JSON：过滤 APP-only 条目，补全封面 CDN 域名
     private fun parseSearchResultJson(response: Response): MangasPage {
         val json = JSONObject(response.body.string())
         val total = json.optInt("total", 0)
         val start = json.optInt("start", 0)
         val titleList = json.optJSONArray("titleList")
-        val returnedCount = titleList?.length() ?: 0
+        val rawCount = titleList?.length() ?: 0
 
         val entries = mutableListOf<SManga>()
         if (titleList != null) {
             for (i in 0 until titleList.length()) {
                 val item = titleList.getJSONObject(i)
+
+                // 过滤仅APP可见的作品
+                val platform = item.optString("displayPlatform", "ALL")
+                if (platform != "ALL" && platform != "WEB") continue
+
                 val manga = SManga.create().apply {
                     val titleNo = item.optString("titleNo", "")
                     url = "/list?title_no=$titleNo"
                     title = item.optString("title", "")
-                    thumbnail_url = item.optString("thumbnail", "")
-                        .ifEmpty { item.optString("thumbnailMobile", "") }
-                        .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") }
+                    // thumbnailMobile 是相对路径，补全 CDN 域名
+                    thumbnail_url = buildThumbnailUrl(
+                        item.optString("thumbnailMobile", "")
+                            .ifEmpty { item.optString("thumbnail", "") }
+                            .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") },
+                    )
                 }
                 if (manga.title.isNotEmpty()) entries.add(manga)
             }
         }
 
-        // start 是1-based，已显示条数 = start - 1 + 本页条数
-        val hasNextPage = returnedCount > 0 && (start - 1 + returnedCount) < total
+        // start 是 1-based：已显示条数 = start - 1 + 本页原始条数（含被过滤的）
+        val hasNextPage = rawCount > 0 && (start - 1 + rawCount) < total
 
         if (hasNextPage) {
             val keyword = extractKeywordFromBody(response)
             if (keyword.isNotEmpty()) {
-                nextStartMap[keyword] = start + returnedCount
+                nextStartMap[keyword] = start + rawCount
             }
         }
 
         return MangasPage(entries, hasNextPage)
     }
 
-    // 从请求 body 里取回 keyword，用作 nextStartMap 的 key
+    // 补全相对路径为完整 CDN URL
+    private fun buildThumbnailUrl(raw: String): String {
+        if (raw.isEmpty()) return ""
+        return when {
+            raw.startsWith("http") -> raw
+            raw.startsWith("//") -> "https:$raw"
+            raw.startsWith("/") -> "$cdnBase$raw"
+            else -> raw
+        }
+    }
+
     private fun extractKeywordFromBody(response: Response): String {
         val body = response.request.body
         if (body is FormBody) {
@@ -197,7 +208,6 @@ class DongmanManhua : HttpSource() {
         return ""
     }
 
-    // 条目构建
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
@@ -214,7 +224,6 @@ class DongmanManhua : HttpSource() {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    // 封面提取
     private fun extractThumbnailUrl(element: Element): String {
         val img = element.selectFirst(".pic img, img, a img")
         if (img != null) {
@@ -268,7 +277,6 @@ class DongmanManhua : HttpSource() {
         return pattern.find(url)?.groupValues?.get(1) ?: url
     }
 
-    // 漫画详情
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
         val detailElement = document.selectFirst(".detail_header .info")
@@ -304,7 +312,6 @@ class DongmanManhua : HttpSource() {
         }
     }
 
-    // 章节列表（自动翻页）
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         var continueParsing = true
@@ -330,7 +337,6 @@ class DongmanManhua : HttpSource() {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // 阅读页面
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
         return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
