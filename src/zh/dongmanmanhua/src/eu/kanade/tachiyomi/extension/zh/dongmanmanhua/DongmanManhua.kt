@@ -1,7 +1,10 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -9,6 +12,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import okhttp3.FormBody
 import okhttp3.Request
@@ -19,7 +23,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
-class DongmanManhua : HttpSource() {
+class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override val name = "Dongman Manhua"
     override val lang get() = "zh-Hans"
@@ -29,6 +33,23 @@ class DongmanManhua : HttpSource() {
 
     private val cdnBase = "https://cdn.dongmanmanhua.cn"
 
+    private val preferences by getPreferencesLazy()
+
+    // ── 设置页 ──────────────────────────────────────────────────────────────
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = PREF_COOKIE
+            title = "Cookie（登录后粘贴）"
+            summary = "浏览器登录咚漫后，复制完整 Cookie 字符串到这里，用于访问已购付费章节\n当前值：${preferences.getString(PREF_COOKIE, "").orEmpty().take(40).ifEmpty { "（未设置）" }}"
+            dialogTitle = "设置 Cookie"
+            setDefaultValue("")
+        }.also(screen::addPreference)
+    }
+
+    private fun cookieHeader(): String =
+        preferences.getString(PREF_COOKIE, "").orEmpty()
+
+    // ── Headers ─────────────────────────────────────────────────────────────
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set(
@@ -38,6 +59,7 @@ class DongmanManhua : HttpSource() {
 
     override val client = network.cloudflareClient
 
+    // ── 首页 ─────────────────────────────────────────────────────────────────
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -52,6 +74,7 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
+    // ── 最新更新 ──────────────────────────────────────────────────────────────
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -75,9 +98,8 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 全部使用 /searchResult JSON 接口
+    // ── 搜索（全部用 /searchResult JSON） ─────────────────────────────────────
     // start=0 → 500，从 1 开始：start = 1 + (page-1)*20
-    // 必须带 X-Requested-With: XMLHttpRequest
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val start = 1 + (page - 1) * 20
         val body = FormBody.Builder()
@@ -104,16 +126,12 @@ class DongmanManhua : HttpSource() {
         if (titleList != null) {
             for (i in 0 until titleList.length()) {
                 val item = titleList.getJSONObject(i)
-
-                // 过滤仅APP可见的作品，只保留网页版可见的
                 val platform = item.optString("displayPlatform", "ALL")
                 if (platform != "ALL" && platform != "WEB") continue
-
                 val manga = SManga.create().apply {
                     val titleNo = item.optString("titleNo", "")
                     url = "/list?title_no=$titleNo"
                     title = item.optString("title", "")
-                    // thumbnailMobile 是相对路径，需补全 CDN 域名
                     thumbnail_url = buildThumbnailUrl(
                         item.optString("thumbnailMobile", "")
                             .ifEmpty { item.optString("thumbnail", "") }
@@ -123,13 +141,87 @@ class DongmanManhua : HttpSource() {
                 if (manga.title.isNotEmpty()) entries.add(manga)
             }
         }
-
-        // start 是 1-based，已显示条数 = start - 1 + 本页条数
         val hasNextPage = (start - 1 + (titleList?.length() ?: 0)) < total
         return MangasPage(entries, hasNextPage)
     }
 
-    // 补全相对路径为完整 CDN URL
+    // ── 漫画详情 ──────────────────────────────────────────────────────────────
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = response.asJsoup()
+        val detailElement = document.selectFirst(".detail_header .info")
+        val infoElement = document.selectFirst("#_asideDetail")
+        return SManga.create().apply {
+            title = document.selectFirst("h1.subj, h3.subj")!!.text()
+            author = detailElement?.selectFirst(".author:nth-of-type(1)")?.ownText()
+                ?: detailElement?.selectFirst(".author_area")?.ownText()
+            artist = detailElement?.selectFirst(".author:nth-of-type(2)")?.ownText()
+                ?: detailElement?.selectFirst(".author_area")?.ownText()
+                ?: author
+            genre = detailElement?.select(".genre").orEmpty().joinToString { it.text() }
+            description = infoElement?.selectFirst("p.summary")?.text()
+            status = with(infoElement?.selectFirst("p.day_info")?.text().orEmpty()) {
+                when {
+                    contains("更新") -> SManga.ONGOING
+                    contains("完结") -> SManga.COMPLETED
+                    else -> SManga.UNKNOWN
+                }
+            }
+            thumbnail_url = run {
+                val picElement = document.selectFirst("div.detail_body, div.thmb")
+                val discoverPic = document.selectFirst("span.thmb, div.thmb")
+                picElement?.attr("style")
+                    ?.substringAfter("url(")
+                    ?.substringBeforeLast(")")
+                    ?.removeSurrounding("\"")
+                    ?.removeSurrounding("'")
+                    ?.takeUnless { it.isBlank() }
+                    ?: discoverPic?.selectFirst("img")?.absUrl("src")
+                    ?: ""
+            }
+        }
+    }
+
+    // ── 章节列表（携带 Cookie，用于付费章节） ─────────────────────────────────
+    override fun chapterListParse(response: Response): List<SChapter> {
+        var document = response.asJsoup()
+        var continueParsing = true
+        val chapters = mutableListOf<SChapter>()
+        while (continueParsing) {
+            document.select("ul#_listUl li").forEach { chapters.add(chapterFromElement(it)) }
+            val nextPage = document.select("div.paginate a[onclick] + a")
+            if (nextPage.isNotEmpty()) {
+                val nextUrl = nextPage.first()!!.absUrl("href")
+                val reqHeaders = headersBuilder().apply {
+                    val cookie = cookieHeader()
+                    if (cookie.isNotEmpty()) set("Cookie", cookie)
+                }.build()
+                document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
+            } else {
+                continueParsing = false
+            }
+        }
+        return chapters
+    }
+
+    private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
+        name = element.selectFirst("span.subj span")!!.text()
+        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
+        date_upload = dateFormat.tryParse(element.selectFirst("span.date")?.text().orEmpty()) ?: 0L
+    }
+
+    private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
+
+    // ── 阅读页面（携带 Cookie，用于付费章节图片） ──────────────────────────────
+    override fun pageListParse(response: Response): List<Page> {
+        val document = response.asJsoup()
+        return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
+            Page(i, imageUrl = img.attr("data-url").ifEmpty { img.absUrl("src") })
+        }
+    }
+
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    // ── 工具函数 ──────────────────────────────────────────────────────────────
     private fun buildThumbnailUrl(raw: String): String {
         if (raw.isEmpty()) return ""
         return when {
@@ -209,72 +301,7 @@ class DongmanManhua : HttpSource() {
         return pattern.find(url)?.groupValues?.get(1) ?: url
     }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        val detailElement = document.selectFirst(".detail_header .info")
-        val infoElement = document.selectFirst("#_asideDetail")
-        return SManga.create().apply {
-            title = document.selectFirst("h1.subj, h3.subj")!!.text()
-            author = detailElement?.selectFirst(".author:nth-of-type(1)")?.ownText()
-                ?: detailElement?.selectFirst(".author_area")?.ownText()
-            artist = detailElement?.selectFirst(".author:nth-of-type(2)")?.ownText()
-                ?: detailElement?.selectFirst(".author_area")?.ownText()
-                ?: author
-            genre = detailElement?.select(".genre").orEmpty().joinToString { it.text() }
-            description = infoElement?.selectFirst("p.summary")?.text()
-            status = with(infoElement?.selectFirst("p.day_info")?.text().orEmpty()) {
-                when {
-                    contains("更新") -> SManga.ONGOING
-                    contains("完结") -> SManga.COMPLETED
-                    else -> SManga.UNKNOWN
-                }
-            }
-            thumbnail_url = run {
-                val picElement = document.selectFirst("div.detail_body, div.thmb")
-                val discoverPic = document.selectFirst("span.thmb, div.thmb")
-                picElement?.attr("style")
-                    ?.substringAfter("url(")
-                    ?.substringBeforeLast(")")
-                    ?.removeSurrounding("\"")
-                    ?.removeSurrounding("'")
-                    ?.takeUnless { it.isBlank() }
-                    ?: discoverPic?.selectFirst("img")?.absUrl("src")
-                    ?: ""
-            }
-        }
+    companion object {
+        private const val PREF_COOKIE = "pref_cookie"
     }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        var document = response.asJsoup()
-        var continueParsing = true
-        val chapters = mutableListOf<SChapter>()
-        while (continueParsing) {
-            document.select("ul#_listUl li").forEach { chapters.add(chapterFromElement(it)) }
-            val nextPage = document.select("div.paginate a[onclick] + a")
-            if (nextPage.isNotEmpty()) {
-                val nextUrl = nextPage.first()!!.absUrl("href")
-                document = client.newCall(GET(nextUrl, headers)).execute().asJsoup()
-            } else {
-                continueParsing = false
-            }
-        }
-        return chapters
-    }
-
-    private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
-        name = element.selectFirst("span.subj span")!!.text()
-        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
-        date_upload = dateFormat.tryParse(element.selectFirst("span.date")?.text().orEmpty()) ?: 0L
-    }
-
-    private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
-
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
-            Page(i, imageUrl = img.attr("data-url").ifEmpty { img.absUrl("src") })
-        }
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 }
