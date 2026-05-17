@@ -75,87 +75,37 @@ class DongmanManhua : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    // 搜索：双接口
-    // page=1  → POST /search HTML（含小说+漫画混合）
-    // page>=2 → POST /searchResult JSON（漫画，需过滤APP-only）
-    // nextStartMap：key=关键词，value=下一页start，parse时存入，request时取出
-    private val nextStartMap = mutableMapOf<String, Int>()
-
+    // 全部使用 /searchResult JSON 接口
+    // start=0 → 500，从 1 开始：start = 1 + (page-1)*20
+    // 必须带 X-Requested-With: XMLHttpRequest
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return if (page == 1) {
-            nextStartMap.remove(query)
-            val body = FormBody.Builder()
-                .add("searchType", "WEBTOON")
-                .add("keyword", query)
-                .build()
-            val headers = headersBuilder()
-                .set("Origin", baseUrl)
-                .set("Referer", "$baseUrl/search")
-                .set("Content-Type", "application/x-www-form-urlencoded")
-                .build()
-            POST("$baseUrl/search", headers, body)
-        } else {
-            val start = nextStartMap[query] ?: (1 + (page - 1) * 20)
-            val body = FormBody.Builder()
-                .add("keyword", query)
-                .add("searchType", "WEBTOON")
-                .add("start", start.toString())
-                .build()
-            val headers = headersBuilder()
-                .set("Origin", baseUrl)
-                .set("Referer", "$baseUrl/search")
-                .set("Content-Type", "application/x-www-form-urlencoded")
-                .set("X-Requested-With", "XMLHttpRequest")
-                .build()
-            POST("$baseUrl/searchResult", headers, body)
-        }
+        val start = 1 + (page - 1) * 20
+        val body = FormBody.Builder()
+            .add("keyword", query)
+            .add("searchType", "WEBTOON")
+            .add("start", start.toString())
+            .build()
+        val headers = headersBuilder()
+            .set("Origin", baseUrl)
+            .set("Referer", "$baseUrl/search")
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .build()
+        return POST("$baseUrl/searchResult", headers, body)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        return if (response.request.url.toString().contains("/searchResult")) {
-            parseSearchResultJson(response)
-        } else {
-            parseSearchHtml(response)
-        }
-    }
-
-    // 第1页 HTML：保留所有条目（小说+漫画），封面由 extractThumbnailUrl 处理（已是完整URL）
-    private fun parseSearchHtml(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val allItems = document.select("ul._searchResultList > li")
-        val totalEntries = allItems.size
-
-        val entries = allItems
-            .mapNotNull { li -> li.selectFirst("a.cleFix")?.let { searchMangaFromElement(it) } }
-            .filter { it.title.isNotEmpty() }
-
-        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
-        val hasNextPage = total > totalEntries
-
-        if (hasNextPage) {
-            val keyword = extractKeywordFromBody(response)
-            if (keyword.isNotEmpty()) {
-                nextStartMap[keyword] = totalEntries + 1
-            }
-        }
-
-        return MangasPage(entries, hasNextPage)
-    }
-
-    // 第2页起 JSON：过滤 APP-only 条目，补全封面 CDN 域名
-    private fun parseSearchResultJson(response: Response): MangasPage {
         val json = JSONObject(response.body.string())
         val total = json.optInt("total", 0)
         val start = json.optInt("start", 0)
         val titleList = json.optJSONArray("titleList")
-        val rawCount = titleList?.length() ?: 0
 
         val entries = mutableListOf<SManga>()
         if (titleList != null) {
             for (i in 0 until titleList.length()) {
                 val item = titleList.getJSONObject(i)
 
-                // 过滤仅APP可见的作品
+                // 过滤仅APP可见的作品，只保留网页版可见的
                 val platform = item.optString("displayPlatform", "ALL")
                 if (platform != "ALL" && platform != "WEB") continue
 
@@ -163,7 +113,7 @@ class DongmanManhua : HttpSource() {
                     val titleNo = item.optString("titleNo", "")
                     url = "/list?title_no=$titleNo"
                     title = item.optString("title", "")
-                    // thumbnailMobile 是相对路径，补全 CDN 域名
+                    // thumbnailMobile 是相对路径，需补全 CDN 域名
                     thumbnail_url = buildThumbnailUrl(
                         item.optString("thumbnailMobile", "")
                             .ifEmpty { item.optString("thumbnail", "") }
@@ -174,16 +124,8 @@ class DongmanManhua : HttpSource() {
             }
         }
 
-        // start 是 1-based：已显示条数 = start - 1 + 本页原始条数（含被过滤的）
-        val hasNextPage = rawCount > 0 && (start - 1 + rawCount) < total
-
-        if (hasNextPage) {
-            val keyword = extractKeywordFromBody(response)
-            if (keyword.isNotEmpty()) {
-                nextStartMap[keyword] = start + rawCount
-            }
-        }
-
+        // start 是 1-based，已显示条数 = start - 1 + 本页条数
+        val hasNextPage = (start - 1 + (titleList?.length() ?: 0)) < total
         return MangasPage(entries, hasNextPage)
     }
 
@@ -196,16 +138,6 @@ class DongmanManhua : HttpSource() {
             raw.startsWith("/") -> "$cdnBase$raw"
             else -> raw
         }
-    }
-
-    private fun extractKeywordFromBody(response: Response): String {
-        val body = response.request.body
-        if (body is FormBody) {
-            for (i in 0 until body.size) {
-                if (body.name(i) == "keyword") return body.value(i)
-            }
-        }
-        return ""
     }
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
