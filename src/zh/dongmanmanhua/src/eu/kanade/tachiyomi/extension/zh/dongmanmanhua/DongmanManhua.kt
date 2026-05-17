@@ -88,33 +88,15 @@ class DongmanManhua : HttpSource() {
         return POST("$baseUrl/search", headers, body)
     }
 
+    // v2修复点：不依赖._totalCount，直接用条目数>=20判断hasNextPage
     override fun searchMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val entries = document
             .select("ul._searchResultList li a.cleFix")
             .map(::searchMangaFromElement)
             .filter { it.title.isNotEmpty() }
-        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
-        val hasNextPage = if (total > 0) {
-            entries.size >= 20 && entries.size < total
-        } else {
-            document.selectFirst("div.more_area, div.paginate a[onclick] + a") != null
-        }
+        val hasNextPage = entries.size >= 20
         return MangasPage(entries, hasNextPage)
-    }
-
-    // v1修复点：FormBody.value()只接受Int下标，不接受字段名String
-    // 须先用name(i)定位，再用value(i)取值
-    private fun getStartFromResponse(response: Response): Int {
-        val body = response.request?.body
-        if (body is FormBody) {
-            for (i in 0 until body.size) {
-                if (body.name(i) == "start") {
-                    return body.value(i).toIntOrNull() ?: 0
-                }
-            }
-        }
-        return 0
     }
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
