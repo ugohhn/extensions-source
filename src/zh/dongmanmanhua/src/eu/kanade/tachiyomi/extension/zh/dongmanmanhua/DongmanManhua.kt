@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -15,6 +16,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import okhttp3.FormBody
+import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
@@ -35,31 +37,58 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val preferences by getPreferencesLazy()
 
-    // ── 设置页 ──────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 设置页
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+
+        // 1. User-Agent 切换
+        ListPreference(screen.context).apply {
+            key = PREF_UA
+            title = "User-Agent"
+            summary = "%s"
+            entries = arrayOf("移动版（默认）", "Windows Firefox", "禁用 User-Agent")
+            entryValues = arrayOf(UA_MOBILE, UA_DESKTOP, "")
+            setDefaultValue(UA_MOBILE)
+        }.also(screen::addPreference)
+
+        // 2. 手动 Cookie
         EditTextPreference(screen.context).apply {
             key = PREF_COOKIE
             title = "Cookie（登录后粘贴）"
-            summary = "浏览器登录咚漫后，复制完整 Cookie 字符串到这里，用于访问已购付费章节\n当前值：${preferences.getString(PREF_COOKIE, "").orEmpty().take(40).ifEmpty { "（未设置）" }}"
+            summary = "从浏览器复制完整 Cookie 字符串到这里，用于访问已购付费章节\n当前值：${previewCookie(preferences.getString(PREF_COOKIE, ""))}"
             dialogTitle = "设置 Cookie"
             setDefaultValue("")
         }.also(screen::addPreference)
     }
 
+    private fun previewCookie(cookie: String?): String =
+        cookie?.take(40)?.ifEmpty { "（未设置）" } ?: "（未设置）"
+
     private fun cookieHeader(): String =
         preferences.getString(PREF_COOKIE, "").orEmpty()
 
-    // ── Headers ─────────────────────────────────────────────────────────────
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set(
-            "User-Agent",
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
-        )
+    private fun currentUserAgent(): String =
+        preferences.getString(PREF_UA, UA_MOBILE) ?: UA_MOBILE
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Headers
+    // ══════════════════════════════════════════════════════════════════════
+
+    override fun headersBuilder(): Headers.Builder {
+        val builder = super.headersBuilder().set("Referer", "$baseUrl/")
+        val ua = currentUserAgent()
+        if (ua.isNotEmpty()) builder.set("User-Agent", ua)
+        return builder
+    }
 
     override val client = network.cloudflareClient
 
-    // ── 首页 ─────────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 首页（Popular）
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
 
@@ -74,7 +103,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return MangasPage(entries, false)
     }
 
-    // ── 最新更新 ──────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 最新更新（Latest）
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -98,8 +130,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return MangasPage(entries, false)
     }
 
-    // ── 搜索（全部用 /searchResult JSON） ─────────────────────────────────────
-    // start=0 → 500，从 1 开始：start = 1 + (page-1)*20
+    // ══════════════════════════════════════════════════════════════════════
+    // 搜索（全部用 /searchResult JSON，start=1+(page-1)*20）
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val start = 1 + (page - 1) * 20
         val body = FormBody.Builder()
@@ -145,83 +179,138 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return MangasPage(entries, hasNextPage)
     }
 
-    // ── 漫画详情 ──────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 漫画详情
+    // ══════════════════════════════════════════════════════════════════════
+
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val reqHeaders = headersBuilder().apply {
+            val cookie = cookieHeader()
+            if (cookie.isNotEmpty()) set("Cookie", cookie)
+        }.build()
+        return GET(baseUrl + manga.url, reqHeaders)
+    }
+
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
-        val detailElement = document.selectFirst(".detail_header .info")
-        val infoElement = document.selectFirst("#_asideDetail")
+        val detailDiv = document.selectFirst("div.detail_info")
+
         return SManga.create().apply {
-            title = document.selectFirst("h1.subj, h3.subj")!!.text()
-            author = detailElement?.selectFirst(".author:nth-of-type(1)")?.ownText()
-                ?: detailElement?.selectFirst(".author_area")?.ownText()
-            artist = detailElement?.selectFirst(".author:nth-of-type(2)")?.ownText()
-                ?: detailElement?.selectFirst(".author_area")?.ownText()
-                ?: author
-            genre = detailElement?.select(".genre").orEmpty().joinToString { it.text() }
-            description = infoElement?.selectFirst("p.summary")?.text()
-            status = with(infoElement?.selectFirst("p.day_info")?.text().orEmpty()) {
-                when {
-                    contains("更新") -> SManga.ONGOING
-                    contains("完结") -> SManga.COMPLETED
-                    else -> SManga.UNKNOWN
-                }
+            title = detailDiv?.selectFirst("p.subj")?.text()
+                ?: document.selectFirst("h1.subj, h3.subj")?.text()
+                ?: document.title().substringBefore("_")
+
+            author = detailDiv?.selectFirst("p.author")?.text()
+                ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
+            artist = author
+
+            genre = detailDiv?.selectFirst("p.genre")?.text()
+
+            description = detailDiv?.selectFirst("p.summary span.ellipsis")?.text()
+                ?: document.selectFirst("meta[property=og:description]")?.attr("content")
+
+            val metaDesc = document.selectFirst("meta[name=description]")?.attr("content") ?: ""
+            val dayInfo = document.select("p.day_info").text()
+            status = when {
+                dayInfo.contains("完结") || metaDesc.contains("完结") -> SManga.COMPLETED
+                dayInfo.contains("更新") || metaDesc.contains("更新") -> SManga.ONGOING
+                dayInfo.isNotEmpty() -> SManga.ONGOING
+                else -> SManga.UNKNOWN
             }
-            thumbnail_url = run {
-                val picElement = document.selectFirst("div.detail_body, div.thmb")
-                val discoverPic = document.selectFirst("span.thmb, div.thmb")
-                picElement?.attr("style")
-                    ?.substringAfter("url(")
-                    ?.substringBeforeLast(")")
-                    ?.removeSurrounding("\"")
-                    ?.removeSurrounding("'")
-                    ?.takeUnless { it.isBlank() }
-                    ?: discoverPic?.selectFirst("img")?.absUrl("src")
-                    ?: ""
-            }
+
+            thumbnail_url = detailDiv?.attr("style")
+                ?.let { extractUrlFromStyle(it) }
+                ?.takeUnless { it.isBlank() }
+                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
+                ?: ""
         }
     }
 
-    // ── 章节列表（携带 Cookie，用于付费章节） ─────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 章节列表
+    // ══════════════════════════════════════════════════════════════════════
+
+    override fun chapterListRequest(manga: SManga): Request {
+        val reqHeaders = headersBuilder().apply {
+            val cookie = cookieHeader()
+            if (cookie.isNotEmpty()) set("Cookie", cookie)
+        }.build()
+        return GET(baseUrl + manga.url, reqHeaders)
+    }
+
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
-        var continueParsing = true
         val chapters = mutableListOf<SChapter>()
-        while (continueParsing) {
-            document.select("ul#_listUl li").forEach { chapters.add(chapterFromElement(it)) }
-            val nextPage = document.select("div.paginate a[onclick] + a")
-            if (nextPage.isNotEmpty()) {
-                val nextUrl = nextPage.first()!!.absUrl("href")
-                val reqHeaders = headersBuilder().apply {
-                    val cookie = cookieHeader()
-                    if (cookie.isNotEmpty()) set("Cookie", cookie)
-                }.build()
-                document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
-            } else {
-                continueParsing = false
-            }
-        }
-        return chapters
-    }
 
-    private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
-        name = element.selectFirst("span.subj span")!!.text()
-        setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
-        date_upload = dateFormat.tryParse(element.selectFirst("span.date")?.text().orEmpty()) ?: 0L
+        while (true) {
+            document.select("div#_episodeList ul li").forEach { li ->
+                val a = li.selectFirst("a.workEpisodeListItem") ?: return@forEach
+                val dataHref = a.attr("data-href").ifEmpty { a.absUrl("href") }
+                if (dataHref.isEmpty()) return@forEach
+
+                chapters.add(
+                    SChapter.create().apply {
+                        val cleanUrl = dataHref.substringBefore("&source")
+                        url = if (cleanUrl.startsWith("http")) {
+                            cleanUrl.removePrefix("https://m.dongmanmanhua.cn")
+                                .removePrefix("//m.dongmanmanhua.cn")
+                        } else {
+                            cleanUrl
+                        }
+                        name = a.selectFirst("p.sub_title span.ellipsis")?.text()
+                            ?: a.selectFirst("p.sub_title")?.text()
+                            ?: "第${li.attr("data-episode-no")}话"
+                        date_upload = dateFormat.tryParse(
+                            a.selectFirst("p.date")?.text()?.trim().orEmpty(),
+                        ) ?: 0L
+                        chapter_number = li.attr("data-episode-no").toFloatOrNull() ?: -1f
+                    },
+                )
+            }
+
+            val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull()
+                ?: break
+            val nextUrl = nextPage.absUrl("href")
+            if (nextUrl.isEmpty()) break
+
+            val reqHeaders = headersBuilder().apply {
+                val cookie = cookieHeader()
+                if (cookie.isNotEmpty()) set("Cookie", cookie)
+            }.build()
+            document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
+        }
+
+        return chapters
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // ── 阅读页面（携带 Cookie，用于付费章节图片） ──────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 阅读页面
+    // ══════════════════════════════════════════════════════════════════════
+
+    override fun pageListRequest(chapter: SChapter): Request {
+        val reqHeaders = headersBuilder().apply {
+            val cookie = cookieHeader()
+            if (cookie.isNotEmpty()) set("Cookie", cookie)
+        }.build()
+        return GET(baseUrl + chapter.url, reqHeaders)
+    }
+
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-        return document.select("div#_imageList img, div.viewer_lst img").mapIndexed { i, img ->
-            Page(i, imageUrl = img.attr("data-url").ifEmpty { img.absUrl("src") })
-        }
+        return document.select("div#_imageList img, div.viewer_lst img")
+            .mapIndexed { i, img ->
+                Page(i, imageUrl = img.attr("data-url").ifEmpty { img.absUrl("src") })
+            }
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
-    // ── 工具函数 ──────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // 工具函数
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun buildThumbnailUrl(raw: String): String {
         if (raw.isEmpty()) return ""
         return when {
@@ -296,12 +385,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
 
-    private fun extractTitleNo(url: String): String {
-        val pattern = Regex("""titleNo[=:](\d+)""")
-        return pattern.find(url)?.groupValues?.get(1) ?: url
-    }
+    // ══════════════════════════════════════════════════════════════════════
+    // 常量
+    // ══════════════════════════════════════════════════════════════════════
 
     companion object {
+        private const val PREF_UA = "pref_user_agent"
         private const val PREF_COOKIE = "pref_cookie"
+
+        private const val UA_MOBILE =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+        private const val UA_DESKTOP =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
 }
