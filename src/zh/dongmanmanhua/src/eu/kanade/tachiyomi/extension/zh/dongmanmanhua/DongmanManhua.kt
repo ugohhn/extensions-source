@@ -96,7 +96,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return builder
     }
 
-    override val client = network.cloudflareClient
+    override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
     // 首页（Popular）
