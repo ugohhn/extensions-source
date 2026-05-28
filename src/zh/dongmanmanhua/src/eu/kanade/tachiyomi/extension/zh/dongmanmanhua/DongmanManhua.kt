@@ -50,7 +50,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
 
         // 1. 登录状态显示 + 登录按钮
-        Preference(ctx).apply {
+        (object : Preference(ctx) {}).apply {
             title = "咚漫账号登录"
             summary = if (DongmanLoginActivity.isLoggedIn(ctx)) {
                 "已登录（NEO_SES 有效）\n点击重新登录以刷新登录状态"
@@ -58,20 +58,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "未登录\n点击打开浏览器登录咚漫"
             }
             setOnPreferenceClickListener {
-                ctx.startActivity(
-                    Intent(ctx, DongmanLoginActivity::class.java),
-                )
+                ctx.startActivity(Intent(ctx, DongmanLoginActivity::class.java))
                 true
             }
         }.also(screen::addPreference)
 
-        // 2. 退出登录按钮（已登录时才有意义）
-        Preference(ctx).apply {
+        // 2. 退出登录按钮
+        (object : Preference(ctx) {}).apply {
             title = "退出登录"
             summary = "清除本地保存的登录 Cookie（NEO_SES / NEO_CHK）"
             setOnPreferenceClickListener {
                 DongmanLoginActivity.logout(ctx)
-                // 刷新登录状态显示
                 summary = "已退出登录"
                 true
             }
