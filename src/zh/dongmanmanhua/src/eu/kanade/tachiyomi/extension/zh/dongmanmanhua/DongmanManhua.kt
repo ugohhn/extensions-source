@@ -1,9 +1,11 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
-import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
+import android.content.Intent
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import androidx.preference.ListPreference
+import androidx.preference.EditTextPreference
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -22,6 +24,8 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
 import org.json.JSONObject
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -43,9 +47,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val ctx = screen.context
 
-        // 1. User-Agent 预设选择
-        ListPreference(screen.context).apply {
+        // 1. 登录状态显示 + 登录按钮
+        Preference(ctx).apply {
+            title = "咚漫账号登录"
+            summary = if (DongmanLoginActivity.isLoggedIn(ctx)) {
+                "已登录（NEO_SES 有效）
+点击重新登录以刷新登录状态"
+            } else {
+                "未登录
+点击打开浏览器登录咚漫"
+            }
+            setOnPreferenceClickListener {
+                ctx.startActivity(
+                    Intent(ctx, DongmanLoginActivity::class.java),
+                )
+                true
+            }
+        }.also(screen::addPreference)
+
+        // 2. 退出登录按钮（已登录时才有意义）
+        Preference(ctx).apply {
+            title = "退出登录"
+            summary = "清除本地保存的登录 Cookie（NEO_SES / NEO_CHK）"
+            setOnPreferenceClickListener {
+                DongmanLoginActivity.logout(ctx)
+                // 刷新登录状态显示
+                summary = "已退出登录"
+                true
+            }
+        }.also(screen::addPreference)
+
+        // 3. 自动扣费开关
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_AUTO_PAY
+            title = "自动购买付费章节"
+            summary = "开启后，打开未购付费章节时将自动扣费解锁\n余额不足时会提示错误\n需要先登录"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        // 4. User-Agent 预设选择
+        ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
             summary = "%s"
@@ -54,38 +97,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // 2. User-Agent 自定义输入框
-        EditTextPreference(screen.context).apply {
+        // 5. User-Agent 自定义输入框
+        EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
             summary = "选择「自定义」时生效\n当前值：${preferences.getString(PREF_UA_CUSTOM, "").orEmpty().ifEmpty { "（未填写）" }}"
             dialogTitle = "输入自定义 User-Agent"
             setDefaultValue("")
         }.also(screen::addPreference)
-
-        // 3. 手动 Cookie
-        EditTextPreference(screen.context).apply {
-            key = PREF_COOKIE
-            title = "Cookie（登录后粘贴）"
-            summary = "从浏览器复制完整 Cookie 字符串到这里，用于访问已购付费章节\n当前值：${previewCookie(preferences.getString(PREF_COOKIE, ""))}"
-            dialogTitle = "设置 Cookie"
-            setDefaultValue("")
-        }.also(screen::addPreference)
-
-        // 4. 自动扣费开关
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_AUTO_PAY
-            title = "自动购买付费章节"
-            summary = "开启后，打开未购付费章节时将自动扣费解锁\n余额不足时会提示错误\n需要先填写有效 Cookie"
-            setDefaultValue(false)
-        }.also(screen::addPreference)
     }
 
-    private fun previewCookie(cookie: String?): String =
-        cookie?.take(40)?.ifEmpty { "（未设置）" } ?: "（未设置）"
-
-    private fun cookieHeader(): String =
-        preferences.getString(PREF_COOKIE, "").orEmpty()
+    // Cookie 头：从 SharedPreferences 读取持久化的 NEO_SES/NEO_CHK
+    // 通过 Injekt 拿到 Application context，不依赖调用方传入
+    private fun cookieHeader(): String {
+        val ctx = Injekt.get<android.app.Application>()
+        return DongmanLoginActivity.buildCookieHeader(ctx)
+    }
 
     private fun currentUserAgent(): String {
         return when (val pref = preferences.getString(PREF_UA, UA_MOBILE) ?: UA_MOBILE) {
@@ -340,9 +367,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 用 client 直接发请求，CookieJar 自动带上 WebView 登录态的 Cookie
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        // 只需要基础 headers，Cookie 由 CookieJar 自动注入
+        // 显式注入 SharedPreferences 里的 NEO_SES/NEO_CHK，不依赖 CookieJar
+        val savedCookie = cookieHeader()
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
 
         // 1. 查询价格和余额
@@ -502,7 +532,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA = "pref_user_agent"
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
-        private const val PREF_COOKIE = "pref_cookie"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
 
         private const val UA_MOBILE =
