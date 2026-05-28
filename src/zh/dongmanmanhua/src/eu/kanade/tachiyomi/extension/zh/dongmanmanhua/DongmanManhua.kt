@@ -53,11 +53,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Preference(ctx).apply {
             title = "咚漫账号登录"
             summary = if (DongmanLoginActivity.isLoggedIn(ctx)) {
-                "已登录（NEO_SES 有效）
-点击重新登录以刷新登录状态"
+                "已登录（NEO_SES 有效）\n点击重新登录以刷新登录状态"
             } else {
-                "未登录
-点击打开浏览器登录咚漫"
+                "未登录\n点击打开浏览器登录咚漫"
             }
             setOnPreferenceClickListener {
                 ctx.startActivity(
