@@ -1,6 +1,6 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
-import android.content.Intent
+import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -48,23 +48,66 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // 1. 登录按钮：点击打开 WebView 登录页，完成后 Cookie 自动存入 SharedPreferences
+        // 1. 登录入口：打开 Mihon 内置 WebView，用户在里面完成登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGIN_TRIGGER
             title = "咚漫账号登录"
-            summary = if (DongmanLoginActivity.isLoggedIn(ctx)) {
-                "已登录（NEO_SES 有效）\n点击打开登录页重新登录"
-            } else {
-                "未登录\n点击打开浏览器登录咚漫"
-            }
-            // 不保存开关状态，仅作为点击触发器
+            summary = "点击后在 Mihon 内置浏览器里完成登录\n登录完成后点击下方「刷新登录状态」保存 Cookie"
             setOnPreferenceChangeListener { _, _ ->
-                ctx.startActivity(Intent(ctx, DongmanLoginActivity::class.java))
+                // 用 Mihon 内置 WebView 打开登录页
+                val loginUrl = "https://m.dongmanmanhua.cn/member/login"
+                val intent = android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                // 实际用 app.mihon 的 WebViewActivity intent
+                val webViewIntent = ctx.packageManager
+                    .getLaunchIntentForPackage(ctx.packageName)
+                    ?.apply {
+                        action = "eu.kanade.tachiyomi.ACTION_WEBVIEW"
+                        putExtra("url", loginUrl)
+                        putExtra("title", "咚漫登录")
+                    }
+                if (webViewIntent != null) {
+                    ctx.startActivity(webViewIntent)
+                } else {
+                    // 降级：用系统浏览器打开
+                    ctx.startActivity(
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(loginUrl),
+                        ),
+                    )
+                }
                 false
             }
         }.also(screen::addPreference)
 
-        // 2. 退出登录：清除持久化 Cookie
+        // 2. 刷新登录状态：从 CookieManager 读取 NEO_SES 存入 SharedPreferences
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_LOGIN_REFRESH
+            title = "刷新登录状态"
+            val loginPref = this
+            summary = if (DongmanLoginActivity.isLoggedIn(ctx)) {
+                "当前状态：已登录\n点击重新从 WebView 读取 Cookie"
+            } else {
+                "当前状态：未登录\n在内置浏览器登录咚漫后点击此处"
+            }
+            setOnPreferenceChangeListener { _, _ ->
+                val cookieStr = CookieManager.getInstance().getCookie("https://m.dongmanmanhua.cn") ?: ""
+                val neoSes = DongmanLoginActivity.extractCookieValue(cookieStr, "NEO_SES")
+                val neoChk = DongmanLoginActivity.extractCookieValue(cookieStr, "NEO_CHK")
+                if (neoSes.isNotEmpty()) {
+                    DongmanLoginActivity.getPreferences(ctx).edit()
+                        .putString(DongmanLoginActivity.KEY_NEO_SES, neoSes)
+                        .putString(DongmanLoginActivity.KEY_NEO_CHK, neoChk)
+                        .apply()
+                    loginPref.summary = "当前状态：已登录（Cookie 已保存）"
+                } else {
+                    loginPref.summary = "当前状态：未登录（未检测到 NEO_SES，请先在内置浏览器登录）"
+                }
+                false
+            }
+        }.also(screen::addPreference)
+
+        // 3. 退出登录：清除持久化 Cookie
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
@@ -613,6 +656,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val PREF_LOGIN_TRIGGER = "pref_login_trigger"
+        private const val PREF_LOGIN_REFRESH = "pref_login_refresh"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
 
         private const val UA_MOBILE =
