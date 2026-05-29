@@ -58,9 +58,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "未登录\n点击打开浏览器登录咚漫"
             }
             // 不保存开关状态，仅作为点击触发器
-            setOnPreferenceChangeListener { pref, _ ->
+            setOnPreferenceChangeListener { _, _ ->
                 ctx.startActivity(Intent(ctx, DongmanLoginActivity::class.java))
-                pref.sharedPreferences?.edit()?.remove(PREF_LOGIN_TRIGGER)?.apply()
                 false
             }
         }.also(screen::addPreference)
@@ -70,10 +69,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的登录 Cookie（NEO_SES / NEO_CHK）"
-            setOnPreferenceChangeListener { pref, _ ->
+            setOnPreferenceChangeListener { _, _ ->
                 DongmanLoginActivity.logout(ctx)
-                pref.summary = "已退出登录"
-                pref.sharedPreferences?.edit()?.remove(PREF_LOGOUT_TRIGGER)?.apply()
                 false
             }
         }.also(screen::addPreference)
