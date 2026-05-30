@@ -6,9 +6,12 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -27,8 +30,6 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Element
 import org.json.JSONObject
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -52,40 +53,60 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // ── 1. 启用登录状态浏览（参考拷贝漫画实现）
-        // 拨动开关时，在后台创建 WebView 静默加载咚漫首页，
-        // 通过 onPageFinished 读取 CookieManager 里的 NEO_SES/NEO_CHK，
-        // 存入 SharedPreferences 持久化保存，不弹任何 Activity。
+        // ── 功能模块多选：勾选后对应的设置项才显示
+        // 目前模块：登录（后续可扩展更多）
+        val enabledModules = preferences.getStringSet(PREF_MODULES, emptySet()) ?: emptySet()
+
         val enableLoginPref = SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
             summary = buildLoginSummary()
             setDefaultValue(false)
+            isVisible = MODULE_LOGIN in enabledModules
             setOnPreferenceChangeListener { pref, newValue ->
                 if (newValue as Boolean) {
-                    // 后台 WebView 读取 Cookie
                     loginWithWebView(pref as SwitchPreferenceCompat)
                 }
                 true
             }
         }
-        screen.addPreference(enableLoginPref)
 
-        // ── 2. 退出登录
-        SwitchPreferenceCompat(ctx).apply {
+        val logoutPref = SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
+            isVisible = MODULE_LOGIN in enabledModules
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 enableLoginPref.isChecked = false
                 enableLoginPref.summary = buildLoginSummary()
                 false
             }
+        }
+
+        // 多选功能模块入口
+        MultiSelectListPreference(ctx).apply {
+            key = PREF_MODULES
+            title = "功能模块"
+            summary = "勾选后显示对应设置项"
+            entries = arrayOf("登录")
+            entryValues = arrayOf(MODULE_LOGIN)
+            setDefaultValue(emptySet<String>())
+            setOnPreferenceChangeListener { _, newValue ->
+                @Suppress("UNCHECKED_CAST")
+                val selected = newValue as Set<String>
+                enableLoginPref.isVisible = MODULE_LOGIN in selected
+                logoutPref.isVisible = MODULE_LOGIN in selected
+                preferences.edit().putStringSet(PREF_MODULES, selected).apply()
+                true
+            }
         }.also(screen::addPreference)
 
-        // ── 3. 自动扣费开关
+        screen.addPreference(enableLoginPref)
+        screen.addPreference(logoutPref)
+
+        // ── 常驻：自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -93,7 +114,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // ── 4. User-Agent 预设
+        // ── 常驻：User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -103,7 +124,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // ── 5. User-Agent 自定义输入框
+        // ── 常驻：User-Agent 自定义输入框
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -252,30 +273,71 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 搜索（全部用 /searchResult JSON，start=1+(page-1)*20）
+    // 搜索（双接口：page=1 HTML，page>=2 JSON）
     // ══════════════════════════════════════════════════════════════════════
 
+    private val nextStartMap = mutableMapOf<String, Int>()
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val start = 1 + (page - 1) * 20
-        val body = FormBody.Builder()
-            .add("keyword", query)
-            .add("searchType", "WEBTOON")
-            .add("start", start.toString())
-            .build()
-        val headers = headersBuilder()
-            .set("Origin", baseUrl)
-            .set("Referer", "$baseUrl/search")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .build()
-        return POST("$baseUrl/searchResult", headers, body)
+        return if (page == 1) {
+            nextStartMap.remove(query)
+            val body = FormBody.Builder()
+                .add("searchType", "WEBTOON")
+                .add("keyword", query)
+                .build()
+            val headers = headersBuilder()
+                .set("Origin", baseUrl)
+                .set("Referer", "$baseUrl/search")
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .build()
+            POST("$baseUrl/search", headers, body)
+        } else {
+            val start = nextStartMap[query] ?: (1 + (page - 1) * 20)
+            val body = FormBody.Builder()
+                .add("keyword", query)
+                .add("searchType", "WEBTOON")
+                .add("start", start.toString())
+                .build()
+            val headers = headersBuilder()
+                .set("Origin", baseUrl)
+                .set("Referer", "$baseUrl/search")
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .set("X-Requested-With", "XMLHttpRequest")
+                .build()
+            POST("$baseUrl/searchResult", headers, body)
+        }
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
+        return if (response.request.url.toString().contains("/searchResult")) {
+            parseSearchResultJson(response)
+        } else {
+            parseSearchHtml(response)
+        }
+    }
+
+    private fun parseSearchHtml(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val allItems = document.select("ul._searchResultList > li")
+        val totalEntries = allItems.size
+        val entries = allItems
+            .mapNotNull { li -> li.selectFirst("a.cleFix")?.let { searchMangaFromElement(it) } }
+            .filter { it.title.isNotEmpty() }
+        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
+        val hasNextPage = total > totalEntries
+        if (hasNextPage) {
+            val keyword = extractKeywordFromBody(response)
+            if (keyword.isNotEmpty()) nextStartMap[keyword] = totalEntries + 1
+        }
+        return MangasPage(entries, hasNextPage)
+    }
+
+    private fun parseSearchResultJson(response: Response): MangasPage {
         val json = JSONObject(response.body.string())
         val total = json.optInt("total", 0)
         val start = json.optInt("start", 0)
         val titleList = json.optJSONArray("titleList")
+        val rawCount = titleList?.length() ?: 0
 
         val entries = mutableListOf<SManga>()
         if (titleList != null) {
@@ -285,8 +347,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (platform != "ALL" && platform != "WEB") continue
                 val manga = SManga.create().apply {
                     val titleNo = item.optString("titleNo", "")
-                    // episodeList?titleNo=XXXX 会被服务器301跳转到完整路径
-                    // OkHttp跟随跳转后拿到正确的详情页，选择器正常工作
                     url = "/episodeList?titleNo=$titleNo"
                     title = item.optString("title", "")
                     thumbnail_url = buildThumbnailUrl(
@@ -298,13 +358,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (manga.title.isNotEmpty()) entries.add(manga)
             }
         }
-        val hasNextPage = (start - 1 + (titleList?.length() ?: 0)) < total
+        val hasNextPage = rawCount > 0 && (start - 1 + rawCount) < total
+        if (hasNextPage) {
+            val keyword = extractKeywordFromBody(response)
+            if (keyword.isNotEmpty()) nextStartMap[keyword] = start + rawCount
+        }
         return MangasPage(entries, hasNextPage)
+    }
+
+    private fun extractKeywordFromBody(response: Response): String {
+        val body = response.request.body
+        if (body is FormBody) {
+            for (i in 0 until body.size) {
+                if (body.name(i) == "keyword") return body.value(i)
+            }
+        }
+        return ""
     }
 
     // ══════════════════════════════════════════════════════════════════════
     // 漫画详情
-    // 封面直接沿用搜索/列表时已获取的 thumbnail_url，不重新提取
+    //
+    // HTML 结构（来自实际抓包）：
+    //   <div class="detail_info v2" style="background-image:url(封面URL)">
+    //     <p class="genre g_fantasy">奇幻 都市</p>
+    //     <a class="_btnInfo">
+    //       <p class="subj">反转练习生</p>
+    //       <p class="author">Song Geukjang</p>
+    //       <p class="summary"><span class="ellipsis">简介...</span></p>
+    //     </a>
+    //   </div>
+    //   更新状态在 <div class="lst_type3 detail_white"> 上方的标签中，
+    //   或者通过 meta description 里的"周X更新"/"完结"判断
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
@@ -320,14 +405,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val detailDiv = document.selectFirst("div.detail_info")
 
         return SManga.create().apply {
+            // 标题
             title = detailDiv?.selectFirst("p.subj")?.text()
                 ?: document.selectFirst("h1.subj, h3.subj")?.text()
                 ?: document.title().substringBefore("_")
 
+            // 作者（单作者情况，咚漫页面 author 标签只有一个）
             author = detailDiv?.selectFirst("p.author")?.text()
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
 
+            // 类型标签 + 更新周期拼在一起，如"奇幻 都市 每周二更新"
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val updateTag = extractUpdateTag(document.html())
             genre = if (updateTag.isNotEmpty()) "$genreBase, $updateTag" else genreBase
@@ -349,7 +437,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 章节列表（倒序返回，最新话在前）
+    // 章节列表
+    //
+    // HTML 结构（来自实际抓包）：
+    //   <div id="_episodeList">
+    //     <ul>
+    //       <li id="episode_1" data-episode-no="1">
+    //         <a class="workEpisodeListItem"
+    //            data-href="/FANTASY/.../viewer?title_no=2795&episode_no=1&...">
+    //           <p class="sub_title"><span class="ellipsis">第1话 昨天的我是金上泫(1)</span></p>
+    //           <p class="date">2025-7-7</p>
+    //         </a>
+    //       </li>
+    //       ...
+    //     </ul>
+    //   </div>
+    //
+    // 注意：
+    //   1. 章节链接在 data-href 属性，不在 href（href 为空或 javascript:void）
+    //   2. 付费章节 data-free="false"，此处不过滤，让用户凭 Cookie 自行访问
+    //   3. 翻页：页面底部有 <div class="paginate"> 结构，检测"下一页"按钮
     // ══════════════════════════════════════════════════════════════════════
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -367,35 +474,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         while (true) {
             document.select("div#_episodeList ul li").forEach { li ->
                 val a = li.selectFirst("a.workEpisodeListItem") ?: return@forEach
+                // 章节 URL 在 data-href，需转换为相对路径
                 val dataHref = a.attr("data-href").ifEmpty { a.absUrl("href") }
                 if (dataHref.isEmpty()) return@forEach
 
-                chapters.add(
-                    SChapter.create().apply {
-                        val cleanUrl = dataHref.substringBefore("&source")
-                        url = if (cleanUrl.startsWith("http")) {
-                            cleanUrl.removePrefix("https://m.dongmanmanhua.cn")
-                                .removePrefix("//m.dongmanmanhua.cn")
-                        } else {
-                            cleanUrl
-                        }
-                        val isFree = a.attr("data-free") == "true"
-                        val rawName = a.selectFirst("p.sub_title span.ellipsis")?.text()
-                            ?: a.selectFirst("p.sub_title")?.text()
-                            ?: "第${li.attr("data-episode-no")}话"
-                        // 付费且未解锁的章节加🔒前缀，已购(data-free=true)不加
-                        name = if (isFree) rawName else "🔒 $rawName"
-                        date_upload = dateFormat.tryParse(
-                            a.selectFirst("p.date")?.text()?.trim().orEmpty(),
-                        ) ?: 0L
-                        chapter_number = li.attr("data-episode-no").toFloatOrNull() ?: -1f
-                    },
-                )
+                val chapter = SChapter.create().apply {
+                    val cleanUrl = dataHref.substringBefore("&source")
+                    url = if (cleanUrl.startsWith("http")) {
+                        cleanUrl.removePrefix("https://m.dongmanmanhua.cn")
+                            .removePrefix("//m.dongmanmanhua.cn")
+                    } else {
+                        cleanUrl
+                    }
+                    val isFree = a.attr("data-free") == "true"
+                    val rawName = a.selectFirst("p.sub_title span.ellipsis")?.text()
+                        ?: a.selectFirst("p.sub_title")?.text()
+                        ?: "第${li.attr("data-episode-no")}话"
+                    name = if (isFree) rawName else "🔒 $rawName"
+                    date_upload = dateFormat.tryParse(
+                        a.selectFirst("p.date")?.text()?.trim().orEmpty(),
+                    ) ?: 0L
+                    chapter_number = li.attr("data-episode-no").toFloatOrNull() ?: -1f
+                }
+                chapters.add(chapter)
             }
 
+            // 翻页：检测分页按钮
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull()
                 ?: break
-            val nextUrl = nextPage.absUrl("href")
+            val nextUrl = nextPage.absUrl("href").ifEmpty { break.also { } }
             if (nextUrl.isEmpty()) break
 
             val reqHeaders = headersBuilder().apply {
@@ -412,18 +519,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面
+    // 阅读页面（viewer）
+    //
+    // URL 格式：/viewer?titleNo=2795&episodeNo=1
+    // 或：/FANTASY/.../viewer?title_no=2795&episode_no=1
+    // 图片选择器：div#_imageList img，图片 URL 在 data-url 属性
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
-        // network.client 的 CookieJar 自动保存 WebView 登录态，直接用 headers 即可
         val reqHeaders = headersBuilder().apply {
-            // 如果用户额外填了手动 Cookie，叠加进去
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
 
-        // 自动扣费：开关开启时执行，Cookie 由 CookieJar 自动携带
         val autoPay = preferences.getBoolean(PREF_AUTO_PAY, false)
         if (autoPay) {
             val titleNo = extractUrlParam(chapter.url, "title_no")
@@ -436,10 +544,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return GET(baseUrl + chapter.url, reqHeaders)
     }
 
-    // 用 client 直接发请求，CookieJar 自动带上 WebView 登录态的 Cookie
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        // 显式注入 SharedPreferences 里的 NEO_SES/NEO_CHK，不依赖 CookieJar
         val savedCookie = cookieHeader()
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
@@ -447,7 +553,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
 
-        // 1. 查询价格和余额
         val priceResp = client.newCall(
             GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders),
         ).execute()
@@ -455,10 +560,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val data = priceJson.optJSONObject("data") ?: return
 
         val isFree = data.optBoolean("free", true)
-        if (isFree) return  // 已解锁或免费
+        if (isFree) return
 
         val isLimit = data.optBoolean("isLimit", false)
-        if (isLimit) return  // 仅限 App，无法网页购买
+        if (isLimit) return
 
         val price = data.optInt("price", 0)
         val coinCount = data.optInt("coinCount", 0)
@@ -468,7 +573,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
         }
 
-        // 2. 余额足够，静默扣费
         val payResp = client.newCall(
             GET("$baseUrl/episode/unlock/pay?$params", reqHeaders),
         ).execute()
@@ -483,14 +587,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun pageListParse(response: Response): List<Page> {
         val html = response.body.string()
-        // 图片数据在页面内嵌 JS 的 var imageList = [{url:"...", ...}, ...]
         val imageRegex = Regex("""url\s*:\s*"(https://cdn\.dongmanmanhua\.cn/[^"]+)"""")
         return imageRegex.findAll(html)
             .mapIndexed { i, match -> Page(i, imageUrl = match.groupValues[1]) }
             .toList()
     }
 
-    // 图片来自 cdn.dongmanmanhua.cn，需要带 Referer 才能正常加载
     override fun imageRequest(page: Page): Request {
         return GET(
             page.imageUrl!!,
@@ -508,14 +610,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     // 从页面内嵌 JS 提取 serial_status 值
-    // 格式：serial_status: 'SERIES'  或  "serial_status":"SERIES"
+    // SERIES=连载中, TERMINATION=已完结, REST=暂停更新
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
         return regex.find(html)?.groupValues?.get(1) ?: ""
     }
 
-    // 从 info_update 区域提取更新周期标签
-    // 连载中返回如"每周二更新"，完结返回""（状态已单独处理）
+    // 从 info_update 区域提取更新周期标签，如"每周二更新"
     private fun extractUpdateTag(html: String): String {
         val regex = Regex("""在(周[一二三四五六七日天])更新""")
         val match = regex.find(html) ?: return ""
@@ -604,6 +705,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA = "pref_user_agent"
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
+
+        private const val PREF_MODULES = "pref_modules"
+        private const val MODULE_LOGIN = "module_login"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
