@@ -62,7 +62,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "启用登录状态浏览"
             summary = buildLoginSummary()
             setDefaultValue(false)
-            isVisible = MODULE_LOGIN in enabledModules
             setOnPreferenceChangeListener { pref, newValue ->
                 if (newValue as Boolean) {
                     loginWithWebView(pref as SwitchPreferenceCompat)
@@ -76,7 +75,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
-            isVisible = MODULE_LOGIN in enabledModules
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 enableLoginPref.isChecked = false
@@ -85,7 +83,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
 
-        // 多选功能模块入口
+        // 多选功能模块入口：勾选后动态 add/remove 对应设置项
         MultiSelectListPreference(ctx).apply {
             key = PREF_MODULES
             title = "功能模块"
@@ -96,15 +94,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setOnPreferenceChangeListener { _, newValue ->
                 @Suppress("UNCHECKED_CAST")
                 val selected = newValue as Set<String>
-                enableLoginPref.isVisible = MODULE_LOGIN in selected
-                logoutPref.isVisible = MODULE_LOGIN in selected
-                preferences.edit().putStringSet(PREF_MODULES, selected).apply()
+                if (MODULE_LOGIN in selected) {
+                    if (screen.findPreference<SwitchPreferenceCompat>(PREF_ENABLE_LOGIN) == null) {
+                        screen.addPreference(enableLoginPref)
+                        screen.addPreference(logoutPref)
+                    }
+                } else {
+                    screen.removePreference(enableLoginPref)
+                    screen.removePreference(logoutPref)
+                }
                 true
             }
         }.also(screen::addPreference)
 
-        screen.addPreference(enableLoginPref)
-        screen.addPreference(logoutPref)
+        // 初始化：已勾选则显示
+        if (MODULE_LOGIN in enabledModules) {
+            screen.addPreference(enableLoginPref)
+            screen.addPreference(logoutPref)
+        }
 
         // ── 常驻：自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
