@@ -6,6 +6,7 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.core.view.isVisible  // 新增：解决 isVisible 未解析
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -204,6 +205,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             // 15 秒超时销毁
             Handler(Looper.getMainLooper()).postDelayed({ webView.destroy() }, 15_000)
         }
+    }
+
+    // 新增：密码登录（仅提示用户使用 WebView 登录，避免编译错误）
+    private fun loginWithPassword(username: String, password: String, pref: SwitchPreferenceCompat) {
+        // 咚漫网页版不支持简单的密码登录接口，直接调起 WebView 让用户手动登录
+        Toast.makeText(pref.context, "请在弹出的 WebView 中手动登录", Toast.LENGTH_LONG).show()
+        loginWithWebView(pref)
     }
 
     private fun saveLoginCookie(neoSes: String, neoChk: String) {
@@ -739,4 +747,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
