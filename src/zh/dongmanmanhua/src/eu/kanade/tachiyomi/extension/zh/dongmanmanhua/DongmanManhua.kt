@@ -52,26 +52,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // ── 功能模块开关：打开后子项才可交互（用 dependency 机制）
-        // 登录模块开关
-        SwitchPreferenceCompat(ctx).apply {
-            key = PREF_MODULE_LOGIN
-            title = "登录模块"
-            summary = "开启后显示登录相关设置"
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-
-        // 登录模块子项（dependency = PREF_MODULE_LOGIN，开关关闭时自动灰掉不可交互）
+        // ── 登录模块（后台 WebView 静默读取 Cookie）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
             summary = buildLoginSummary()
             setDefaultValue(false)
-            dependency = PREF_MODULE_LOGIN
             setOnPreferenceChangeListener { pref, newValue ->
-                if (newValue as Boolean) {
-                    loginWithWebView(pref as SwitchPreferenceCompat)
-                }
+                if (newValue as Boolean) loginWithWebView(pref as SwitchPreferenceCompat)
                 true
             }
         }.also(screen::addPreference)
@@ -81,22 +69,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
-            dependency = PREF_MODULE_LOGIN
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 false
             }
         }.also(screen::addPreference)
 
-        // ── 常驻：自动扣费开关
+        // ── 自动扣费
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
-            summary = "开启后，打开未购付费章节时将自动扣费解锁\n余额不足时会提示错误\n需要先开启登录状态"
+            summary = "开启后打开未购付费章节时将自动扣费\n余额不足时会提示错误，需要先开启登录状态"
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // ── 常驻：User-Agent 预设
+        // ── User-Agent
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -106,7 +93,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // ── 常驻：User-Agent 自定义输入框
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -606,7 +592,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA = "pref_user_agent"
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
-        private const val PREF_MODULE_LOGIN = "pref_module_login"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
