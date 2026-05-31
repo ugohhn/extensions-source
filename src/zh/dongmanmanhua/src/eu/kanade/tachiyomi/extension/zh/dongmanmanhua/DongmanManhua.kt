@@ -57,26 +57,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // 先声明所有 Preference，让 listener 里可以互相引用（参考拷贝漫画 PreferencesKt 模式）
+        // ── 1. 登录开关（WebView 静默读取 Cookie）
+        val enableLoginPref = SwitchPreferenceCompat(ctx).apply {
+            key = PREF_ENABLE_LOGIN
+            title = "启用登录状态浏览"
+            summary = buildLoginSummary()
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { pref, newValue ->
+                if (newValue as Boolean) loginWithWebView(pref as SwitchPreferenceCompat)
+                true
+            }
+        }.also(screen::addPreference)
 
-        // ── 账号输入框（登录开关开启后才可见）
-        val usernamePref = EditTextPreference(ctx).apply {
+        // ── 2. 账号输入框（密码登录用）
+        EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
-            summary = "用于密码登录"
+            summary = "用于密码登录，填写后再填密码触发登录"
             dialogTitle = "输入账号"
             setDefaultValue("")
-            isVisible = preferences.getBoolean(PREF_ENABLE_LOGIN, false)
-        }
+        }.also(screen::addPreference)
 
-        // ── 密码输入框（填写后立即触发登录，登录开关开启后才可见）
-        val passwordPref = EditTextPreference(ctx).apply {
+        // ── 3. 密码输入框（填写后立即触发登录）
+        EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
             summary = "输入密码点确定后立即尝试登录"
             dialogTitle = "输入密码"
             setDefaultValue("")
-            isVisible = preferences.getBoolean(PREF_ENABLE_LOGIN, false)
             setOnPreferenceChangeListener { _, newValue ->
                 val password = newValue as? String ?: ""
                 if (password.isNotBlank()) {
@@ -84,33 +92,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     if (username.isBlank()) {
                         Toast.makeText(ctx, "请先填写账号", Toast.LENGTH_SHORT).show()
                     } else {
-                        // enableLoginPref 会在后面声明，这里用 key 找到它
-                        screen.findPreference<SwitchPreferenceCompat>(PREF_ENABLE_LOGIN)
-                            ?.let { loginWithPassword(username, password, it) }
+                        loginWithPassword(username, password, enableLoginPref)
                     }
                 }
                 preferences.edit().remove(PREF_LOGIN_PASSWORD).apply()
                 false
             }
-        }
+        }.also(screen::addPreference)
 
-        // ── 登录开关（WebView 静默读取 Cookie，开启后显示账号密码输入框）
-        val enableLoginPref = SwitchPreferenceCompat(ctx).apply {
-            key = PREF_ENABLE_LOGIN
-            title = "启用登录状态浏览"
-            summary = buildLoginSummary()
-            setDefaultValue(false)
-            setOnPreferenceChangeListener { pref, newValue ->
-                val enabled = newValue as Boolean
-                usernamePref.isVisible = enabled
-                passwordPref.isVisible = enabled
-                if (enabled) loginWithWebView(pref as SwitchPreferenceCompat)
-                true
-            }
-        }
-
-        // ── 退出登录
-        val logoutPref = SwitchPreferenceCompat(ctx).apply {
+        // ── 4. 退出登录
+        SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
@@ -119,60 +110,124 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 clearLoginCookie()
                 enableLoginPref.isChecked = false
                 enableLoginPref.summary = buildLoginSummary()
-                usernamePref.isVisible = false
-                passwordPref.isVisible = false
                 false
             }
-        }
+        }.also(screen::addPreference)
 
-        // ── 搜索模式（开启=混合含小说，关闭=仅漫画JSON）
-        val searchModePref = SwitchPreferenceCompat(ctx).apply {
+        // ── 5. 搜索模式（仅漫画 vs 含小说）
+        ListPreference(ctx).apply {
             key = PREF_SEARCH_MODE
-            title = "搜索显示小说"
-            summary = "开启后搜索结果包含小说（首页HTML接口）\n关闭则只显示漫画（JSON接口，速度更快）"
-            setDefaultValue(false)
-        }
+            title = "搜索模式"
+            summary = "%s"
+            entries = arrayOf("仅漫画（JSON，速度快）", "混合结果（含小说，首页HTML）")
+            entryValues = arrayOf(SEARCH_MODE_JSON, SEARCH_MODE_MIXED)
+            setDefaultValue(SEARCH_MODE_JSON)
+        }.also(screen::addPreference)
 
-        // ── 自动扣费开关
-        val autoPayPref = SwitchPreferenceCompat(ctx).apply {
+        // ── 6. 自动扣费开关
+        SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
             summary = "开启后，打开未购付费章节时将自动扣费解锁\n余额不足时会提示错误，需要先开启登录状态"
             setDefaultValue(false)
-        }
+        }.also(screen::addPreference)
 
-        // ── User-Agent 预设
-        val uaPref = ListPreference(ctx).apply {
+        // ── 7. User-Agent 预设
+        ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
             summary = "%s"
             entries = arrayOf("移动版（默认）", "Windows Firefox", "禁用 User-Agent", "自定义（见下方输入框）")
             entryValues = arrayOf(UA_MOBILE, UA_DESKTOP, "", PREF_UA_CUSTOM_FLAG)
             setDefaultValue(UA_MOBILE)
-        }
+        }.also(screen::addPreference)
 
-        // ── User-Agent 自定义输入框
-        val uaCustomPref = EditTextPreference(ctx).apply {
+        // ── 8. User-Agent 自定义输入框
+        EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
             summary = "选择「自定义」时生效\n当前值：${preferences.getString(PREF_UA_CUSTOM, "").orEmpty().ifEmpty { "（未填写）" }}"
             dialogTitle = "输入自定义 User-Agent"
             setDefaultValue("")
-        }
-
-        // 统一添加（顺序即显示顺序）
-        arrayOf(
-            enableLoginPref,
-            usernamePref,
-            passwordPref,
-            logoutPref,
-            searchModePref,
-            autoPayPref,
-            uaPref,
-            uaCustomPref,
-        ).forEach(screen::addPreference)
+        }.also(screen::addPreference)
     }
 
+
+    // ── 密码登录（RSA 加密）
+    private fun loginWithPassword(username: String, password: String, enablePref: SwitchPreferenceCompat) {
+        Thread {
+            try {
+                // 1. 获取 RSA 公钥
+                val rsaResp = client.newCall(
+                    GET("$baseUrl/member/login/rsa/getKeys", headers),
+                ).execute()
+                val rsaJson = JSONObject(rsaResp.body.string())
+                val keyName = rsaJson.getString("keyName")
+                val nvalue = rsaJson.getString("nvalue")
+                val evalue = rsaJson.getString("evalue")
+                val sessionKey = rsaJson.getString("sessionKey")
+
+                // 2. 构造明文：lenChar(sessionKey)+sessionKey+lenChar(username)+username+lenChar(password)+password
+                fun lenChar(s: String) = s.length.toChar()
+                val plain = "${lenChar(sessionKey)}$sessionKey${lenChar(username)}$username${lenChar(password)}$password"
+
+                // 3. RSA 加密输出十六进制（修正参数顺序：模数=evalue，指数=nvalue）
+                val encrypted = rsaEncryptToHex(plain, evalue, nvalue)
+
+                // 4. 提交登录
+                val body = FormBody.Builder()
+                    .add("encnm", keyName)
+                    .add("encpw", encrypted)
+                    .add("returnUrl", "$baseUrl/")
+                    .add("loginType", "PHONE_NUMBER")
+                    .build()
+                val loginResp = client.newCall(
+                    POST("$baseUrl/member/login/doLoginById", headers, body),
+                ).execute()
+                val loginJson = JSONObject(loginResp.body.string())
+
+                if (loginJson.optInt("loginStatus", -1) == 0) {
+                    // 从响应头读 NEO_SES
+                    val setCookie = loginResp.header("Set-Cookie") ?: ""
+                    val neoSes = extractCookieValue(setCookie, "NEO_SES")
+                    if (neoSes.isNotEmpty()) {
+                        saveLoginCookie(neoSes, "")
+                        CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        enablePref.summary = buildLoginSummary()
+                        Toast.makeText(
+                            Injekt.get<android.app.Application>(),
+                            "登录成功",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                } else {
+                    val msg = loginJson.optString("loginMessage", "登录失败")
+                    throw Exception(msg)
+                }
+            } catch (e: Exception) {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(
+                        Injekt.get<android.app.Application>(),
+                        "登录失败：${e.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun rsaEncryptToHex(data: String, modulusHex: String, exponentHex: String): String {
+        val modulus = BigInteger(modulusHex, 16)
+        val exponent = BigInteger(exponentHex, 16)
+        val keySpec = RSAPublicKeySpec(modulus, exponent)
+        val publicKey = KeyFactory.getInstance("RSA").generatePublic(keySpec)
+        val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey)
+        val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
+        return encrypted.joinToString("") { "%02x".format(it) }
+    }
 
     // ── 后台 WebView 静默读取 Cookie（参考拷贝漫画 TokenProvider.V2）
     // 在主线程创建 WebView，加载咚漫，onPageFinished 检测到 NEO_SES 后保存并更新 summary
@@ -319,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val nextStartMap = mutableMapOf<String, Int>()
 
     private fun isMixedMode() =
-        preferences.getBoolean(PREF_SEARCH_MODE, false)
+        preferences.getString(PREF_SEARCH_MODE, SEARCH_MODE_JSON) == SEARCH_MODE_MIXED
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         if (isMixedMode() && page == 1) {
@@ -730,6 +785,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
+        private const val SEARCH_MODE_JSON = "json"
+        private const val SEARCH_MODE_MIXED = "mixed"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
