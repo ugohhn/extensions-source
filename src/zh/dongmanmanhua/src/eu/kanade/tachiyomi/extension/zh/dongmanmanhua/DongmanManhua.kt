@@ -125,14 +125,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
 
-        // ── 搜索模式
-        val searchModePref = ListPreference(ctx).apply {
+        // ── 搜索模式（开启=混合含小说，关闭=仅漫画JSON）
+        val searchModePref = SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
-            title = "搜索模式"
-            summary = "%s"
-            entries = arrayOf("仅漫画（JSON，速度快）", "混合结果（含小说，首页HTML）")
-            entryValues = arrayOf(SEARCH_MODE_JSON, SEARCH_MODE_MIXED)
-            setDefaultValue(SEARCH_MODE_JSON)
+            title = "搜索显示小说"
+            summary = "开启后搜索结果包含小说（首页HTML接口）\n关闭则只显示漫画（JSON接口，速度更快）"
+            setDefaultValue(false)
         }
 
         // ── 自动扣费开关
@@ -321,7 +319,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val nextStartMap = mutableMapOf<String, Int>()
 
     private fun isMixedMode() =
-        preferences.getString(PREF_SEARCH_MODE, SEARCH_MODE_JSON) == SEARCH_MODE_MIXED
+        preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         if (isMixedMode() && page == 1) {
@@ -732,8 +730,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
-        private const val SEARCH_MODE_JSON = "json"
-        private const val SEARCH_MODE_MIXED = "mixed"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
