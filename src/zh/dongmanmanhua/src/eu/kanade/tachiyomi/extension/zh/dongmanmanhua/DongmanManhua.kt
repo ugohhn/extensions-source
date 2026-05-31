@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -134,6 +135,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun saveLoginCookie(neoSes: String, neoChk: String) {
+        Log.d("CookieDebug", "saveLoginCookie: NEO_SES='$neoSes', NEO_CHK='$neoChk'")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
@@ -168,6 +170,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun cookieHeader(): String {
         val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        Log.d("CookieDebug", "cookieHeader: SP读取 NEO_SES='$neoSes', NEO_CHK='$neoChk'")
         return buildString {
             if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
             if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
@@ -429,6 +432,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
         // 显式注入 SharedPreferences 里的 NEO_SES/NEO_CHK，不依赖 CookieJar
         val savedCookie = cookieHeader()
+        Log.d("CookieDebug", "autoUnlockEpisode: savedCookie='$savedCookie'")
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
             .set("X-Requested-With", "XMLHttpRequest")
