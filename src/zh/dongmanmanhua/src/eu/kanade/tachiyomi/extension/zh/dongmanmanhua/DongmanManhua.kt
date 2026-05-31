@@ -2,14 +2,18 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.spec.RSAPublicKeySpec
+import javax.crypto.Cipher
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -53,8 +57,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // ── 登录模块（后台 WebView 静默读取 Cookie）
-        SwitchPreferenceCompat(ctx).apply {
+        // ── 1. 登录开关（WebView 静默读取 Cookie）
+        val enableLoginPref = SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
             summary = buildLoginSummary()
@@ -65,6 +69,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // ── 2. 账号输入框（密码登录用）
+        EditTextPreference(ctx).apply {
+            key = PREF_LOGIN_USERNAME
+            title = "账号（手机号或邮箱）"
+            summary = "用于密码登录，填写后再填密码触发登录"
+            dialogTitle = "输入账号"
+            setDefaultValue("")
+        }.also(screen::addPreference)
+
+        // ── 3. 密码输入框（填写后立即触发登录）
+        EditTextPreference(ctx).apply {
+            key = PREF_LOGIN_PASSWORD
+            title = "密码"
+            summary = "输入密码点确定后立即尝试登录"
+            dialogTitle = "输入密码"
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                val password = newValue as? String ?: ""
+                if (password.isNotBlank()) {
+                    val username = preferences.getString(PREF_LOGIN_USERNAME, "").orEmpty()
+                    if (username.isBlank()) {
+                        Toast.makeText(ctx, "请先填写账号", Toast.LENGTH_SHORT).show()
+                    } else {
+                        loginWithPassword(username, password, enableLoginPref)
+                    }
+                }
+                preferences.edit().remove(PREF_LOGIN_PASSWORD).apply()
+                false
+            }
+        }.also(screen::addPreference)
+
+        // ── 4. 退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
@@ -72,19 +108,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
+                enableLoginPref.isChecked = false
+                enableLoginPref.summary = buildLoginSummary()
                 false
             }
         }.also(screen::addPreference)
 
-        // ── 自动扣费
+        // ── 5. 搜索模式（仅漫画 vs 含小说）
+        ListPreference(ctx).apply {
+            key = PREF_SEARCH_MODE
+            title = "搜索模式"
+            summary = "%s"
+            entries = arrayOf("仅漫画（JSON，速度快）", "混合结果（含小说，首页HTML）")
+            entryValues = arrayOf(SEARCH_MODE_JSON, SEARCH_MODE_MIXED)
+            setDefaultValue(SEARCH_MODE_JSON)
+        }.also(screen::addPreference)
+
+        // ── 6. 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
-            summary = "开启后打开未购付费章节时将自动扣费\n余额不足时会提示错误，需要先开启登录状态"
+            summary = "开启后，打开未购付费章节时将自动扣费解锁\n余额不足时会提示错误，需要先开启登录状态"
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // ── User-Agent
+        // ── 7. User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -94,6 +142,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
+        // ── 8. User-Agent 自定义输入框
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -102,6 +151,84 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
     }
+
+
+    // ── 密码登录（RSA 加密）
+    private fun loginWithPassword(username: String, password: String, enablePref: SwitchPreferenceCompat) {
+        Thread {
+            try {
+                // 1. 获取 RSA 公钥
+                val rsaResp = client.newCall(
+                    GET("$baseUrl/member/login/rsa/getKeys", headers),
+                ).execute()
+                val rsaJson = JSONObject(rsaResp.body.string())
+                val keyName = rsaJson.getString("keyName")
+                val nvalue = rsaJson.getString("nvalue")
+                val evalue = rsaJson.getString("evalue")
+                val sessionKey = rsaJson.getString("sessionKey")
+
+                // 2. 构造明文：lenChar(sessionKey)+sessionKey+lenChar(username)+username+lenChar(password)+password
+                fun lenChar(s: String) = s.length.toChar()
+                val plain = "${lenChar(sessionKey)}$sessionKey${lenChar(username)}$username${lenChar(password)}$password"
+
+                // 3. RSA 加密输出十六进制
+                val encrypted = rsaEncryptToHex(plain, nvalue, evalue)
+
+                // 4. 提交登录
+                val body = FormBody.Builder()
+                    .add("encnm", keyName)
+                    .add("encpw", encrypted)
+                    .add("returnUrl", "$baseUrl/")
+                    .add("loginType", "PHONE_NUMBER")
+                    .build()
+                val loginResp = client.newCall(
+                    POST("$baseUrl/member/login/doLoginById", headers, body),
+                ).execute()
+                val loginJson = JSONObject(loginResp.body.string())
+
+                if (loginJson.optInt("loginStatus", -1) == 0) {
+                    // 从响应头读 NEO_SES
+                    val setCookie = loginResp.header("Set-Cookie") ?: ""
+                    val neoSes = extractCookieValue(setCookie, "NEO_SES")
+                    if (neoSes.isNotEmpty()) {
+                        saveLoginCookie(neoSes, "")
+                        CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        enablePref.summary = buildLoginSummary()
+                        Toast.makeText(
+                            Injekt.get<android.app.Application>(),
+                            "登录成功",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                } else {
+                    val msg = loginJson.optString("loginMessage", "登录失败")
+                    throw Exception(msg)
+                }
+            } catch (e: Exception) {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(
+                        Injekt.get<android.app.Application>(),
+                        "登录失败：${e.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun rsaEncryptToHex(data: String, modulusHex: String, exponentHex: String): String {
+        val modulus = BigInteger(modulusHex, 16)
+        val exponent = BigInteger(exponentHex, 16)
+        val keySpec = RSAPublicKeySpec(modulus, exponent)
+        val publicKey = KeyFactory.getInstance("RSA").generatePublic(keySpec)
+        val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey)
+        val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
+        return encrypted.joinToString("") { "%02x".format(it) }
+    }
+
     // ── 后台 WebView 静默读取 Cookie（参考拷贝漫画 TokenProvider.V2）
     // 在主线程创建 WebView，加载咚漫，onPageFinished 检测到 NEO_SES 后保存并更新 summary
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
@@ -135,7 +262,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun saveLoginCookie(neoSes: String, neoChk: String) {
-        Log.d("CookieDebug", "saveLoginCookie: NEO_SES='$neoSes', NEO_CHK='$neoChk'")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
@@ -170,7 +296,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun cookieHeader(): String {
         val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        Log.d("CookieDebug", "cookieHeader: SP读取 NEO_SES='$neoSes', NEO_CHK='$neoChk'")
         return buildString {
             if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
             if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
@@ -243,11 +368,33 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 搜索（全部用 /searchResult JSON，start=1+(page-1)*20）
-    // ══════════════════════════════════════════════════════════════════════
+    // 搜索：支持两种模式，由设置页 PREF_SEARCH_MODE 控制
+    // SEARCH_MODE_JSON  → 全部用 /searchResult JSON（仅漫画，速度快）
+    // SEARCH_MODE_MIXED → page=1 用 /search HTML（含小说），page>=2 用 /searchResult JSON
+    private val nextStartMap = mutableMapOf<String, Int>()
+
+    private fun isMixedMode() =
+        preferences.getString(PREF_SEARCH_MODE, SEARCH_MODE_JSON) == SEARCH_MODE_MIXED
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val start = 1 + (page - 1) * 20
+        if (isMixedMode() && page == 1) {
+            nextStartMap.remove(query)
+            val body = FormBody.Builder()
+                .add("searchType", "WEBTOON")
+                .add("keyword", query)
+                .build()
+            val headers = headersBuilder()
+                .set("Origin", baseUrl)
+                .set("Referer", "$baseUrl/search")
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .build()
+            return POST("$baseUrl/search", headers, body)
+        }
+        val start = if (isMixedMode()) {
+            nextStartMap[query] ?: (1 + (page - 1) * 20)
+        } else {
+            1 + (page - 1) * 20
+        }
         val body = FormBody.Builder()
             .add("keyword", query)
             .add("searchType", "WEBTOON")
@@ -263,10 +410,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
+        return if (response.request.url.toString().contains("/searchResult")) {
+            parseSearchResultJson(response)
+        } else {
+            parseSearchHtml(response)
+        }
+    }
+
+    private fun parseSearchHtml(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val allItems = document.select("ul._searchResultList > li")
+        val totalEntries = allItems.size
+        val entries = allItems
+            .mapNotNull { li -> li.selectFirst("a.cleFix")?.let { searchMangaFromElement(it) } }
+            .filter { it.title.isNotEmpty() }
+        val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
+        val hasNextPage = total > totalEntries
+        if (hasNextPage) {
+            val keyword = extractKeywordFromBody(response)
+            if (keyword.isNotEmpty()) nextStartMap[keyword] = totalEntries + 1
+        }
+        return MangasPage(entries, hasNextPage)
+    }
+
+    private fun parseSearchResultJson(response: Response): MangasPage {
         val json = JSONObject(response.body.string())
         val total = json.optInt("total", 0)
         val start = json.optInt("start", 0)
         val titleList = json.optJSONArray("titleList")
+        val rawCount = titleList?.length() ?: 0
 
         val entries = mutableListOf<SManga>()
         if (titleList != null) {
@@ -276,8 +448,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (platform != "ALL" && platform != "WEB") continue
                 val manga = SManga.create().apply {
                     val titleNo = item.optString("titleNo", "")
-                    // episodeList?titleNo=XXXX 会被服务器301跳转到完整路径
-                    // OkHttp跟随跳转后拿到正确的详情页，选择器正常工作
                     url = "/episodeList?titleNo=$titleNo"
                     title = item.optString("title", "")
                     thumbnail_url = buildThumbnailUrl(
@@ -289,9 +459,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (manga.title.isNotEmpty()) entries.add(manga)
             }
         }
-        val hasNextPage = (start - 1 + (titleList?.length() ?: 0)) < total
+        val hasNextPage = rawCount > 0 && (start - 1 + rawCount) < total
+        if (hasNextPage && isMixedMode()) {
+            val keyword = extractKeywordFromBody(response)
+            if (keyword.isNotEmpty()) nextStartMap[keyword] = start + rawCount
+        }
         return MangasPage(entries, hasNextPage)
     }
+
+    private fun extractKeywordFromBody(response: Response): String {
+        val body = response.request.body
+        if (body is FormBody) {
+            for (i in 0 until body.size) {
+                if (body.name(i) == "keyword") return body.value(i)
+            }
+        }
+        return ""
+    }
+
 
     // ══════════════════════════════════════════════════════════════════════
     // 漫画详情
@@ -432,7 +617,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
         // 显式注入 SharedPreferences 里的 NEO_SES/NEO_CHK，不依赖 CookieJar
         val savedCookie = cookieHeader()
-        Log.d("CookieDebug", "autoUnlockEpisode: savedCookie='$savedCookie'")
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
             .set("X-Requested-With", "XMLHttpRequest")
@@ -597,7 +781,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
+        private const val PREF_LOGIN_USERNAME = "pref_login_username"
+        private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
+        private const val PREF_SEARCH_MODE = "pref_search_mode"
+        private const val SEARCH_MODE_JSON = "json"
+        private const val SEARCH_MODE_MIXED = "mixed"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
