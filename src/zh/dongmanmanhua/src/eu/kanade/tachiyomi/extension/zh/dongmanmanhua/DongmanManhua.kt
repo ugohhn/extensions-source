@@ -58,7 +58,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
 
         // ── 1. 登录开关（WebView 静默读取 Cookie）
-        val enableLoginPref = SwitchPreferenceCompat(ctx).apply {
+        SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
             summary = buildLoginSummary()
@@ -69,11 +69,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 2. 账号输入框（密码登录用）
+        // ── 2. 账号输入框（密码登录）
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
-            summary = "用于密码登录，填写后再填密码触发登录"
+            summary = "用于密码登录，需先填账号再填密码"
             dialogTitle = "输入账号"
             setDefaultValue("")
         }.also(screen::addPreference)
@@ -82,7 +82,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
-            summary = "输入密码点确定后立即尝试登录"
+            summary = "输入密码点确定后立即尝试 RSA 登录"
             dialogTitle = "输入密码"
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
@@ -92,7 +92,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     if (username.isBlank()) {
                         Toast.makeText(ctx, "请先填写账号", Toast.LENGTH_SHORT).show()
                     } else {
-                        loginWithPassword(username, password, enableLoginPref)
+                        loginWithPassword(username, password)
                     }
                 }
                 preferences.edit().remove(PREF_LOGIN_PASSWORD).apply()
@@ -108,20 +108,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
-                enableLoginPref.isChecked = false
-                enableLoginPref.summary = buildLoginSummary()
                 false
             }
         }.also(screen::addPreference)
 
-        // ── 5. 搜索模式（仅漫画 vs 含小说）
-        ListPreference(ctx).apply {
+        // ── 5. 搜索显示小说
+        SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
-            title = "搜索模式"
-            summary = "%s"
-            entries = arrayOf("仅漫画（JSON，速度快）", "混合结果（含小说，首页HTML）")
-            entryValues = arrayOf(SEARCH_MODE_JSON, SEARCH_MODE_MIXED)
-            setDefaultValue(SEARCH_MODE_JSON)
+            title = "搜索显示小说"
+            summary = "开启后搜索结果包含小说（首页HTML接口）\n关闭则只显示漫画（JSON接口，速度更快）"
+            setDefaultValue(false)
         }.also(screen::addPreference)
 
         // ── 6. 自动扣费开关
@@ -153,8 +149,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
 
-    // ── 密码登录（RSA 加密）
-    private fun loginWithPassword(username: String, password: String, enablePref: SwitchPreferenceCompat) {
+    private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
                 // 1. 获取 RSA 公钥
@@ -171,7 +166,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 fun lenChar(s: String) = s.length.toChar()
                 val plain = "${lenChar(sessionKey)}$sessionKey${lenChar(username)}$username${lenChar(password)}$password"
 
-                // 3. RSA 加密输出十六进制（修正参数顺序：模数=evalue，指数=nvalue）
+                // 3. RSA 加密输出十六进制
                 val encrypted = rsaEncryptToHex(plain, evalue, nvalue)
 
                 // 4. 提交登录
@@ -195,7 +190,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
                     }
                     Handler(Looper.getMainLooper()).post {
-                        enablePref.summary = buildLoginSummary()
                         Toast.makeText(
                             Injekt.get<android.app.Application>(),
                             "登录成功",
@@ -374,7 +368,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val nextStartMap = mutableMapOf<String, Int>()
 
     private fun isMixedMode() =
-        preferences.getString(PREF_SEARCH_MODE, SEARCH_MODE_JSON) == SEARCH_MODE_MIXED
+        preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         if (isMixedMode() && page == 1) {
@@ -785,8 +779,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
-        private const val SEARCH_MODE_JSON = "json"
-        private const val SEARCH_MODE_MIXED = "mixed"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
