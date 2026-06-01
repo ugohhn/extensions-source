@@ -57,7 +57,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // ⭐ 数据迁移：修复旧版本可能存储的字符串型布尔值（避免 ClassCastException）
+        // ⭐ 数据迁移：修复旧版本存储的字符串型布尔值（避免 ClassCastException）
         val booleanKeys = listOf(
             PREF_ENABLE_LOGIN,
             PREF_LOGOUT_TRIGGER,
@@ -120,13 +120,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 4. 退出登录（一次性触发器，不持久化）
+        // ── 4. 退出登录（保持原样，仍是开关，但不持久化状态？原代码没有设置持久化，沿用即可）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
-            setPersistent(false)   // ⭐ 避免读取可能的错误类型
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 false
