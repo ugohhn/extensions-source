@@ -126,7 +126,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
-            isPersistent = false   // ⭐ 避免读取可能的错误类型
+            setPersistent(false)   // ⭐ 避免读取可能的错误类型
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 false
