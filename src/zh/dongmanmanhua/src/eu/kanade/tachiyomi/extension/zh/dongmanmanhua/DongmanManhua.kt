@@ -8,6 +8,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -57,12 +58,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // ⭐ 数据迁移：修复旧版本存储的字符串型布尔值（避免 ClassCastException）
+        // 数据迁移：修复旧版本存储的字符串型布尔值（避免 ClassCastException）
         val booleanKeys = listOf(
             PREF_ENABLE_LOGIN,
-            PREF_LOGOUT_TRIGGER,
             PREF_SEARCH_MODE,
             PREF_AUTO_PAY
+            // PREF_LOGOUT_TRIGGER 已废弃，不再使用
         )
         val editor = preferences.edit()
         booleanKeys.forEach { key ->
@@ -70,12 +71,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 is String -> {
                     val boolValue = value.toBooleanStrictOrNull() ?: false
                     editor.putBoolean(key, boolValue)
-                    editor.remove(key) // 删除字符串版本的旧键
+                    editor.remove(key)
                 }
             }
         }
+        // 清理旧的退出登录开关可能残留的垃圾数据
+        if (preferences.all[PREF_LOGOUT_TRIGGER] is String) {
+            editor.remove(PREF_LOGOUT_TRIGGER)
+        }
         editor.apply()
-        // ---------------------------------------------------------------
 
         // ── 1. 登录开关（WebView 静默读取 Cookie）
         SwitchPreferenceCompat(ctx).apply {
@@ -120,15 +124,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 4. 退出登录（保持原样，仍是开关，但不持久化状态？原代码没有设置持久化，沿用即可）
-        SwitchPreferenceCompat(ctx).apply {
+        // ── 4. 退出登录（改为普通按钮，不持久化）
+        Preference(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
-            setDefaultValue(false)
-            setOnPreferenceChangeListener { _, _ ->
+            setOnPreferenceClickListener {
                 clearLoginCookie()
-                false
+                Toast.makeText(ctx, "已退出登录", Toast.LENGTH_SHORT).show()
+                true
             }
         }.also(screen::addPreference)
 
@@ -243,8 +247,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return encrypted.joinToString("") { "%02x".format(it) }
     }
 
-    // ── 后台 WebView 静默读取 Cookie（参考拷贝漫画 TokenProvider.V2）
-    // 在主线程创建 WebView，加载咚漫，onPageFinished 检测到 NEO_SES 后保存并更新 summary
+    // ── 后台 WebView 静默读取 Cookie
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
         val app = Injekt.get<android.app.Application>()
         Handler(Looper.getMainLooper()).post {
@@ -270,7 +273,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
                 loadUrl("$baseUrl/member/mypage")
             }
-            // 15 秒超时销毁
             Handler(Looper.getMainLooper()).postDelayed({ webView.destroy() }, 15_000)
         }
     }
@@ -287,6 +289,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .remove(KEY_NEO_SES)
             .remove(KEY_NEO_CHK)
             .apply()
+        // 刷新登录开关的摘要
+        // 可以后续通过回调更新，但简单起见，用户重新进入设置页会刷新
     }
 
     private fun buildLoginSummary(): String {
@@ -306,7 +310,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.removePrefix("$key=")
             ?.trim() ?: ""
 
-    // Cookie 头：优先用 SharedPreferences 持久化的 NEO_SES/NEO_CHK
     private fun cookieHeader(): String {
         val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
@@ -323,10 +326,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // Headers
-    // ══════════════════════════════════════════════════════════════════════
-
     override fun headersBuilder(): Headers.Builder {
         val builder = super.headersBuilder().set("Referer", "$baseUrl/")
         val ua = currentUserAgent()
@@ -335,10 +334,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override val client = network.client
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 首页（Popular）
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int) =
         GET("$baseUrl/?pageName=home", headers)
@@ -353,10 +348,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 最新更新（Latest）
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) =
         GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
@@ -381,10 +372,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return MangasPage(entries, false)
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 搜索：支持两种模式，由设置页 PREF_SEARCH_MODE 控制
-    // SEARCH_MODE_JSON  → 全部用 /searchResult JSON（仅漫画，速度快）
-    // SEARCH_MODE_MIXED → page=1 用 /search HTML（含小说），page>=2 用 /searchResult JSON
     private val nextStartMap = mutableMapOf<String, Int>()
 
     private fun isMixedMode() =
@@ -491,12 +478,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return ""
     }
 
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 漫画详情
-    // 封面直接沿用搜索/列表时已获取的 thumbnail_url，不重新提取
-    // ══════════════════════════════════════════════════════════════════════
-
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
@@ -525,22 +506,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             description = detailDiv?.selectFirst("p.summary span.ellipsis")?.text()
                 ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-            // 状态：从页面内嵌 JS 的 serial_status 变量读取
-            // SERIES=连载中, TERMINATION=已完结, REST=暂停更新
             status = when (extractSerialStatus(document.html())) {
                 "SERIES" -> SManga.ONGOING
                 "TERMINATION" -> SManga.COMPLETED
                 "REST" -> SManga.ON_HIATUS
                 else -> SManga.UNKNOWN
             }
-
-            // 封面不在这里赋值，Mihon 会保留已有的 thumbnail_url
         }
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 章节列表（倒序返回，最新话在前）
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
@@ -573,7 +546,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val rawName = a.selectFirst("p.sub_title span.ellipsis")?.text()
                             ?: a.selectFirst("p.sub_title")?.text()
                             ?: "第${li.attr("data-episode-no")}话"
-                        // 付费且未解锁的章节加🔒前缀，已购(data-free=true)不加
                         name = if (isFree) rawName else "🔒 $rawName"
                         date_upload = dateFormat.tryParse(
                             a.selectFirst("p.date")?.text()?.trim().orEmpty(),
@@ -595,25 +567,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
         }
 
-        // 倒序：最新话在前，第1话在末尾
         return chapters.reversed()
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面
-    // ══════════════════════════════════════════════════════════════════════
-
     override fun pageListRequest(chapter: SChapter): Request {
-        // network.client 的 CookieJar 自动保存 WebView 登录态，直接用 headers 即可
         val reqHeaders = headersBuilder().apply {
-            // 如果用户额外填了手动 Cookie，叠加进去
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
 
-        // 自动扣费：开关开启时执行，Cookie 由 CookieJar 自动携带
         val autoPay = preferences.getBoolean(PREF_AUTO_PAY, false)
         if (autoPay) {
             val titleNo = extractUrlParam(chapter.url, "title_no")
@@ -626,10 +590,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return GET(baseUrl + chapter.url, reqHeaders)
     }
 
-    // 用 client 直接发请求，CookieJar 自动带上 WebView 登录态的 Cookie
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        // 显式注入 SharedPreferences 里的 NEO_SES/NEO_CHK，不依赖 CookieJar
         val savedCookie = cookieHeader()
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
@@ -637,18 +599,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
 
-        // 1. 查询价格和余额
         val priceResp = client.newCall(
             GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders),
         ).execute()
-        val priceJson = org.json.JSONObject(priceResp.body.string())
+        val priceJson = JSONObject(priceResp.body.string())
         val data = priceJson.optJSONObject("data") ?: return
 
         val isFree = data.optBoolean("free", true)
-        if (isFree) return  // 已解锁或免费
+        if (isFree) return
 
         val isLimit = data.optBoolean("isLimit", false)
-        if (isLimit) return  // 仅限 App，无法网页购买
+        if (isLimit) return
 
         val price = data.optInt("price", 0)
         val coinCount = data.optInt("coinCount", 0)
@@ -658,11 +619,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
         }
 
-        // 2. 余额足够，静默扣费
         val payResp = client.newCall(
             GET("$baseUrl/episode/unlock/pay?$params", reqHeaders),
         ).execute()
-        val payJson = org.json.JSONObject(payResp.body.string())
+        val payJson = JSONObject(payResp.body.string())
         if (payJson.optInt("code") != 200) return
     }
 
@@ -673,14 +633,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun pageListParse(response: Response): List<Page> {
         val html = response.body.string()
-        // 图片数据在页面内嵌 JS 的 var imageList = [{url:"...", ...}, ...]
         val imageRegex = Regex("""url\s*:\s*"(https://cdn\.dongmanmanhua\.cn/[^"]+)"""")
         return imageRegex.findAll(html)
             .mapIndexed { i, match -> Page(i, imageUrl = match.groupValues[1]) }
             .toList()
     }
 
-    // 图片来自 cdn.dongmanmanhua.cn，需要带 Referer 才能正常加载
     override fun imageRequest(page: Page): Request {
         return GET(
             page.imageUrl!!,
@@ -693,19 +651,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 工具函数
-    // ══════════════════════════════════════════════════════════════════════
-
-    // 从页面内嵌 JS 提取 serial_status 值
-    // 格式：serial_status: 'SERIES'  或  "serial_status":"SERIES"
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
         return regex.find(html)?.groupValues?.get(1) ?: ""
     }
 
-    // 从 info_update 区域提取更新周期标签
-    // 连载中返回如"每周二更新"，完结返回""（状态已单独处理）
     private fun extractUpdateTag(html: String): String {
         val regex = Regex("""在(周[一二三四五六七日天])更新""")
         val match = regex.find(html) ?: return ""
@@ -785,10 +735,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 常量
-    // ══════════════════════════════════════════════════════════════════════
 
     companion object {
         private const val PREF_UA = "pref_user_agent"
