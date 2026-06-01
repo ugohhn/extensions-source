@@ -57,6 +57,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
+        // ⭐ 数据迁移：修复旧版本可能存储的字符串型布尔值（避免 ClassCastException）
+        val booleanKeys = listOf(
+            PREF_ENABLE_LOGIN,
+            PREF_LOGOUT_TRIGGER,
+            PREF_SEARCH_MODE,
+            PREF_AUTO_PAY
+        )
+        val editor = preferences.edit()
+        booleanKeys.forEach { key ->
+            when (val value = preferences.all[key]) {
+                is String -> {
+                    val boolValue = value.toBooleanStrictOrNull() ?: false
+                    editor.putBoolean(key, boolValue)
+                    editor.remove(key) // 删除字符串版本的旧键
+                }
+            }
+        }
+        editor.apply()
+        // ---------------------------------------------------------------
+
         // ── 1. 登录开关（WebView 静默读取 Cookie）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
@@ -100,12 +120,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 4. 退出登录
+        // ── 4. 退出登录（一次性触发器，不持久化）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
             summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
+            isPersistent = false   // ⭐ 避免读取可能的错误类型
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
                 false
