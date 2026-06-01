@@ -41,20 +41,6 @@ import java.util.Locale
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
     init {
-        // 迁移：将旧版 ListPreference 存储的字符串 "true"/"false" 转为布尔值
-        // 防止 SwitchPreferenceCompat 的 getBoolean 读取时崩溃
-        val editor = preferences.edit()
-        preferences.all.forEach { (key, value) ->
-            if (value is String) {
-                when (value.lowercase()) {
-                    "true" -> editor.putBoolean(key, true)
-                    "false" -> editor.putBoolean(key, false)
-                    else -> return@forEach
-                }
-                editor.remove(key)
-            }
-        }
-        editor.apply()
         // 确保 CookieManager 接受 Cookie
         Handler(Looper.getMainLooper()).post {
             CookieManager.getInstance().setAcceptCookie(true)
@@ -77,6 +63,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
+
+        // 迁移：将旧版 ListPreference 存储的字符串 "true"/"false" 转为布尔值
+        val editor = preferences.edit()
+        var needApply = false
+        preferences.all.forEach { (key, value) ->
+            if (value is String) {
+                when (value.lowercase()) {
+                    "true" -> { editor.putBoolean(key, true); editor.remove(key); needApply = true }
+                    "false" -> { editor.putBoolean(key, false); editor.remove(key); needApply = true }
+                    else -> {}
+                }
+            }
+        }
+        if (needApply) editor.apply()
 
         // ── 1. 登录开关（WebView 静默读取 Cookie）
         SwitchPreferenceCompat(ctx).apply {
