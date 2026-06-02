@@ -35,6 +35,7 @@ import org.jsoup.nodes.Element
 import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -56,14 +57,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val cdnBase = "https://cdn.dongmanmanhua.cn"
     private val preferences by getPreferencesLazy()
+    private val appContext by lazy { Injekt.get<android.app.Application>() }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 设置页（与原版完全相同）
+    // 私有文件存储（独立存储开关）
+    // ══════════════════════════════════════════════════════════════════════
+    private fun getCookieFile(): File = File(appContext.filesDir, "dongman_cookie")
+    private fun saveCookieToFile(neoSes: String, neoChk: String) {
+        try {
+            getCookieFile().writeText("$neoSes|$neoChk")
+            Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
+        } catch (e: Exception) {
+            Log.e("DongmanCookie", "写入文件失败", e)
+        }
+    }
+    private fun readCookieFromFile(): Pair<String, String> {
+        return try {
+            val content = getCookieFile().readText()
+            val parts = content.split("|")
+            if (parts.size == 2) parts[0] to parts[1] else "" to ""
+        } catch (e: Exception) {
+            "" to ""
+        }
+    }
+    private fun deleteCookieFile() {
+        try {
+            getCookieFile().delete()
+            Log.d("DongmanCookie", "Cookie 文件已删除")
+        } catch (e: Exception) {
+            Log.e("DongmanCookie", "删除文件失败", e)
+        }
+    }
+
+    private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 设置页
     // ══════════════════════════════════════════════════════════════════════
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
+        // 迁移旧设置
         val editor = preferences.edit()
         var needApply = false
         preferences.all.forEach { (key, value) ->
@@ -77,6 +112,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         if (needApply) editor.apply()
 
+        // 独立存储开关
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_INDEPENDENT_STORAGE
+            title = "独立存储 Cookie"
+            summary = "开启后使用私有文件保存登录态，不受清除全局Cookie影响"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        // 登录开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
@@ -161,7 +205,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 登录相关（只增加日志）
+    // 登录相关
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -200,7 +244,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Log.e("DongmanCookie", "密码登录响应中未找到 NEO_SES")
                     }
                     Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(Injekt.get<android.app.Application>(), "登录成功", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
                     val msg = loginJson.optString("loginMessage", "登录失败")
@@ -210,7 +254,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             } catch (e: Exception) {
                 Log.e("DongmanCookie", "密码登录异常", e)
                 Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(Injekt.get<android.app.Application>(), "登录失败：${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(appContext, "登录失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
@@ -229,11 +273,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
         Log.d("DongmanCookie", "=== 启动 WebView 登录 ===")
-        val app = Injekt.get<android.app.Application>()
+        val app = appContext
         Handler(Looper.getMainLooper()).post {
             val webView = WebView(app).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                settings.userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
                 CookieManager.getInstance().setAcceptCookie(true)
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -266,24 +311,32 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
             .apply()
-        Log.d("DongmanCookie", "saveLoginCookie: 已写入 SP")
+        if (useIndependentStorage()) {
+            saveCookieToFile(neoSes, neoChk)
+        }
     }
 
     private fun clearLoginCookie() {
         Log.d("DongmanCookie", "clearLoginCookie: 清除所有登录信息", Throwable())
         CookieManager.getInstance().removeAllCookies(null)
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        Log.d("DongmanCookie", "clearLoginCookie: 清除完成")
+        if (useIndependentStorage()) {
+            deleteCookieFile()
+        }
     }
 
     private fun buildLoginSummary(): String {
-        val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-        val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-        val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        Log.d("DongmanCookie", "buildLoginSummary: CookieManager=$cmCookie, SP: neoSes=$spNeoSes, neoChk=$spNeoChk")
-        val neoSes = extractCookieValue(cmCookie, "NEO_SES").ifEmpty { spNeoSes }
-        val status = if (neoSes.isNotEmpty()) "已登录（NEO_SES: ${neoSes.take(8)}...）" else "未登录"
-        return "启用后将使用登录状态搜寻/载入漫画，重启此开关刷新登录信息\n登录状态：$status"
+        val independent = useIndependentStorage()
+        val hasCookie = if (independent) {
+            val (neoSes, _) = readCookieFromFile()
+            neoSes.isNotEmpty()
+        } else {
+            val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+            cmCookie.contains("NEO_SES") || preferences.getString(KEY_NEO_SES, "").orEmpty().isNotEmpty()
+        }
+        val status = if (hasCookie) "已登录" else "未登录"
+        Log.d("DongmanCookie", "buildLoginSummary: 独立存储=$independent, 状态=$status")
+        return "Cookie存储方式：${if (independent) "私有文件（独立）" else "CookieManager/SP"}\n启用后将使用登录状态搜寻/载入漫画，重启此开关刷新登录信息\n登录状态：$status"
     }
 
     private fun extractCookieValue(cookieStr: String, key: String): String =
@@ -294,20 +347,36 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.trim() ?: ""
 
     private fun cookieHeader(): String {
-        val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-        Log.d("DongmanCookie", "cookieHeader: CookieManager 返回 = $cmCookie")
-        if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
-            Log.d("DongmanCookie", "cookieHeader: 使用 CookieManager 的 Cookie")
-            return cmCookie
+        if (useIndependentStorage()) {
+            val (neoSes, neoChk) = readCookieFromFile()
+            if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
+                Log.d("DongmanCookie", "cookieHeader: 使用文件 Cookie")
+                return "NEO_SES=$neoSes; NEO_CHK=$neoChk"
+            }
+            val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+            val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+            if (spNeoSes.isNotEmpty() && spNeoChk.isNotEmpty()) {
+                Log.d("DongmanCookie", "cookieHeader: 降级使用 SP Cookie")
+                return "NEO_SES=$spNeoSes; NEO_CHK=$spNeoChk"
+            }
+            Log.w("DongmanCookie", "cookieHeader: 独立存储模式下未找到 Cookie")
+            return ""
+        } else {
+            val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+            Log.d("DongmanCookie", "cookieHeader: CookieManager 返回 = $cmCookie")
+            if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
+                Log.d("DongmanCookie", "cookieHeader: 使用 CookieManager 的 Cookie")
+                return cmCookie
+            }
+            val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+            val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+            val result = buildString {
+                if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
+                if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
+            }.trimEnd(';', ' ')
+            Log.d("DongmanCookie", "cookieHeader: 使用 SP 构造的 Cookie = $result (neoSes=$neoSes, neoChk=$neoChk)")
+            return result
         }
-        val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-        val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        val result = buildString {
-            if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
-            if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
-        }.trimEnd(';', ' ')
-        Log.d("DongmanCookie", "cookieHeader: 使用 SP 构造的 Cookie = $result (neoSes=$neoSes, neoChk=$neoChk)")
-        return result
     }
 
     private fun currentUserAgent(): String {
@@ -730,6 +799,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
+        private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
 
