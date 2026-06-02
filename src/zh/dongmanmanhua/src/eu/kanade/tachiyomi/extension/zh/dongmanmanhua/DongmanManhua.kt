@@ -73,15 +73,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
-            // 调试提示（可选）
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(appContext, "独立存储已保存", Toast.LENGTH_SHORT).show()
-            }
         } catch (e: Exception) {
             Log.e("DongmanCookie", "写入文件失败", e)
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(appContext, "写入独立存储失败: ${e.message}", Toast.LENGTH_LONG).show()
-            }
         }
     }
 
@@ -145,18 +138,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private lateinit var enableLoginSwitch: SwitchPreferenceCompat
-    private lateinit var debugStatusPref: androidx.preference.Preference
-
-    private fun updateFileStatusSummary(): String {
-        val file = getCookieFile()
-        if (!file.exists()) return "文件不存在"
-        val (neoSes, neoChk) = readCookieFromFile()
-        return if (neoSes.isNotEmpty()) {
-            "文件存在，NEO_SES=${neoSes.take(8)}... NEO_CHK=${neoChk.take(8)}..."
-        } else {
-            "文件存在但内容为空"
-        }
-    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -183,7 +164,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
                 enableLoginSwitch.summary = buildLoginSummary()
-                debugStatusPref.summary = updateFileStatusSummary()
                 true
             }
         }.also(screen::addPreference)
@@ -288,18 +268,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 调试：独立存储文件状态（使用全限定名避免歧义）
-        androidx.preference.Preference(ctx).apply {
-            key = "debug_file_status"
-            title = "独立存储文件状态"
-            summary = updateFileStatusSummary()
-            setOnPreferenceClickListener {
-                summary = updateFileStatusSummary()
-                true
-            }
-            debugStatusPref = this
-        }.also(screen::addPreference)
-
         refreshCookieCache()
     }
 
@@ -343,7 +311,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     Handler(Looper.getMainLooper()).post {
                         enableLoginSwitch.isChecked = true
                         enableLoginSwitch.summary = buildLoginSummary()
-                        debugStatusPref.summary = updateFileStatusSummary()
                         Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
@@ -404,7 +371,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             Handler(Looper.getMainLooper()).post {
                                 pref.isChecked = true
                                 pref.summary = buildLoginSummary()
-                                debugStatusPref.summary = updateFileStatusSummary()
                                 Toast.makeText(app, "WebView 登录成功", Toast.LENGTH_SHORT).show()
                             }
                             view?.stopLoading()
@@ -446,7 +412,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
         enableLoginSwitch.isChecked = false
         enableLoginSwitch.summary = buildLoginSummary()
-        debugStatusPref.summary = updateFileStatusSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
@@ -462,7 +427,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
         // 不改变 enableLoginSwitch.isChecked，因为实际登录态可能还在
         enableLoginSwitch.summary = buildLoginSummary()
-        debugStatusPref.summary = updateFileStatusSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
