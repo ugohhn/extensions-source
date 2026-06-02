@@ -9,7 +9,6 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -146,9 +145,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private lateinit var enableLoginSwitch: SwitchPreferenceCompat
-    private lateinit var debugStatusPref: Preference
+    private lateinit var debugStatusPref: androidx.preference.Preference
 
-    // 辅助函数：更新独立存储文件状态显示
     private fun updateFileStatusSummary(): String {
         val file = getCookieFile()
         if (!file.exists()) return "文件不存在"
@@ -290,8 +288,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 调试：独立存储文件状态（可点击刷新）
-        Preference(ctx).apply {
+        // 调试：独立存储文件状态（使用全限定名避免歧义）
+        androidx.preference.Preference(ctx).apply {
             key = "debug_file_status"
             title = "独立存储文件状态"
             summary = updateFileStatusSummary()
@@ -372,7 +370,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录（动态 UA）- 重点修复：确保状态更新
+    // WebView 登录（动态 UA）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
@@ -402,7 +400,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 cachedCookie = buildCookieString(neoSes, neoChk)
                                 lastIndependentState = useIndependentStorage()
                             }
-                            // 强制刷新缓存
                             refreshCookieCache()
                             Handler(Looper.getMainLooper()).post {
                                 pref.isChecked = true
