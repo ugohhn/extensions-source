@@ -174,7 +174,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
-            setEnabled(false)   // 修复：使用 setEnabled(false) 代替 isEnabled = false
+            setEnabled(false)
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
@@ -267,17 +267,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             summary = "选择「自定义」时生效\n当前值：${preferences.getString(PREF_UA_CUSTOM, "").orEmpty().ifEmpty { "（未填写）" }}"
             dialogTitle = "输入自定义 User-Agent"
             setDefaultValue("")
-        }.also(screen::addPreference)
-
-        // 调试按钮（使用全限定名避免冲突）
-        androidx.preference.Preference(ctx).apply {
-            key = "debug_show_cookie"
-            title = "调试：显示 Cookie 文件内容"
-            setOnPreferenceClickListener {
-                val (neoSes, neoChk) = readCookieFromFile()
-                Toast.makeText(ctx, "文件内容:\nNEO_SES=$neoSes\nNEO_CHK=$neoChk", Toast.LENGTH_LONG).show()
-                true
-            }
         }.also(screen::addPreference)
 
         refreshCookieCache()
@@ -880,4 +869,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
