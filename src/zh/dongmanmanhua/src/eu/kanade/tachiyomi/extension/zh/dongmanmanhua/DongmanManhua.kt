@@ -9,6 +9,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -73,8 +74,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
+            // 调试提示（可选）
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(appContext, "独立存储已保存", Toast.LENGTH_SHORT).show()
+            }
         } catch (e: Exception) {
             Log.e("DongmanCookie", "写入文件失败", e)
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(appContext, "写入独立存储失败: ${e.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -138,6 +146,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private lateinit var enableLoginSwitch: SwitchPreferenceCompat
+    private lateinit var debugStatusPref: Preference
+
+    // 辅助函数：更新独立存储文件状态显示
+    private fun updateFileStatusSummary(): String {
+        val file = getCookieFile()
+        if (!file.exists()) return "文件不存在"
+        val (neoSes, neoChk) = readCookieFromFile()
+        return if (neoSes.isNotEmpty()) {
+            "文件存在，NEO_SES=${neoSes.take(8)}... NEO_CHK=${neoChk.take(8)}..."
+        } else {
+            "文件存在但内容为空"
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -164,6 +185,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
                 enableLoginSwitch.summary = buildLoginSummary()
+                debugStatusPref.summary = updateFileStatusSummary()
                 true
             }
         }.also(screen::addPreference)
@@ -209,8 +231,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ---------- 两套退出/清除开关 ----------
-        // 1. 彻底退出登录（原行为）
+        // 彻底退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "彻底退出登录"
@@ -222,7 +243,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 2. 仅清除独立存储备份
+        // 仅清除独立存储备份
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_CLEAR_BACKUP
             title = "清除独立存储备份"
@@ -269,6 +290,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
+        // 调试：独立存储文件状态（可点击刷新）
+        Preference(ctx).apply {
+            key = "debug_file_status"
+            title = "独立存储文件状态"
+            summary = updateFileStatusSummary()
+            setOnPreferenceClickListener {
+                summary = updateFileStatusSummary()
+                true
+            }
+            debugStatusPref = this
+        }.also(screen::addPreference)
+
         refreshCookieCache()
     }
 
@@ -312,6 +345,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     Handler(Looper.getMainLooper()).post {
                         enableLoginSwitch.isChecked = true
                         enableLoginSwitch.summary = buildLoginSummary()
+                        debugStatusPref.summary = updateFileStatusSummary()
                         Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
@@ -338,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录（动态 UA）
+    // WebView 登录（动态 UA）- 重点修复：确保状态更新
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
@@ -357,16 +391,32 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
                         if (neoSes.isNotEmpty()) {
-                            saveLoginCookie(neoSes, neoChk)
+                            // 直接保存，同时更新内存缓存和文件
+                            preferences.edit()
+                                .putString(KEY_NEO_SES, neoSes)
+                                .putString(KEY_NEO_CHK, neoChk)
+                                .apply()
+                            if (useIndependentStorage()) {
+                                saveCookieToFile(neoSes, neoChk)  // 内部会设置 cachedCookie
+                            } else {
+                                cachedCookie = buildCookieString(neoSes, neoChk)
+                                lastIndependentState = useIndependentStorage()
+                            }
+                            // 强制刷新缓存
                             refreshCookieCache()
                             Handler(Looper.getMainLooper()).post {
                                 pref.isChecked = true
                                 pref.summary = buildLoginSummary()
+                                debugStatusPref.summary = updateFileStatusSummary()
+                                Toast.makeText(app, "WebView 登录成功", Toast.LENGTH_SHORT).show()
                             }
                             view?.stopLoading()
                             view?.destroy()
                         } else {
                             Log.w("DongmanCookie", "WebView 登录后未找到 NEO_SES")
+                            Handler(Looper.getMainLooper()).post {
+                                Toast.makeText(app, "登录失败：未获取到Cookie", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
                 }
@@ -388,8 +438,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // ---------- 两个功能 ----------
-    // 彻底退出登录（清除所有：CookieManager, SP, 文件）
+    // 彻底退出登录
     private fun fullLogout() {
         Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
@@ -400,12 +449,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
         enableLoginSwitch.isChecked = false
         enableLoginSwitch.summary = buildLoginSummary()
+        debugStatusPref.summary = updateFileStatusSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
     }
 
-    // 仅清除独立存储备份（不影响 CookieManager）
+    // 仅清除独立存储备份
     private fun clearBackupOnly() {
         Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
@@ -415,6 +465,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
         // 不改变 enableLoginSwitch.isChecked，因为实际登录态可能还在
         enableLoginSwitch.summary = buildLoginSummary()
+        debugStatusPref.summary = updateFileStatusSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
@@ -869,4 +920,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
