@@ -59,18 +59,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val preferences by getPreferencesLazy()
     private val appContext by lazy { Injekt.get<android.app.Application>() }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 私有文件存储（独立存储开关）
-    // ══════════════════════════════════════════════════════════════════════
-    private fun getCookieFile(): File = File(appContext.filesDir, "dongman_cookie")
+    // ---------- 独立存储（问题四：专用目录） ----------
+    private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
+    private fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
+
+    // ---------- Cookie 内存缓存（问题五） ----------
+    private var cachedCookie: String? = null
+    private var lastIndependentState: Boolean? = null
+
     private fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
             Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
+            cachedCookie = buildCookieString(neoSes, neoChk)
         } catch (e: Exception) {
             Log.e("DongmanCookie", "写入文件失败", e)
         }
     }
+
     private fun readCookieFromFile(): Pair<String, String> {
         return try {
             val content = getCookieFile().readText()
@@ -80,6 +86,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "" to ""
         }
     }
+
     private fun deleteCookieFile() {
         try {
             getCookieFile().delete()
@@ -89,7 +96,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun buildCookieString(neoSes: String, neoChk: String): String = buildString {
+        if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
+        if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
+    }.trimEnd(';', ' ')
+
     private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
+
+    private fun refreshCookieCache() {
+        val independent = useIndependentStorage()
+        val cookie = if (independent) {
+            val (neoSes, neoChk) = readCookieFromFile()
+            if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
+                buildCookieString(neoSes, neoChk)
+            } else {
+                val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+                val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+                buildCookieString(spNeoSes, spNeoChk)
+            }
+        } else {
+            val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+            if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
+                cmCookie
+            } else {
+                val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+                val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+                buildCookieString(neoSes, neoChk)
+            }
+        }
+        cachedCookie = cookie.ifEmpty { null }
+        lastIndependentState = independent
+        Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
+    }
+
+    // 保存登录开关引用（修复2）
+    private lateinit var enableLoginSwitch: SwitchPreferenceCompat
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -98,19 +139,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // 迁移旧设置
+        // 迁移旧设置（字符串布尔转 Boolean，不删除原键避免误删）
         val editor = preferences.edit()
-        var needApply = false
         preferences.all.forEach { (key, value) ->
-            if (value is String) {
-                when (value.lowercase()) {
-                    "true" -> { editor.putBoolean(key, true); editor.remove(key); needApply = true }
-                    "false" -> { editor.putBoolean(key, false); editor.remove(key); needApply = true }
-                    else -> {}
-                }
+            if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
+                editor.putBoolean(key, value.toBoolean())
+                // 不删除原字符串键，避免丢失非布尔值
             }
         }
-        if (needApply) editor.apply()
+        editor.apply()
 
         // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
@@ -118,9 +155,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "独立存储 Cookie"
             summary = "开启后使用私有文件保存登录态，不受清除全局Cookie影响"
             setDefaultValue(false)
+            setOnPreferenceChangeListener { _, _ ->
+                refreshCookieCache()
+                true
+            }
         }.also(screen::addPreference)
 
-        // 登录开关
+        // 登录开关（修复2：保存引用）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
@@ -130,8 +171,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (newValue as Boolean) loginWithWebView(pref as SwitchPreferenceCompat)
                 true
             }
+            enableLoginSwitch = this
         }.also(screen::addPreference)
 
+        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -140,6 +183,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
+        // 密码输入框（触发登录）
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -161,6 +205,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 退出登录开关（修复2：点击后清空并关闭登录开关）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
@@ -168,10 +213,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
-                false
+                false  // 让开关弹回关闭状态
             }
         }.also(screen::addPreference)
 
+        // 搜索模式开关（布尔）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -179,6 +225,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        // 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -186,6 +233,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        // User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -195,6 +243,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
+        // User-Agent 自定义
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -202,6 +251,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             dialogTitle = "输入自定义 User-Agent"
             setDefaultValue("")
         }.also(screen::addPreference)
+
+        // 初始化 Cookie 缓存
+        refreshCookieCache()
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -239,11 +291,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     if (neoSes.isNotEmpty()) {
                         saveLoginCookie(neoSes, "")
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
-                        Log.d("DongmanCookie", "密码登录成功，已保存 NEO_SES=$neoSes")
+                        refreshCookieCache()
                     } else {
                         Log.e("DongmanCookie", "密码登录响应中未找到 NEO_SES")
                     }
                     Handler(Looper.getMainLooper()).post {
+                        // 修复2：更新登录开关的 summary
+                        enableLoginSwitch.summary = buildLoginSummary()
                         Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
@@ -271,6 +325,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return encrypted.joinToString("") { "%02x".format(it) }
     }
 
+    // 修复1：WebView 使用动态 UA
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
         Log.d("DongmanCookie", "=== 启动 WebView 登录 ===")
         val app = appContext
@@ -278,7 +333,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val webView = WebView(app).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
-                settings.userAgentString = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+                // 关键修复：使用当前 User-Agent 设置，若为空则回退到移动版
+                settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
                 CookieManager.getInstance().setAcceptCookie(true)
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -289,6 +345,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         if (neoSes.isNotEmpty()) {
                             saveLoginCookie(neoSes, neoChk)
                             Log.d("DongmanCookie", "WebView 登录成功，已保存 NEO_SES=$neoSes, NEO_CHK=$neoChk")
+                            refreshCookieCache()
                             Handler(Looper.getMainLooper()).post {
                                 pref.summary = buildLoginSummary()
                             }
@@ -314,6 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) {
             saveCookieToFile(neoSes, neoChk)
         }
+        refreshCookieCache()
     }
 
     private fun clearLoginCookie() {
@@ -322,6 +380,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
         if (useIndependentStorage()) {
             deleteCookieFile()
+        }
+        refreshCookieCache()
+        // 修复2：关闭登录开关并更新 summary
+        enableLoginSwitch.isChecked = false
+        enableLoginSwitch.summary = buildLoginSummary()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "已退出登录", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -347,36 +412,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.trim() ?: ""
 
     private fun cookieHeader(): String {
-        if (useIndependentStorage()) {
-            val (neoSes, neoChk) = readCookieFromFile()
-            if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
-                Log.d("DongmanCookie", "cookieHeader: 使用文件 Cookie")
-                return "NEO_SES=$neoSes; NEO_CHK=$neoChk"
-            }
-            val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-            val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-            if (spNeoSes.isNotEmpty() && spNeoChk.isNotEmpty()) {
-                Log.d("DongmanCookie", "cookieHeader: 降级使用 SP Cookie")
-                return "NEO_SES=$spNeoSes; NEO_CHK=$spNeoChk"
-            }
-            Log.w("DongmanCookie", "cookieHeader: 独立存储模式下未找到 Cookie")
-            return ""
-        } else {
-            val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-            Log.d("DongmanCookie", "cookieHeader: CookieManager 返回 = $cmCookie")
-            if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
-                Log.d("DongmanCookie", "cookieHeader: 使用 CookieManager 的 Cookie")
-                return cmCookie
-            }
-            val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-            val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-            val result = buildString {
-                if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
-                if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
-            }.trimEnd(';', ' ')
-            Log.d("DongmanCookie", "cookieHeader: 使用 SP 构造的 Cookie = $result (neoSes=$neoSes, neoChk=$neoChk)")
-            return result
+        // 使用缓存
+        if (cachedCookie != null && lastIndependentState == useIndependentStorage()) {
+            Log.d("DongmanCookie", "cookieHeader: 使用缓存 Cookie")
+            return cachedCookie!!
         }
+        refreshCookieCache()
+        return cachedCookie ?: ""
     }
 
     private fun currentUserAgent(): String {
@@ -628,7 +670,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁
+    // 阅读页面 & 自动解锁（无 purchased 检查）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
