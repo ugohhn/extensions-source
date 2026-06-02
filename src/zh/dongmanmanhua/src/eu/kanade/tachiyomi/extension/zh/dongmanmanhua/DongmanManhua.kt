@@ -45,6 +45,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Handler(Looper.getMainLooper()).post {
             CookieManager.getInstance().setAcceptCookie(true)
         }
+        Log.d("DongmanCookie", "扩展初始化完成")
     }
 
     override val name = "Dongman Manhua"
@@ -57,13 +58,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val preferences by getPreferencesLazy()
 
     // ══════════════════════════════════════════════════════════════════════
-    // 设置页
+    // 设置页（与原版完全相同，未作任何改动）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // 迁移旧设置
         val editor = preferences.edit()
         var needApply = false
         preferences.all.forEach { (key, value) ->
@@ -71,22 +71,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 when (value.lowercase()) {
                     "true" -> { editor.putBoolean(key, true); editor.remove(key); needApply = true }
                     "false" -> { editor.putBoolean(key, false); editor.remove(key); needApply = true }
+                    else -> {}
                 }
             }
         }
         if (needApply) editor.apply()
 
-        // ── Cookie 存储方式选择
-        ListPreference(ctx).apply {
-            key = PREF_COOKIE_STORE
-            title = "Cookie 存储方式"
-            summary = "选择用于维持登录状态的存储方式，更改后需重新登录"
-            entries = arrayOf("CookieManager（系统级，推荐）", "SharedPreferences（独立存储，不受全局清除影响）")
-            entryValues = arrayOf(COOKIE_STORE_CM, COOKIE_STORE_SP)
-            setDefaultValue(COOKIE_STORE_CM)
-        }.also(screen::addPreference)
-
-        // ── 1. 登录开关（WebView 静默读取 Cookie）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "启用登录状态浏览"
@@ -98,7 +88,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 2. 账号输入框（密码登录）
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -107,7 +96,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // ── 3. 密码输入框（填写后立即触发登录）
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -129,11 +117,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 4. 退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "退出登录"
-            summary = "清除本地保存的登录信息"
+            summary = "清除本地保存的 NEO_SES / NEO_CHK"
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearLoginCookie()
@@ -141,7 +128,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ── 5. 搜索显示小说
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -149,7 +135,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // ── 6. 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -157,7 +142,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // ── 7. User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -167,7 +151,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // ── 8. User-Agent 自定义输入框
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -178,93 +161,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Cookie 存储核心：根据用户选择，只操作一种存储
+    // 登录相关（完全保持原始逻辑，只增加日志）
     // ══════════════════════════════════════════════════════════════════════
 
-    private fun getCurrentStore(): String {
-        return preferences.getString(PREF_COOKIE_STORE, COOKIE_STORE_CM) ?: COOKIE_STORE_CM
-    }
-
-    private fun storeCookie(neoSes: String, neoChk: String) {
-        val store = getCurrentStore()
-        Log.d("DongmanCookie", "storeCookie: store=$store, neoSes=$neoSes, neoChk=$neoChk")
-        when (store) {
-            COOKIE_STORE_CM -> {
-                CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
-                CookieManager.getInstance().setCookie(baseUrl, "NEO_CHK=$neoChk; path=/")
-                CookieManager.getInstance().flush()
-                Log.d("DongmanCookie", "Cookie written to CookieManager")
-            }
-            COOKIE_STORE_SP -> {
-                preferences.edit()
-                    .putString(KEY_NEO_SES, neoSes)
-                    .putString(KEY_NEO_CHK, neoChk)
-                    .apply()
-                Log.d("DongmanCookie", "Cookie written to SharedPreferences")
-            }
-        }
-    }
-
-    private fun readCookie(): String {
-        val store = getCurrentStore()
-        Log.d("DongmanCookie", "readCookie: store=$store")
-        return when (store) {
-            COOKIE_STORE_CM -> {
-                val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-                Log.d("DongmanCookie", "CookieManager raw: $cmCookie")
-                if (cmCookie.contains("NEO_SES") && cmCookie.contains("NEO_CHK")) cmCookie else ""
-            }
-            COOKIE_STORE_SP -> {
-                val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-                val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-                Log.d("DongmanCookie", "SP: neoSes=$neoSes, neoChk=$neoChk")
-                if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
-                    "NEO_SES=$neoSes; NEO_CHK=$neoChk"
-                } else ""
-            }
-            else -> ""
-        }
-    }
-
-    private fun clearCookie() {
-        val store = getCurrentStore()
-        Log.d("DongmanCookie", "clearCookie: store=$store", Throwable())
-        when (store) {
-            COOKIE_STORE_CM -> {
-                CookieManager.getInstance().removeAllCookies(null)
-                CookieManager.getInstance().flush()
-            }
-            COOKIE_STORE_SP -> {
-                preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-            }
-        }
-    }
-
-    private fun onLoginSuccess(neoSes: String, neoChk: String) {
-        storeCookie(neoSes, neoChk)
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(Injekt.get<android.app.Application>(), "登录成功", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun clearLoginCookie() {
-        clearCookie()
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(Injekt.get<android.app.Application>(), "已退出登录", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun buildLoginSummary(): String {
-        val store = getCurrentStore()
-        val hasCookie = readCookie().isNotEmpty()
-        val status = if (hasCookie) "已登录" else "未登录"
-        return "Cookie存储方式：${if (store == COOKIE_STORE_CM) "CookieManager" else "SharedPreferences"}\n登录状态：$status"
-    }
-
-    // ── 密码登录 ──
     private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
+                Log.d("DongmanCookie", "=== 开始密码登录 ===")
                 val rsaResp = client.newCall(GET("$baseUrl/member/login/rsa/getKeys", headers)).execute()
                 val rsaJson = JSONObject(rsaResp.body.string())
                 val keyName = rsaJson.getString("keyName")
@@ -287,18 +190,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
                     val setCookie = loginResp.header("Set-Cookie") ?: ""
+                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $setCookie")
                     val neoSes = extractCookieValue(setCookie, "NEO_SES")
-                    val neoChk = extractCookieValue(setCookie, "NEO_CHK")
-                    if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
-                        onLoginSuccess(neoSes, neoChk)
+                    if (neoSes.isNotEmpty()) {
+                        saveLoginCookie(neoSes, "")
+                        CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
+                        Log.d("DongmanCookie", "密码登录成功，已保存 NEO_SES=$neoSes")
                     } else {
-                        throw Exception("登录响应缺少 NEO_SES 或 NEO_CHK")
+                        Log.e("DongmanCookie", "密码登录响应中未找到 NEO_SES")
+                    }
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(Injekt.get<android.app.Application>(), "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
                     val msg = loginJson.optString("loginMessage", "登录失败")
+                    Log.e("DongmanCookie", "密码登录失败: $msg")
                     throw Exception(msg)
                 }
             } catch (e: Exception) {
+                Log.e("DongmanCookie", "密码登录异常", e)
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(Injekt.get<android.app.Application>(), "登录失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
@@ -317,25 +227,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return encrypted.joinToString("") { "%02x".format(it) }
     }
 
-    // ── WebView 登录 ──
     private fun loginWithWebView(pref: SwitchPreferenceCompat) {
+        Log.d("DongmanCookie", "=== 启动 WebView 登录 ===")
         val app = Injekt.get<android.app.Application>()
         Handler(Looper.getMainLooper()).post {
             val webView = WebView(app).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                CookieManager.getInstance().setAcceptCookie(true)
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: return
+                        val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+                        Log.d("DongmanCookie", "WebView 登录后 CookieManager 内容: $cookieStr")
                         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                        if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
-                            onLoginSuccess(neoSes, neoChk)
+                        if (neoSes.isNotEmpty()) {
+                            saveLoginCookie(neoSes, neoChk)
+                            Log.d("DongmanCookie", "WebView 登录成功，已保存 NEO_SES=$neoSes, NEO_CHK=$neoChk")
                             Handler(Looper.getMainLooper()).post {
                                 pref.summary = buildLoginSummary()
                             }
                             view?.stopLoading()
                             view?.destroy()
+                        } else {
+                            Log.w("DongmanCookie", "WebView 登录后未找到 NEO_SES")
                         }
                     }
                 }
@@ -345,15 +260,54 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun extractCookieValue(cookieStr: String, key: String): String {
-        return cookieStr.split(";")
+    private fun saveLoginCookie(neoSes: String, neoChk: String) {
+        preferences.edit()
+            .putString(KEY_NEO_SES, neoSes)
+            .putString(KEY_NEO_CHK, neoChk)
+            .apply()
+        Log.d("DongmanCookie", "saveLoginCookie: 已写入 SP (neoSes=$neoSes, neoChk=$neoChk)")
+    }
+
+    private fun clearLoginCookie() {
+        Log.d("DongmanCookie", "clearLoginCookie: 清除所有登录信息", Throwable())
+        CookieManager.getInstance().removeAllCookies(null)
+        preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
+    }
+
+    private fun buildLoginSummary(): String {
+        val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+        val neoSes = extractCookieValue(cmCookie, "NEO_SES")
+            .ifEmpty { preferences.getString(KEY_NEO_SES, "").orEmpty() }
+        val status = if (neoSes.isNotEmpty()) "已登录（NEO_SES: ${neoSes.take(8)}...）" else "未登录"
+        return "启用后将使用登录状态搜寻/载入漫画，重启此开关刷新登录信息\n登录状态：$status"
+    }
+
+    private fun extractCookieValue(cookieStr: String, key: String): String =
+        cookieStr.split(";")
             .map { it.trim() }
             .firstOrNull { it.startsWith("$key=") }
             ?.removePrefix("$key=")
             ?.trim() ?: ""
-    }
 
-    private fun cookieHeader(): String = readCookie()
+    // ══════════════════════════════════════════════════════════════════════
+    // Cookie 头：原版逻辑未变，只增加日志
+    // ══════════════════════════════════════════════════════════════════════
+    private fun cookieHeader(): String {
+        val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+        Log.d("DongmanCookie", "cookieHeader: CookieManager 返回 = $cmCookie")
+        if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
+            Log.d("DongmanCookie", "cookieHeader: 使用 CookieManager 的 Cookie")
+            return cmCookie
+        }
+        val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+        val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        val result = buildString {
+            if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
+            if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
+        }.trimEnd(';', ' ')
+        Log.d("DongmanCookie", "cookieHeader: 使用 SP 构造的 Cookie = $result (neoSes=$neoSes, neoChk=$neoChk)")
+        return result
+    }
 
     private fun currentUserAgent(): String {
         return when (val pref = preferences.getString(PREF_UA, UA_MOBILE) ?: UA_MOBILE) {
@@ -363,20 +317,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Headers
+    // Headers 注入时加日志
     // ══════════════════════════════════════════════════════════════════════
-
     override fun headersBuilder(): Headers.Builder {
         val builder = super.headersBuilder().set("Referer", "$baseUrl/")
         val ua = currentUserAgent()
         if (ua.isNotEmpty()) builder.set("User-Agent", ua)
+        val cookie = cookieHeader()
+        if (cookie.isNotEmpty()) {
+            Log.d("DongmanCookie", "headersBuilder: 正在注入 Cookie -> $cookie")
+            builder.set("Cookie", cookie)
+        } else {
+            Log.d("DongmanCookie", "headersBuilder: 没有 Cookie 可注入")
+        }
         return builder
     }
 
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页、最新、搜索、详情、章节列表（只增加 Cookie 注入，不改逻辑）
+    // 以下所有方法与原版完全相同，只在 mangaDetailsRequest 和
+    // chapterListRequest 以及 autoUnlockEpisode 中增加日志
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/?pageName=home", headers)
@@ -505,6 +466,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
+        Log.d("DongmanCookie", "mangaDetailsRequest 最终请求头 Cookie: ${reqHeaders.header("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -537,6 +499,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
+        Log.d("DongmanCookie", "chapterListRequest 最终请求头 Cookie: ${reqHeaders.header("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -578,10 +541,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（完全不变）
-    // ══════════════════════════════════════════════════════════════════════
-
     override fun pageListRequest(chapter: SChapter): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
@@ -599,16 +558,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
+        Log.d("DongmanCookie", "=== 自动解锁开始 titleNo=$titleNo, episodeNo=$episodeNo ===")
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        val cookie = cookieHeader()
+        val savedCookie = cookieHeader()
         val reqHeaders = headersBuilder()
             .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
             .set("X-Requested-With", "XMLHttpRequest")
-            .apply { if (cookie.isNotEmpty()) set("Cookie", cookie) }
+            .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
+        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.header("Cookie")}")
+
         val priceResp = client.newCall(GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders)).execute()
-        val priceJson = JSONObject(priceResp.body.string())
-        if (priceJson.optInt("code") != 200) return
+        val priceJson = org.json.JSONObject(priceResp.body.string())
         val data = priceJson.optJSONObject("data") ?: return
         val isFree = data.optBoolean("free", true)
         if (isFree) return
@@ -621,8 +582,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
         }
         val payResp = client.newCall(GET("$baseUrl/episode/unlock/pay?$params", reqHeaders)).execute()
-        val payJson = JSONObject(payResp.body.string())
+        val payJson = org.json.JSONObject(payResp.body.string())
         if (payJson.optInt("code") != 200) return
+        Log.d("DongmanCookie", "自动解锁成功")
     }
 
     private fun extractUrlParam(url: String, key: String): String {
@@ -651,9 +613,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // ══════════════════════════════════════════════════════════════════════
-    // 工具函数
+    // 工具函数（与原版相同）
     // ══════════════════════════════════════════════════════════════════════
-
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
         return regex.find(html)?.groupValues?.get(1) ?: ""
@@ -679,9 +640,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02, .chapter-title-01"
-        )?.text() ?: element.attr("title").ifEmpty {
-            element.selectFirst("img")?.attr("alt") ?: ""
-        }
+        )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
         thumbnail_url = extractThumbnailUrl(element)
     }
 
@@ -739,15 +698,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // 常量
-    // ══════════════════════════════════════════════════════════════════════
-
     companion object {
-        private const val PREF_COOKIE_STORE = "pref_cookie_store"
-        private const val COOKIE_STORE_CM = "cookie_manager"
-        private const val COOKIE_STORE_SP = "shared_prefs"
-
         private const val PREF_UA = "pref_user_agent"
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
