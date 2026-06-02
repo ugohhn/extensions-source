@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -75,7 +76,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         if (needApply) editor.apply()
 
-        // ── Cookie 存储方式选择（新增）──
+        // ── Cookie 存储方式选择
         ListPreference(ctx).apply {
             key = PREF_COOKIE_STORE
             title = "Cookie 存储方式"
@@ -184,7 +185,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return preferences.getString(PREF_COOKIE_STORE, COOKIE_STORE_CM) ?: COOKIE_STORE_CM
     }
 
-    // 写入 Cookie（根据当前存储方式）
     private fun storeCookie(neoSes: String, neoChk: String) {
         val store = getCurrentStore()
         Log.d("DongmanCookie", "storeCookie: store=$store, neoSes=$neoSes, neoChk=$neoChk")
@@ -205,7 +205,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 读取 Cookie（根据当前存储方式）
     private fun readCookie(): String {
         val store = getCurrentStore()
         Log.d("DongmanCookie", "readCookie: store=$store")
@@ -227,7 +226,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 清除 Cookie（根据当前存储方式）
     private fun clearCookie() {
         val store = getCurrentStore()
         Log.d("DongmanCookie", "clearCookie: store=$store", Throwable())
@@ -242,7 +240,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 登录成功时调用（统一入口）
     private fun onLoginSuccess(neoSes: String, neoChk: String) {
         storeCookie(neoSes, neoChk)
         Handler(Looper.getMainLooper()).post {
@@ -250,7 +247,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 退出登录
     private fun clearLoginCookie() {
         clearCookie()
         Handler(Looper.getMainLooper()).post {
@@ -258,7 +254,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 登录状态摘要
     private fun buildLoginSummary(): String {
         val store = getCurrentStore()
         val hasCookie = readCookie().isNotEmpty()
@@ -270,7 +265,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
-                // 1. 获取 RSA 公钥
                 val rsaResp = client.newCall(GET("$baseUrl/member/login/rsa/getKeys", headers)).execute()
                 val rsaJson = JSONObject(rsaResp.body.string())
                 val keyName = rsaJson.getString("keyName")
@@ -332,7 +326,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 settings.domStorageEnabled = true
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        // 从 WebView 读取 Cookie（依赖 CookieManager）
                         val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: return
                         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
@@ -360,7 +353,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.trim() ?: ""
     }
 
-    // 请求用的 Cookie 头（直接调用 readCookie）
     private fun cookieHeader(): String = readCookie()
 
     private fun currentUserAgent(): String {
