@@ -58,7 +58,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val preferences by getPreferencesLazy()
 
     // ══════════════════════════════════════════════════════════════════════
-    // 设置页（与原版完全相同，未作任何改动）
+    // 设置页（与原版完全相同）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -161,7 +161,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 登录相关（完全保持原始逻辑，只增加日志）
+    // 登录相关（只增加日志）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -261,23 +261,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun saveLoginCookie(neoSes: String, neoChk: String) {
+        Log.d("DongmanCookie", "saveLoginCookie: 保存 neoSes=$neoSes, neoChk=$neoChk")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
             .apply()
-        Log.d("DongmanCookie", "saveLoginCookie: 已写入 SP (neoSes=$neoSes, neoChk=$neoChk)")
+        Log.d("DongmanCookie", "saveLoginCookie: 已写入 SP")
     }
 
     private fun clearLoginCookie() {
         Log.d("DongmanCookie", "clearLoginCookie: 清除所有登录信息", Throwable())
         CookieManager.getInstance().removeAllCookies(null)
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
+        Log.d("DongmanCookie", "clearLoginCookie: 清除完成")
     }
 
     private fun buildLoginSummary(): String {
         val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-        val neoSes = extractCookieValue(cmCookie, "NEO_SES")
-            .ifEmpty { preferences.getString(KEY_NEO_SES, "").orEmpty() }
+        val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+        val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        Log.d("DongmanCookie", "buildLoginSummary: CookieManager=$cmCookie, SP: neoSes=$spNeoSes, neoChk=$spNeoChk")
+        val neoSes = extractCookieValue(cmCookie, "NEO_SES").ifEmpty { spNeoSes }
         val status = if (neoSes.isNotEmpty()) "已登录（NEO_SES: ${neoSes.take(8)}...）" else "未登录"
         return "启用后将使用登录状态搜寻/载入漫画，重启此开关刷新登录信息\n登录状态：$status"
     }
@@ -289,9 +293,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.removePrefix("$key=")
             ?.trim() ?: ""
 
-    // ══════════════════════════════════════════════════════════════════════
-    // Cookie 头：原版逻辑未变，只增加日志
-    // ══════════════════════════════════════════════════════════════════════
     private fun cookieHeader(): String {
         val cmCookie = CookieManager.getInstance().getCookie(baseUrl) ?: ""
         Log.d("DongmanCookie", "cookieHeader: CookieManager 返回 = $cmCookie")
@@ -317,8 +318,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // Headers 注入时加日志
+    // Headers
     // ══════════════════════════════════════════════════════════════════════
+
     override fun headersBuilder(): Headers.Builder {
         val builder = super.headersBuilder().set("Referer", "$baseUrl/")
         val ua = currentUserAgent()
@@ -336,11 +338,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 以下所有方法与原版完全相同，只在 mangaDetailsRequest 和
-    // chapterListRequest 以及 autoUnlockEpisode 中增加日志（修复了 header 方法）
+    // 首页（Popular）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/?pageName=home", headers)
+
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val entries = document
@@ -352,7 +354,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return MangasPage(entries, false)
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 最新更新（Latest）
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
+
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
         val day = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
@@ -372,6 +379,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 搜索
+    // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
@@ -461,12 +472,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return ""
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 漫画详情
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        Log.d("DongmanCookie", "mangaDetailsRequest 最终请求头 Cookie: ${reqHeaders.get("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -494,12 +508,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 章节列表
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        Log.d("DongmanCookie", "chapterListRequest 最终请求头 Cookie: ${reqHeaders.get("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -540,6 +557,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 阅读页面 & 自动解锁
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
         val reqHeaders = headersBuilder().apply {
@@ -613,8 +634,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // ══════════════════════════════════════════════════════════════════════
-    // 工具函数（与原版相同）
+    // 工具函数
     // ══════════════════════════════════════════════════════════════════════
+
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
         return regex.find(html)?.groupValues?.get(1) ?: ""
