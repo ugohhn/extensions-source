@@ -9,7 +9,6 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -60,7 +59,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val preferences by getPreferencesLazy()
     private val appContext by lazy { Injekt.get<android.app.Application>() }
 
-    // ---------- 独立存储：专用目录 ----------
+    // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
     private fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
 
@@ -147,7 +146,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
 
-        // 迁移旧设置（字符串布尔转 Boolean）
+        // 迁移旧设置
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
             if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
@@ -175,11 +174,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
-            isEnabled = false  // 禁止手动开关，只作为状态显示
+            setEnabled(false)   // 修复：使用 setEnabled(false) 代替 isEnabled = false
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
-        // 账号输入框（密码登录）
+        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -188,7 +187,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 密码输入框（触发密码登录）
+        // 密码输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -210,14 +209,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 退出登录开关（点击后自动弹回）
+        // ---------- 两套退出/清除开关 ----------
+        // 1. 彻底退出登录（原行为）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
-            title = "退出登录"
-            summary = "清除本地保存的 NEO_SES / NEO_CHK"
+            title = "彻底退出登录"
+            summary = "清除所有登录信息（包括WebView），并删除独立存储备份"
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
-                clearLoginCookie()
+                fullLogout()
+                false
+            }
+        }.also(screen::addPreference)
+
+        // 2. 仅清除独立存储备份
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_CLEAR_BACKUP
+            title = "清除独立存储备份"
+            summary = "仅删除本地保存的Cookie备份，不影响WebView登录状态"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, _ ->
+                clearBackupOnly()
                 false
             }
         }.also(screen::addPreference)
@@ -257,8 +269,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 调试按钮：显示 Cookie 文件内容
-        Preference(ctx).apply {
+        // 调试按钮（使用全限定名避免冲突）
+        androidx.preference.Preference(ctx).apply {
             key = "debug_show_cookie"
             title = "调试：显示 Cookie 文件内容"
             setOnPreferenceClickListener {
@@ -387,8 +399,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    private fun clearLoginCookie() {
-        Log.d("DongmanCookie", "clearLoginCookie: 清除所有登录信息")
+    // ---------- 两个功能 ----------
+    // 彻底退出登录（清除所有：CookieManager, SP, 文件）
+    private fun fullLogout() {
+        Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
         if (useIndependentStorage()) {
@@ -398,7 +412,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         enableLoginSwitch.isChecked = false
         enableLoginSwitch.summary = buildLoginSummary()
         Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, "已退出登录", Toast.LENGTH_SHORT).show()
+            Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // 仅清除独立存储备份（不影响 CookieManager）
+    private fun clearBackupOnly() {
+        Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
+        preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
+        if (useIndependentStorage()) {
+            deleteCookieFile()
+        }
+        refreshCookieCache()
+        // 不改变 enableLoginSwitch.isChecked，因为实际登录态可能还在
+        enableLoginSwitch.summary = buildLoginSummary()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -839,6 +868,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_LOGIN_USERNAME = "pref_login_username"
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
+        private const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
