@@ -337,7 +337,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     // ══════════════════════════════════════════════════════════════════════
     // 以下所有方法与原版完全相同，只在 mangaDetailsRequest 和
-    // chapterListRequest 以及 autoUnlockEpisode 中增加日志
+    // chapterListRequest 以及 autoUnlockEpisode 中增加日志（修复了 header 方法）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int) = GET("$baseUrl/?pageName=home", headers)
@@ -466,7 +466,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        Log.d("DongmanCookie", "mangaDetailsRequest 最终请求头 Cookie: ${reqHeaders.header("Cookie")}")
+        Log.d("DongmanCookie", "mangaDetailsRequest 最终请求头 Cookie: ${reqHeaders.get("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -499,7 +499,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        Log.d("DongmanCookie", "chapterListRequest 最终请求头 Cookie: ${reqHeaders.header("Cookie")}")
+        Log.d("DongmanCookie", "chapterListRequest 最终请求头 Cookie: ${reqHeaders.get("Cookie")}")
         return GET(baseUrl + manga.url, reqHeaders)
     }
 
@@ -566,7 +566,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .set("X-Requested-With", "XMLHttpRequest")
             .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
-        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.header("Cookie")}")
+        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.get("Cookie")}")
 
         val priceResp = client.newCall(GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders)).execute()
         val priceJson = org.json.JSONObject(priceResp.body.string())
