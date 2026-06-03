@@ -1,14 +1,11 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
-import android.app.AlertDialog
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -106,7 +103,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
 
-    // ===================== 手动备用Cookie开关相关 =====================
+    // ===================== 手动备用Cookie开关 =====================
     private fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
 
     private fun clearManualBackup() {
@@ -121,7 +118,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun buildManualSwitchSummary(): String {
         val hasLocal = hasManualBackup()
-        return "开启：请求头强制使用本地保存的NEO鉴权Cookie；关闭：使用原有Cookie策略\n当前本地缓存：${if (hasLocal) "存在登录Cookie" else "无登录Cookie"}"
+        return "开启：请求头使用本地保存的NEO鉴权Cookie；关闭：使用原有策略\n本地缓存：${if (hasLocal) "存在" else "无"}"
     }
 
     // ===================== 探针校验 =====================
@@ -167,12 +164,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val (neoSes, neoChk) = readCookieFromFile()
                 if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
                     buildCookieString(neoSes, neoChk)
-                } else {
-                    null
-                }
-            } else {
-                null
-            }
+                } else null
+            } else null
         } else {
             if (independent) {
                 val file = getCookieFile()
@@ -263,18 +256,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
-        // ---------- WebView 登录按钮（对话框） ----------
-        androidx.preference.Preference(ctx).apply {
-            key = "webview_login_button"
+        // WebView 登录开关（拨动触发登录，然后自动弹回）
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_LOGIN_TRIGGER
             title = "WebView 登录"
-            summary = "点击弹出咚漫登录页面，登录后自动保存状态"
-            setOnPreferenceClickListener {
-                showWebViewLoginDialog()
-                true
+            summary = "拨动此开关打开咚漫登录页面，登录后自动同步状态"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue as Boolean) {
+                    loginWithWebView()
+                    false // 弹回关闭状态
+                } else {
+                    true
+                }
             }
         }.also(screen::addPreference)
 
-        // 账号输入框
+        // 账号输入框（密码登录）
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -367,73 +365,60 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // ===================== 弹出 WebView 登录对话框 =====================
-    private fun showWebViewLoginDialog() {
-        val dialogView = FrameLayout(appContext).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        val webView = WebView(appContext).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
-            CookieManager.getInstance().setAcceptCookie(true)
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-                    Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
-                    val neoSes = extractCookieValue(cookieStr, "NEO_SES")
-                    val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                    if (neoSes.isNotEmpty()) {
-                        // 保存 Cookie 到各种存储
-                        preferences.edit()
-                            .putString(KEY_NEO_SES, neoSes)
-                            .putString(KEY_NEO_CHK, neoChk)
-                            .apply()
-                        if (useIndependentStorage()) {
-                            saveCookieToFile(neoSes, neoChk)
-                        } else {
-                            cachedCookie = buildCookieString(neoSes, neoChk)
-                            lastIndependentState = useIndependentStorage()
-                        }
-                        saveCookieToFile(neoSes, neoChk)
-                        refreshCookieCache()
-                        Handler(Looper.getMainLooper()).post {
-                            enableLoginSwitch.isChecked = true
-                            enableLoginSwitch.summary = buildLoginSummary()
-                            if (::manualCookieSwitch.isInitialized) {
-                                manualCookieSwitch.summary = buildManualSwitchSummary()
+    // ══════════════════════════════════════════════════════════════════════
+    // WebView 登录（静默加载）
+    // ══════════════════════════════════════════════════════════════════════
+
+    private fun loginWithWebView() {
+        Log.d("DongmanCookie", "=== 启动 WebView 登录 ===")
+        val app = appContext
+        Handler(Looper.getMainLooper()).post {
+            val webView = WebView(app).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
+                CookieManager.getInstance().setAcceptCookie(true)
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+                        Log.d("DongmanCookie", "WebView 登录后 CookieManager: $cookieStr")
+                        val neoSes = extractCookieValue(cookieStr, "NEO_SES")
+                        val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
+                        if (neoSes.isNotEmpty()) {
+                            preferences.edit()
+                                .putString(KEY_NEO_SES, neoSes)
+                                .putString(KEY_NEO_CHK, neoChk)
+                                .apply()
+                            if (useIndependentStorage()) {
+                                saveCookieToFile(neoSes, neoChk)
+                            } else {
+                                cachedCookie = buildCookieString(neoSes, neoChk)
+                                lastIndependentState = useIndependentStorage()
                             }
-                            Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            saveCookieToFile(neoSes, neoChk)
+                            refreshCookieCache()
+                            Handler(Looper.getMainLooper()).post {
+                                enableLoginSwitch.isChecked = true
+                                enableLoginSwitch.summary = buildLoginSummary()
+                                if (::manualCookieSwitch.isInitialized) {
+                                    manualCookieSwitch.summary = buildManualSwitchSummary()
+                                }
+                                Toast.makeText(app, "登录成功", Toast.LENGTH_SHORT).show()
+                            }
+                            view?.stopLoading()
+                            view?.destroy()
+                        } else {
+                            Log.w("DongmanCookie", "WebView 登录后未找到 NEO_SES")
+                            Handler(Looper.getMainLooper()).post {
+                                Toast.makeText(app, "登录失败：未获取到Cookie", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        // 关闭对话框
-                        (view?.parent as? ViewGroup)?.let {
-                            (it.parent as? AlertDialog)?.dismiss()
-                        }
-                        view?.destroy()
                     }
                 }
+                loadUrl("$baseUrl/member/mypage")
             }
-            loadUrl("$baseUrl/member/mypage")
+            Handler(Looper.getMainLooper()).postDelayed({ webView.destroy() }, 15_000)
         }
-        dialogView.addView(webView)
-        AlertDialog.Builder(appContext)
-            .setTitle("咚漫登录")
-            .setView(dialogView)
-            .setNegativeButton("取消") { dialog, _ ->
-                dialog.dismiss()
-                webView.destroy()
-            }
-            .setOnDismissListener {
-                webView.destroy()
-            }
-            .show()
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -561,7 +546,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val status = if (isLoggedIn) "已登录" else "未登录"
         val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
-        return "Cookie存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
+        return "存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
     }
 
     private fun extractCookieValue(cookieStr: String, key: String): String =
@@ -604,7 +589,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页（Popular）触发探针
+    // 首页（触发探针）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -997,6 +982,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
+        private const val PREF_LOGIN_TRIGGER = "pref_login_trigger"
         private const val PREF_LOGIN_USERNAME = "pref_login_username"
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
@@ -1013,4 +999,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
