@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import android.app.AlertDialog
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -61,6 +62,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val cdnBase = "https://cdn.dongmanmanhua.cn"
     private val preferences by getPreferencesLazy()
     private val appContext by lazy { Injekt.get<android.app.Application>() }
+    private var dialogContext: Context? = null   // 用于对话框的 Activity 上下文
 
     // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
@@ -211,6 +213,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
+        // 保存 Activity 上下文用于显示对话框
+        dialogContext = ctx
 
         // 迁移旧设置（字符串布尔转 Boolean）
         val editor = preferences.edit()
@@ -259,7 +263,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
-        // ----- WebView 登录按钮（使用全限定名 Preference）-----
+        // WebView 登录按钮（使用全限定名）
         androidx.preference.Preference(ctx).apply {
             key = "webview_login_button"
             title = "WebView 登录"
@@ -364,17 +368,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框
+    // WebView 登录对话框（使用 Activity 上下文）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
-        val dialogView = FrameLayout(appContext).apply {
+        val actCtx = dialogContext
+        if (actCtx == null) {
+            Toast.makeText(appContext, "无法显示登录窗口：上下文丢失", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 确保 Activity 未销毁
+        if (actCtx is android.app.Activity && (actCtx.isFinishing || actCtx.isDestroyed)) {
+            Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val dialogView = FrameLayout(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-        val webView = WebView(appContext).apply {
+        val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -409,7 +423,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             if (::manualCookieSwitch.isInitialized) {
                                 manualCookieSwitch.summary = buildManualSwitchSummary()
                             }
-                            Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
                         }
                         // 关闭对话框
                         (view?.parent as? ViewGroup)?.let {
@@ -419,11 +433,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 }
             }
-            // 直接加载登录页面，确保每次都能看到登录表单
             loadUrl("$baseUrl/member/login")
         }
         dialogView.addView(webView)
-        AlertDialog.Builder(appContext)
+        AlertDialog.Builder(actCtx)
             .setTitle("咚漫登录")
             .setView(dialogView)
             .setNegativeButton("取消") { dialog, _ ->
