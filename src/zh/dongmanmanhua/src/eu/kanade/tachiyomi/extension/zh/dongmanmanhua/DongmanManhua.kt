@@ -259,19 +259,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
-        // WebView 登录开关（拨动触发登录对话框，然后自动弹回）
-        SwitchPreferenceCompat(ctx).apply {
-            key = PREF_WEBVIEW_LOGIN_TRIGGER
+        // ----- WebView 登录按钮（使用全限定名 Preference）-----
+        androidx.preference.Preference(ctx).apply {
+            key = "webview_login_button"
             title = "WebView 登录"
-            summary = "拨动此开关弹出咚漫登录页面，登录后自动同步状态"
-            setDefaultValue(false)
-            setOnPreferenceChangeListener { _, newValue ->
-                if (newValue as Boolean) {
-                    showWebViewLoginDialog()
-                    false // 让开关弹回关闭状态
-                } else {
-                    true
-                }
+            summary = "点击弹出咚漫登录页面，登录后自动保存状态"
+            setOnPreferenceClickListener {
+                showWebViewLoginDialog()
+                true
             }
         }.also(screen::addPreference)
 
@@ -1002,7 +997,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
-        private const val PREF_WEBVIEW_LOGIN_TRIGGER = "pref_webview_login_trigger"
         private const val PREF_LOGIN_USERNAME = "pref_login_username"
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
@@ -1019,4 +1013,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
