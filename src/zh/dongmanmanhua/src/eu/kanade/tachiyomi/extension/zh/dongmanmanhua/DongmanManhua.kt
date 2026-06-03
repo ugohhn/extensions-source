@@ -62,7 +62,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val cdnBase = "https://cdn.dongmanmanhua.cn"
     private val preferences by getPreferencesLazy()
     private val appContext by lazy { Injekt.get<android.app.Application>() }
-    private var dialogContext: Context? = null   // 用于对话框的 Activity 上下文
+    private var dialogContext: Context? = null
 
     // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
@@ -150,7 +150,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!valid) {
                 clearManualBackup()
                 refreshCookieCache()
-                enableLoginSwitch.summary = buildLoginSummary()
+                loginIndicator.summary = buildLoginSummary()
                 if (::manualCookieSwitch.isInitialized) {
                     manualCookieSwitch.summary = buildManualSwitchSummary()
                 }
@@ -204,7 +204,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
-    private lateinit var enableLoginSwitch: SwitchPreferenceCompat
+    private lateinit var loginIndicator: SwitchPreferenceCompat   // 登录状态指示灯
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
     // ══════════════════════════════════════════════════════════════════════
@@ -213,10 +213,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
-        // 保存 Activity 上下文用于显示对话框
         dialogContext = ctx
 
-        // 迁移旧设置（字符串布尔转 Boolean）
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
             if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
@@ -233,7 +231,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                enableLoginSwitch.summary = buildLoginSummary()
+                loginIndicator.summary = buildLoginSummary()
                 true
             }
         }.also(screen::addPreference)
@@ -246,7 +244,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                enableLoginSwitch.summary = buildLoginSummary()
+                loginIndicator.summary = buildLoginSummary()
                 summary = buildManualSwitchSummary()
                 true
             }
@@ -255,26 +253,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         // 登录状态指示灯（仅显示，不可点击）
         SwitchPreferenceCompat(ctx).apply {
-            key = PREF_ENABLE_LOGIN
+            key = "login_indicator"
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
             setEnabled(false)
-            enableLoginSwitch = this
+            loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录按钮（使用全限定名）
-        androidx.preference.Preference(ctx).apply {
-            key = "webview_login_button"
+        // WebView 登录触发器（拨动开关弹出对话框，然后自动弹回）
+        SwitchPreferenceCompat(ctx).apply {
+            key = "webview_login_trigger"
             title = "WebView 登录"
-            summary = "点击弹出咚漫登录页面，登录后自动保存状态"
-            setOnPreferenceClickListener {
-                showWebViewLoginDialog()
-                true
+            summary = "拨动此开关弹出咚漫登录页面，登录后自动保存状态"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue as Boolean) {
+                    showWebViewLoginDialog()
+                    false // 弹回关闭状态
+                } else {
+                    true
+                }
             }
         }.also(screen::addPreference)
 
-        // 账号输入框（密码登录）
+        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -377,7 +380,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Toast.makeText(appContext, "无法显示登录窗口：上下文丢失", Toast.LENGTH_SHORT).show()
             return
         }
-        // 确保 Activity 未销毁
         if (actCtx is android.app.Activity && (actCtx.isFinishing || actCtx.isDestroyed)) {
             Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
             return
@@ -404,7 +406,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                     val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
-                        // 保存 Cookie
                         preferences.edit()
                             .putString(KEY_NEO_SES, neoSes)
                             .putString(KEY_NEO_CHK, neoChk)
@@ -418,14 +419,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         saveCookieToFile(neoSes, neoChk)
                         refreshCookieCache()
                         Handler(Looper.getMainLooper()).post {
-                            enableLoginSwitch.isChecked = true
-                            enableLoginSwitch.summary = buildLoginSummary()
+                            loginIndicator.isChecked = true
+                            loginIndicator.summary = buildLoginSummary()
                             if (::manualCookieSwitch.isInitialized) {
                                 manualCookieSwitch.summary = buildManualSwitchSummary()
                             }
                             Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
                         }
-                        // 关闭对话框
                         (view?.parent as? ViewGroup)?.let {
                             (it.parent as? AlertDialog)?.dismiss()
                         }
@@ -489,8 +489,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         refreshCookieCache()
                     }
                     Handler(Looper.getMainLooper()).post {
-                        enableLoginSwitch.isChecked = true
-                        enableLoginSwitch.summary = buildLoginSummary()
+                        loginIndicator.isChecked = true
+                        loginIndicator.summary = buildLoginSummary()
                         if (::manualCookieSwitch.isInitialized) {
                             manualCookieSwitch.summary = buildManualSwitchSummary()
                         }
@@ -531,7 +531,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // 彻底退出登录
     private fun fullLogout() {
         Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
@@ -541,8 +540,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         clearManualBackup()
         refreshCookieCache()
-        enableLoginSwitch.isChecked = false
-        enableLoginSwitch.summary = buildLoginSummary()
+        loginIndicator.isChecked = false
+        loginIndicator.summary = buildLoginSummary()
         if (::manualCookieSwitch.isInitialized) {
             manualCookieSwitch.summary = buildManualSwitchSummary()
         }
@@ -551,7 +550,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 仅清除独立存储备份
     private fun clearBackupOnly() {
         Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
@@ -560,7 +558,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         clearManualBackup()
         refreshCookieCache()
-        enableLoginSwitch.summary = buildLoginSummary()
+        loginIndicator.summary = buildLoginSummary()
         if (::manualCookieSwitch.isInitialized) {
             manualCookieSwitch.summary = buildManualSwitchSummary()
         }
@@ -1009,15 +1007,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA = "pref_user_agent"
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
-        private const val PREF_ENABLE_LOGIN = "pref_enable_login"
+        private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
+        private const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
         private const val PREF_LOGIN_USERNAME = "pref_login_username"
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         private const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         private const val PREF_SEARCH_MODE = "pref_search_mode"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
-        private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
-        private const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
 
