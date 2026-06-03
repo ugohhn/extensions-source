@@ -12,7 +12,6 @@ import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -260,14 +259,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             enableLoginSwitch = this
         }.also(screen::addPreference)
 
-        // ----- WebView 登录按钮（弹出对话框，加载登录页） -----
-        Preference(ctx).apply {
-            key = "webview_login_button"
+        // WebView 登录开关（拨动触发登录对话框，然后自动弹回）
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_WEBVIEW_LOGIN_TRIGGER
             title = "WebView 登录"
-            summary = "点击弹出咚漫登录页面，登录后自动保存状态"
-            setOnPreferenceClickListener {
-                showWebViewLoginDialog()
-                true
+            summary = "拨动此开关弹出咚漫登录页面，登录后自动同步状态"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, newValue ->
+                if (newValue as Boolean) {
+                    showWebViewLoginDialog()
+                    false // 让开关弹回关闭状态
+                } else {
+                    true
+                }
             }
         }.also(screen::addPreference)
 
@@ -365,7 +369,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（加载登录页）
+    // WebView 登录对话框
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -998,6 +1002,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         private const val PREF_UA_CUSTOM_FLAG = "__custom__"
         private const val PREF_ENABLE_LOGIN = "pref_enable_login"
+        private const val PREF_WEBVIEW_LOGIN_TRIGGER = "pref_webview_login_trigger"
         private const val PREF_LOGIN_USERNAME = "pref_login_username"
         private const val PREF_LOGIN_PASSWORD = "pref_login_password"
         private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
