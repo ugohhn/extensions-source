@@ -9,6 +9,7 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import java.math.BigInteger
@@ -104,13 +105,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
 
-    // ===================== 新增：手动备用Cookie开关相关 =====================
+    // ===================== 手动备用Cookie开关相关 =====================
     private fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
-
-    private fun saveNeoToManualFile(neoSes: String, neoChk: String) {
-        // 手动模式独立使用同一个文件，但仅当手动开关开启时才会读取
-        saveCookieToFile(neoSes, neoChk)
-    }
 
     private fun clearManualBackup() {
         deleteCookieFile()
@@ -126,9 +122,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasLocal = hasManualBackup()
         return "开启：请求头强制使用本地保存的NEO鉴权Cookie；关闭：使用原有Cookie策略\n当前本地缓存：${if (hasLocal) "存在登录Cookie" else "无登录Cookie"}"
     }
-    // =====================================================================
 
-    // ===================== 新增：探针校验 (冷却60秒) =====================
+    // ===================== 探针校验 =====================
     private var lastProbeTime: Long = 0L
     private var cacheLoginValid: Boolean? = null
 
@@ -150,20 +145,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             lastProbeTime = now
             cacheLoginValid = valid
             if (!valid) {
-                // 失效则清除本地备份并关闭手动开关
                 clearManualBackup()
-                // 同时刷新缓存
                 refreshCookieCache()
                 enableLoginSwitch.summary = buildLoginSummary()
-                // 更新手动开关的summary（需要UI线程）
-                Handler(Looper.getMainLooper()).post {
-                    // 注意：manualCookieSwitch 在 setupPreferenceScreen 中赋值，此处可能未初始化，需要安全处理
-                    try {
-                        val pref = manualCookieSwitch
-                        if (::manualCookieSwitch.isInitialized) {
-                            pref.summary = buildManualSwitchSummary()
-                        }
-                    } catch (_: Exception) {}
+                if (::manualCookieSwitch.isInitialized) {
+                    manualCookieSwitch.summary = buildManualSwitchSummary()
                 }
             }
             valid
@@ -171,11 +157,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             true
         }
     }
-    // =====================================================================
 
     private fun refreshCookieCache() {
         val independent = useIndependentStorage()
-        // 新规则：如果手动备用开关开启，则完全忽略独立存储逻辑，强制从文件读取并拼接
         val cookie = if (getManualCookieEnable()) {
             val file = getCookieFile()
             if (file.exists()) {
@@ -189,7 +173,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 null
             }
         } else {
-            // 原有独立存储逻辑
             if (independent) {
                 val file = getCookieFile()
                 if (file.exists()) {
@@ -223,7 +206,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private lateinit var enableLoginSwitch: SwitchPreferenceCompat
-    private lateinit var manualCookieSwitch: SwitchPreferenceCompat   // 新增：手动备用开关引用
+    private lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -241,7 +224,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         editor.apply()
 
-        // 独立存储开关（原有）
+        // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
@@ -254,23 +237,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // ---------- 新增：手动备用Cookie开关 ----------
+        // 手动备用Cookie开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_MANUAL_COOKIE_SWITCH
             title = "启用手动备用Cookie模式"
             summary = buildManualSwitchSummary()
             setDefaultValue(false)
-            setOnPreferenceChangeListener { _, newValue ->
+            setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
                 enableLoginSwitch.summary = buildLoginSummary()
-                // 更新自身的summary
                 summary = buildManualSwitchSummary()
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        // 登录状态指示灯（仅显示，不可手动点击）
+        // 登录状态指示灯（仅显示，不可点击）
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_ENABLE_LOGIN
             title = "登录状态"
@@ -278,6 +260,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setEnabled(false)
             enableLoginSwitch = this
+        }.also(screen::addPreference)
+
+        // ---------- 新增：WebView 登录按钮（替换原来的开关） ----------
+        Preference(ctx).apply {
+            key = "webview_login_button"
+            title = "WebView 登录"
+            summary = "点击打开咚漫网页，登录后自动同步状态"
+            setOnPreferenceClickListener {
+                loginWithWebView()
+                true
+            }
         }.also(screen::addPreference)
 
         // 账号输入框
@@ -374,7 +367,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录（修改：同时保存到手动备份文件）
+    // 密码登录
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -407,17 +400,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     val neoSes = extractCookieValue(setCookie, "NEO_SES")
                     val neoChk = extractCookieValue(setCookie, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
-                        // 原有保存逻辑
                         saveLoginCookie(neoSes, neoChk)
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
-                        // 额外保存到手动备份文件（仅当手动开关未开启时也存一份，方便用户后续手动开启）
                         saveCookieToFile(neoSes, neoChk)
                         refreshCookieCache()
                     }
                     Handler(Looper.getMainLooper()).post {
                         enableLoginSwitch.isChecked = true
                         enableLoginSwitch.summary = buildLoginSummary()
-                        // 更新手动开关的summary
                         if (::manualCookieSwitch.isInitialized) {
                             manualCookieSwitch.summary = buildManualSwitchSummary()
                         }
@@ -447,10 +437,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录（修改：同时保存到手动备份文件）
+    // WebView 登录（无参数，只操作指示灯）
     // ══════════════════════════════════════════════════════════════════════
 
-    private fun loginWithWebView(pref: SwitchPreferenceCompat) {
+    private fun loginWithWebView() {
         Log.d("DongmanCookie", "=== 启动 WebView 登录 ===")
         val app = appContext
         Handler(Looper.getMainLooper()).post {
@@ -466,7 +456,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
                         if (neoSes.isNotEmpty()) {
-                            // 原有保存逻辑
                             preferences.edit()
                                 .putString(KEY_NEO_SES, neoSes)
                                 .putString(KEY_NEO_CHK, neoChk)
@@ -477,16 +466,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 cachedCookie = buildCookieString(neoSes, neoChk)
                                 lastIndependentState = useIndependentStorage()
                             }
-                            // 额外保存到手动备份文件
                             saveCookieToFile(neoSes, neoChk)
                             refreshCookieCache()
                             Handler(Looper.getMainLooper()).post {
-                                pref.isChecked = true
-                                pref.summary = buildLoginSummary()
+                                // 关键：只操作指示灯
+                                enableLoginSwitch.isChecked = true
+                                enableLoginSwitch.summary = buildLoginSummary()
                                 if (::manualCookieSwitch.isInitialized) {
                                     manualCookieSwitch.summary = buildManualSwitchSummary()
                                 }
-                                Toast.makeText(app, "WebView 登录成功", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(app, "登录成功", Toast.LENGTH_SHORT).show()
                             }
                             view?.stopLoading()
                             view?.destroy()
@@ -516,7 +505,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // 彻底退出登录（修改：同时清除手动备份并关闭手动开关）
+    // 彻底退出登录
     private fun fullLogout() {
         Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
@@ -524,7 +513,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) {
             deleteCookieFile()
         }
-        // 清除手动备份
         clearManualBackup()
         refreshCookieCache()
         enableLoginSwitch.isChecked = false
@@ -537,14 +525,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // 仅清除独立存储备份（修改：也清除手动备份文件，但保留CookieManager）
+    // 仅清除独立存储备份
     private fun clearBackupOnly() {
         Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
         if (useIndependentStorage()) {
             deleteCookieFile()
         }
-        // 也清除手动备份文件
         clearManualBackup()
         refreshCookieCache()
         enableLoginSwitch.summary = buildLoginSummary()
@@ -604,7 +591,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页（Popular）【新增：触发探针】
+    // 首页（Popular）触发探针
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -828,7 +815,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（修改：余额不足不抛异常，改为Toast）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -869,7 +856,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val coinCount = data.optInt("coinCount", 0)
         val episodeName = data.optString("episodeName", "本话")
         if (coinCount < price) {
-            // 不抛异常，改为Toast提示，避免页面崩溃
             Handler(Looper.getMainLooper()).post {
                 Toast.makeText(appContext, "余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币", Toast.LENGTH_LONG).show()
             }
@@ -1005,7 +991,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val PREF_SEARCH_MODE = "pref_search_mode"
         private const val PREF_AUTO_PAY = "pref_auto_pay"
         private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
-        private const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"   // 新增
+        private const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
         private const val KEY_NEO_SES = "neo_ses"
         private const val KEY_NEO_CHK = "neo_chk"
 
