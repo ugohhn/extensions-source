@@ -204,7 +204,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
-    private lateinit var loginIndicator: SwitchPreferenceCompat   // 登录状态指示灯
+    private lateinit var loginIndicator: SwitchPreferenceCompat
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
     // ══════════════════════════════════════════════════════════════════════
@@ -261,7 +261,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录触发器（拨动开关弹出对话框，然后自动弹回）
+        // WebView 登录触发器
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -270,7 +270,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setOnPreferenceChangeListener { _, newValue ->
                 if (newValue as Boolean) {
                     showWebViewLoginDialog()
-                    false // 弹回关闭状态
+                    false
                 } else {
                     true
                 }
@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（使用 Activity 上下文）
+    // WebView 登录对话框
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -839,7 +839,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁
+    // 阅读页面 & 自动解锁（恢复原始行为：余额不足抛出异常）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -880,10 +880,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val coinCount = data.optInt("coinCount", 0)
         val episodeName = data.optString("episodeName", "本话")
         if (coinCount < price) {
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(appContext, "余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币", Toast.LENGTH_LONG).show()
-            }
-            return
+            // 恢复原始行为：抛出异常，让页面加载失败
+            throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
         }
         val payResp = client.newCall(GET("$baseUrl/episode/unlock/pay?$params", reqHeaders)).execute()
         val payJson = org.json.JSONObject(payResp.body.string())
