@@ -7,6 +7,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -401,13 +402,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // 修复：使 WebView 可以获得焦点，并允许弹窗
+            // 确保可获取焦点
             isFocusable = true
             isFocusableInTouchMode = true
-            requestFocus()
+
+            // 修复：触摸时主动请求焦点并弹出键盘
+            setOnTouchListener { _, _ ->
+                requestFocus()
+                val imm = actCtx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                false
+            }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
+                    // 尝试用 JS 聚焦第一个输入框
+                    view?.evaluateJavascript("document.querySelector('input')?.focus();", null)
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
@@ -455,12 +465,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             .create()
         dialog.show()
-        // 设置软键盘模式，避免遮挡输入框
+        // 设置软键盘调整模式
         dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-        // 延迟请求焦点，确保布局完成
+        // 延迟请求焦点（辅助）
         webView.postDelayed({
             webView.requestFocus()
-        }, 200)
+            val imm = actCtx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT)
+        }, 300)
     }
 
     // ══════════════════════════════════════════════════════════════════════
