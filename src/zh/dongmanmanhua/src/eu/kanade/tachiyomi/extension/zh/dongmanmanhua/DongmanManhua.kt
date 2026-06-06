@@ -7,7 +7,6 @@ import android.os.Looper
 import android.util.Log
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -386,12 +385,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
             return
         }
+
         val dialogView = FrameLayout(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
+
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -402,22 +403,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // 确保可获取焦点
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 修复：触摸时主动请求焦点并弹出键盘
-            setOnTouchListener { _, _ ->
-                requestFocus()
-                val imm = actCtx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-                imm.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+            // 只请求焦点，让系统自然弹出键盘
+            setOnTouchListener { v, _ ->
+                if (!v.hasFocus()) v.requestFocus()
                 false
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // 尝试用 JS 聚焦第一个输入框
-                    view?.evaluateJavascript("document.querySelector('input')?.focus();", null)
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
@@ -452,7 +448,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             loadUrl("$baseUrl/member/login")
         }
+
         dialogView.addView(webView)
+
         val dialog = AlertDialog.Builder(actCtx)
             .setTitle("咚漫登录")
             .setView(dialogView)
@@ -464,15 +462,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 webView.destroy()
             }
             .create()
+
         dialog.show()
-        // 设置软键盘调整模式
-        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
-        // 延迟请求焦点（辅助）
-        webView.postDelayed({
-            webView.requestFocus()
-            val imm = actCtx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT)
-        }, 300)
+
+        // ── 核心修复：让 Dialog 的 Window 真正接受输入焦点 ──────────────────
+        dialog.window?.apply {
+            // 清除可能阻止输入焦点的 flag（某些 ROM 可能会设置）
+            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+
+            // 键盘弹出时 WebView 可滚动，避免遮挡输入框
+            setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+            )
+        }
+        webView.requestFocus()
+        // ───────────────────────────────────────────────────────────────────
     }
 
     // ══════════════════════════════════════════════════════════════════════
