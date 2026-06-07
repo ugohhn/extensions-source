@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（添加详细日志）
+    // WebView 登录对话框（使用 devicePixelRatio 修正单位）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -487,34 +487,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         (function(){
                             var el = document.getElementById('formLogin');
                             if(!el) return 'NO_ELEMENT';
-                            return el.offsetTop + ',' + (el.offsetTop + el.offsetHeight) + ',' + document.body.scrollHeight;
+                            var dpr = window.devicePixelRatio || 1;
+                            var top = el.offsetTop * dpr;
+                            var bottom = (el.offsetTop + el.offsetHeight) * dpr;
+                            return top + ',' + bottom;
                         })()
                     """.trimIndent()) { value ->
                         Log.d("DongmanIME", "JS回调 value=$value")
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                        val scrollHeight = parts[2].toFloatOrNull() ?: 0f
                         val formHeight = (bottom - top).toInt()
                         val targetScrollY = top.toInt() - ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-                        Log.d("DongmanIME", "计算 top=$top bottom=$bottom formHeight=$formHeight visibleBottom=$visibleBottom scrollHeight=$scrollHeight targetScrollY=$targetScrollY")
+                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
                         }
                     }
                 } else {
-                    val visibleBottom = rect.bottom
-                    Log.d("DongmanIME", "键盘收起 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY}")
+                    Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
                             if(!el) return '0';
-                            return String(el.offsetTop);
+                            return String(el.offsetTop * (window.devicePixelRatio || 1));
                         })()
                     """.trimIndent()) { value ->
-                        Log.d("DongmanIME", "收起JS回调 value=$value")
                         val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
+                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
