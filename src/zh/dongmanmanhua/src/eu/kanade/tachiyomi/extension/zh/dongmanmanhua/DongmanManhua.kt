@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（监听键盘 + 状态锁 + 清理监听器）
+    // WebView 登录对话框（最终版：使用 webView.scrollTo 避免 JS 冲突）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,7 +386,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         var dialog: AlertDialog? = null
-        var isKeyboardVisible = false  // 状态锁
+        var isKeyboardVisible = false
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -467,39 +467,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        // 监听键盘高度变化，状态锁 + 防抖
+        // 监听键盘高度变化，使用 webView.scrollTo 避免与页面 JS 冲突
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
                 val keyboardHeight = rootView.height - rect.bottom
-
                 val keyboardNowVisible = keyboardHeight > 150
 
-                // 状态没变就不处理，避免重复触发
                 if (keyboardNowVisible == isKeyboardVisible) return
                 isKeyboardVisible = keyboardNowVisible
 
-                if (keyboardNowVisible) {
-                    webView.evaluateJavascript("""
-                        var el = document.getElementById('formLogin');
-                        if(el) {
-                            var top = el.getBoundingClientRect().top + window.scrollY;
-                            window.scrollTo({top: top, behavior: 'instant'});
+                // 查询 formLogin 元素相对于 WebView 顶部的偏移量
+                webView.evaluateJavascript(
+                    "document.getElementById('formLogin')?.getBoundingClientRect().top",
+                    { value ->
+                        val top = value?.toFloatOrNull() ?: return@evaluateJavascript
+                        val targetScrollY = webView.scrollY + top.toInt()
+                        Handler(Looper.getMainLooper()).post {
+                            // 直接滚动 WebView 的 scrollY，页面 JS 无法覆盖
+                            webView.scrollTo(0, targetScrollY)
                         }
-                    """.trimIndent(), null)
-                } else {
-                    webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
-                }
+                    }
+                )
             }
         }
         rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
 
-        // Dialog 关闭时移除监听器，防止内存泄漏
         dialog.setOnDismissListener {
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
             webView.destroy()
@@ -1077,4 +1072,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
