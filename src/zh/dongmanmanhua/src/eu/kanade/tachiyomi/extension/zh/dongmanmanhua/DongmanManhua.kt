@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：使用 webView.scrollTo 避免 JS 冲突）
+    // WebView 登录对话框（最终版：键盘居中滚动 + 防冲突）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -467,7 +467,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        // 监听键盘高度变化，使用 webView.scrollTo 避免与页面 JS 冲突
+        // 监听键盘高度变化，使用 webView.scrollTo 并居中显示 formLogin
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
@@ -479,18 +479,44 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (keyboardNowVisible == isKeyboardVisible) return
                 isKeyboardVisible = keyboardNowVisible
 
-                // 查询 formLogin 元素相对于 WebView 顶部的偏移量
-                webView.evaluateJavascript(
-                    "document.getElementById('formLogin')?.getBoundingClientRect().top",
-                    { value ->
-                        val top = value?.toFloatOrNull() ?: return@evaluateJavascript
-                        val targetScrollY = webView.scrollY + top.toInt()
-                        Handler(Looper.getMainLooper()).post {
-                            // 直接滚动 WebView 的 scrollY，页面 JS 无法覆盖
-                            webView.scrollTo(0, targetScrollY)
+                if (keyboardNowVisible) {
+                    // 获取 formLogin 元素的 top 和 bottom
+                    webView.evaluateJavascript(
+                        """
+                        (function(){
+                            var el = document.getElementById('formLogin');
+                            if(!el) return '0,0';
+                            var rect = el.getBoundingClientRect();
+                            return rect.top + ',' + rect.bottom;
+                        })()
+                        """.trimIndent(),
+                        { value ->
+                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                            val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
+                            val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
+                            val formHeight = (bottom - top).toInt()
+                            val visibleHeight = rect.bottom  // 键盘上方可见区域高度（从屏幕顶部到键盘顶部）
+                            // 让表单在可见区域内居中（如果表单高度大于可见区域，则顶部对齐）
+                            val offset = if (formHeight >= visibleHeight) 0 else (visibleHeight - formHeight) / 2
+                            val targetScrollY = webView.scrollY + top.toInt() - offset
+                            Handler(Looper.getMainLooper()).post {
+                                webView.scrollTo(0, targetScrollY)
+                            }
                         }
-                    }
-                )
+                    )
+                } else {
+                    // 键盘收起时，将表单滚动回顶部（可选）
+                    webView.evaluateJavascript(
+                        "document.getElementById('formLogin')?.getBoundingClientRect().top",
+                        { value ->
+                            val top = value?.toFloatOrNull() ?: return@evaluateJavascript
+                            val targetScrollY = webView.scrollY + top.toInt()
+                            Handler(Looper.getMainLooper()).post {
+                                webView.scrollTo(0, targetScrollY)
+                            }
+                        }
+                    )
+                }
             }
         }
         rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
@@ -1072,4 +1098,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
