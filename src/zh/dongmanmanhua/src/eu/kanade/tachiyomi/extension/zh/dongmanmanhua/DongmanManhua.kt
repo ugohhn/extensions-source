@@ -404,7 +404,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // Android 层触摸拦截：表单外区域吞掉事件
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
@@ -429,7 +428,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         (function(){
                             var form = document.getElementById('formLogin');
                             if(!form) return;
-                            // 拦截非交互元素的 mousedown，防止焦点转移
                             form.addEventListener('mousedown', function(e) {
                                 if(e.target.tagName !== 'INPUT' && 
                                    e.target.tagName !== 'BUTTON' &&
@@ -440,10 +438,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     e.preventDefault();
                                 }
                             }, true);
-                            // 隐藏底部空白区域（div#content）
                             var content = document.getElementById('content');
                             if(content) content.style.display = 'none';
-                            // 动态撑高表单，覆盖底部物理空白
                             var remainHeight = document.documentElement.clientHeight - form.offsetTop;
                             form.style.minHeight = remainHeight + 'px';
                             form.style.boxSizing = 'border-box';
@@ -452,6 +448,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     """.trimIndent(), null)
 
                     // 延迟缓存表单坐标（将底部扩展到屏幕底部）
+                    val webViewHeight = this@apply.height
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -460,8 +457,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 if(!form) return '';
                                 var r = form.getBoundingClientRect();
                                 var scrollY = window.scrollY;
-                                // 底部扩展到屏幕物理高度，覆盖下方空白
-                                var screenBottom = ${webView.height};
+                                var screenBottom = $webViewHeight;
                                 return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+screenBottom;
                             })()
                         """.trimIndent()) { value ->
