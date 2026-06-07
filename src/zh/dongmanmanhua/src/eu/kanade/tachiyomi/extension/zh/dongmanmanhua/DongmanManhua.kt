@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：Android层拦截等待formTop就绪，JS处理LI）
+    // WebView 登录对话框
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -388,7 +388,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var formTop = 0f
+        var formTop = 0f  // 单位：物理像素，相对于 WebView 内容区顶部（包含滚动偏移）
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -400,7 +400,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // 添加 WebChromeClient 以便查看 JS 日志
             webChromeClient = object : android.webkit.WebChromeClient() {
                 override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
                     Log.d("DongmanIME", "JS: ${msg.message()}")
@@ -411,20 +410,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // Android 层触摸拦截：formTop 未就绪时全部拦截，就绪后只拦截上方区域
+            // 触摸拦截：使用视口坐标，formTop 为内容绝对坐标，需减去当前 scrollY 得到视口内位置
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
-                    val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formTop=$formTop")
-                    // 修复1：formTop 未就绪（<=0）时，暂时拦截所有触摸，等待缓存
+                    val y = event.y
+                    val formTopInViewport = formTop - scrollY
+                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formTop=$formTop formTopInViewport=$formTopInViewport")
                     if (formTop <= 0) {
-                        Log.d("DongmanIME", "formTop未就绪，暂时拦截")
+                        Log.d("DongmanIME", "formTop未就绪拦截")
                         return@setOnTouchListener true
                     }
-                    if (y < formTop) {
-                        Log.d("DongmanIME", "formLogin上方，吞掉")
+                    if (y < formTopInViewport) {
+                        Log.d("DongmanIME", "上方吞掉")
                         return@setOnTouchListener true
                     }
                 }
@@ -433,7 +432,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 样式调整：隐藏底部空白，撑高表单
+                    // 样式调整
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -448,14 +447,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 获取 formLogin 顶部坐标（用于 Android 层拦截）
+                    // 获取 formLogin 顶部坐标（绝对坐标，含滚动偏移，单位物理像素）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var form = document.getElementById('formLogin');
                                 if(!form) return '0';
-                                return (form.getBoundingClientRect().top * dpr);
+                                return (form.getBoundingClientRect().top + window.scrollY) * dpr;
                             })()
                         """.trimIndent()) { value ->
                             formTop = value?.trim('"')?.toFloatOrNull() ?: 0f
@@ -463,13 +462,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }, 800)
 
-                    // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
-                    // 修复2：LI 父容器直接找 UL，不再依赖 role 属性
+                    // JS 拦截：LI 白名单（自动补全列表放行）
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
                                 var t = e.target;
-                                // 原有白名单元素直接放行
                                 if (t.tagName === 'INPUT' ||
                                     t.tagName === 'BUTTON' ||
                                     t.tagName === 'A' ||
@@ -479,18 +476,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     t.closest('label')) {
                                     return;
                                 }
-                                // 处理 LI 元素：只要在 UL 内就视为自动补全列表，放行
                                 if (t.tagName === 'LI' || t.closest('li')) {
                                     var list = t.closest('ul');
-                                    if (list) {
-                                        // 属于自动补全列表 → 放行
-                                        return;
-                                    }
-                                    // 不属于补全列表 → 视为空白区域，阻止失焦
+                                    if (list) return;
                                     e.preventDefault();
                                     return;
                                 }
-                                // 其他元素（如 DIV、BODY）一律阻止默认行为，防止键盘收起
                                 e.preventDefault();
                                 console.log('DongmanIME: preventDefault on ' + t.tagName);
                             }, true);
@@ -560,17 +551,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val keyboardNowVisible = rect.bottom < webView.height - 150
 
                 if (keyboardNowVisible != isKeyboardVisible) {
-                    Log.d("DongmanIME", "键盘状态变化 -> $keyboardNowVisible rectBottom=${rect.bottom} time=${System.currentTimeMillis()}")
                     isKeyboardVisible = keyboardNowVisible
+                    Log.d("DongmanIME", "键盘状态变化->$keyboardNowVisible time=${System.currentTimeMillis()} rectBottom=${rect.bottom} webView.height=${webView.height} webView.scrollY=${webView.scrollY}")
                 }
 
                 if (keyboardNowVisible) {
-                    webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
-                } else {
-                    Log.d("DongmanIME", "键盘收起，不做滚动")
+                    val visibleBottom = rect.bottom
+                    // 获取 formLogin 相对于视口顶部的偏移（物理像素），计算出合适的滚动位置
+                    webView.evaluateJavascript("""
+                        (function(){
+                            var dpr = window.devicePixelRatio || 1;
+                            var form = document.getElementById('formLogin');
+                            if(!form) return '0';
+                            return String(form.offsetTop * dpr);
+                        })()
+                    """.trimIndent()) { value ->
+                        val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
+                        // 目标滚动位置：使表单顶部位于可视区域上部，留出约 30% 屏幕高度的空间
+                        val targetScrollY = (top - (visibleBottom - top * 0.3f).coerceAtLeast(0f)).toInt().coerceAtLeast(0)
+                        Handler(Looper.getMainLooper()).post {
+                            webView.scrollTo(0, targetScrollY)
+                            Log.d("DongmanIME", "scrollTo=$targetScrollY visibleBottom=$visibleBottom offsetTop=$top")
+                        }
+                    }
                 }
             }
         }
@@ -748,7 +751,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页（触发探针）
+    // 首页
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -766,10 +769,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 最新更新（Latest）
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -794,7 +793,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 搜索（支持混合模式）
+    // 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
@@ -972,7 +971,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（原始抛异常行为）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -1153,4 +1152,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
