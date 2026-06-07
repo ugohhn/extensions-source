@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（隐藏无用区域 + 简化滚动）
+    // WebView 登录对话框（包含 DOM 结构打印和临时隐藏逻辑）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -387,7 +387,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var savedScrollY = 0
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -408,24 +407,58 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 隐藏 formLogin 上下的无用区域，使表单占满可视区
+                    // 打印 DOM 结构（调试用）
+                    view?.evaluateJavascript("""
+                        (function(){
+                            var form = document.getElementById('formLogin');
+                            if(!form) return 'NO_FORM';
+                            var result = '';
+                            var node = form.parentElement;
+                            var depth = 0;
+                            while(node && depth < 5) {
+                                result += 'depth' + depth + ':' + node.tagName + 
+                                          ' id=' + node.id + 
+                                          ' class=' + node.className + 
+                                          ' scrollHeight=' + node.scrollHeight + 
+                                          ' clientHeight=' + node.clientHeight + 
+                                          ' minHeight=' + node.style.minHeight + 
+                                          ' padding=' + window.getComputedStyle(node).paddingTop + '|';
+                                node = node.parentElement;
+                                depth++;
+                            }
+                            result += 'PREV:';
+                            node = form.previousElementSibling;
+                            while(node) {
+                                result += node.tagName + '#' + node.id + '.' + node.className + ',';
+                                node = node.previousElementSibling;
+                            }
+                            result += 'NEXT:';
+                            node = form.nextElementSibling;
+                            while(node) {
+                                result += node.tagName + '#' + node.id + '.' + node.className + ',';
+                                node = node.nextElementSibling;
+                            }
+                            return result;
+                        })()
+                    """.trimIndent()) { value ->
+                        Log.d("DongmanIME", "DOM结构: $value")
+                    }
+
+                    // 临时隐藏 formLogin 上下兄弟元素（后续根据结构精确调整）
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
                             if(!form) return;
-                            // 隐藏 formLogin 上方的所有兄弟元素（猫咪图片等）
                             var node = form.previousElementSibling;
                             while(node) {
                                 node.style.display = 'none';
                                 node = node.previousElementSibling;
                             }
-                            // 隐藏 formLogin 下方的所有兄弟元素（底部空白等）
                             node = form.nextElementSibling;
                             while(node) {
                                 node.style.display = 'none';
                                 node = node.nextElementSibling;
                             }
-                            // 调整父容器样式，去除多余 padding/margin
                             if(form.parentElement) {
                                 form.parentElement.style.paddingTop = '0';
                                 form.parentElement.style.marginTop = '0';
@@ -436,7 +469,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 简单滚动到表单顶部
+                    // 滚动到表单顶部
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
@@ -507,16 +540,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 isKeyboardVisible = keyboardNowVisible
 
                 if (keyboardNowVisible) {
-                    // 键盘弹出时，确保表单可见（简单滚动到顶部）
                     webView.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
                     )
-                    webView.evaluateJavascript("window.scrollY") { y ->
-                        savedScrollY = y?.toFloatOrNull()?.toInt() ?: 0
-                    }
                 } else {
-                    // 键盘收起，不做强制滚动，让页面自然停留
                     Log.d("DongmanIME", "键盘收起，不做滚动")
                 }
             }
