@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：键盘居中滚动 + 防冲突）
+    // WebView 登录对话框（最终版：键盘居中滚动 + 异步回调正确获取 visibleBottom）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -480,42 +480,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 isKeyboardVisible = keyboardNowVisible
 
                 if (keyboardNowVisible) {
-                    // 获取 formLogin 元素的 top 和 bottom
+                    val visibleBottom = rect.bottom  // 先保存，供异步回调使用
                     webView.evaluateJavascript(
                         """
                         (function(){
                             var el = document.getElementById('formLogin');
                             if(!el) return '0,0';
-                            var rect = el.getBoundingClientRect();
-                            return rect.top + ',' + rect.bottom;
+                            var r = el.getBoundingClientRect();
+                            return r.top + ',' + r.bottom;
                         })()
-                        """.trimIndent(),
-                        { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                            val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
-                            val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                            val formHeight = (bottom - top).toInt()
-                            val visibleHeight = rect.bottom  // 键盘上方可见区域高度（从屏幕顶部到键盘顶部）
-                            // 让表单在可见区域内居中（如果表单高度大于可见区域，则顶部对齐）
-                            val offset = if (formHeight >= visibleHeight) 0 else (visibleHeight - formHeight) / 2
-                            val targetScrollY = webView.scrollY + top.toInt() - offset
-                            Handler(Looper.getMainLooper()).post {
-                                webView.scrollTo(0, targetScrollY)
-                            }
+                        """.trimIndent()
+                    ) { value ->
+                        val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                        val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
+                        val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
+                        val formHeight = (bottom - top).toInt()
+                        val targetScrollY = webView.scrollY + top.toInt() -
+                            ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
+
+                        Handler(Looper.getMainLooper()).post {
+                            webView.scrollTo(0, targetScrollY)
                         }
-                    )
+                    }
                 } else {
-                    // 键盘收起时，将表单滚动回顶部（可选）
                     webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.getBoundingClientRect().top",
-                        { value ->
-                            val top = value?.toFloatOrNull() ?: return@evaluateJavascript
-                            val targetScrollY = webView.scrollY + top.toInt()
-                            Handler(Looper.getMainLooper()).post {
-                                webView.scrollTo(0, targetScrollY)
-                            }
+                        "document.getElementById('formLogin')?.getBoundingClientRect().top"
+                    ) { value ->
+                        val top = value?.toFloatOrNull() ?: return@evaluateJavascript
+                        val targetScrollY = webView.scrollY + top.toInt()
+                        Handler(Looper.getMainLooper()).post {
+                            webView.scrollTo(0, targetScrollY)
                         }
-                    )
+                    }
                 }
             }
         }
@@ -1098,4 +1094,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
