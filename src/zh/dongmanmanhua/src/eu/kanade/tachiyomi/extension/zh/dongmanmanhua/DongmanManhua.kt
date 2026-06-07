@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版本：移除 blur 拦截，只保留滚动和恢复）
+    // WebView 登录对话框（隐藏无用区域 + 简化滚动）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -387,7 +387,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var savedScrollY = 0  // 保存滚动位置，用于对抗系统重置
+        var savedScrollY = 0
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -408,7 +408,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只滚动到登录表单，不注入 blur 拦截
+                    // 隐藏 formLogin 上下的无用区域，使表单占满可视区
+                    view?.evaluateJavascript("""
+                        (function(){
+                            var form = document.getElementById('formLogin');
+                            if(!form) return;
+                            // 隐藏 formLogin 上方的所有兄弟元素（猫咪图片等）
+                            var node = form.previousElementSibling;
+                            while(node) {
+                                node.style.display = 'none';
+                                node = node.previousElementSibling;
+                            }
+                            // 隐藏 formLogin 下方的所有兄弟元素（底部空白等）
+                            node = form.nextElementSibling;
+                            while(node) {
+                                node.style.display = 'none';
+                                node = node.nextElementSibling;
+                            }
+                            // 调整父容器样式，去除多余 padding/margin
+                            if(form.parentElement) {
+                                form.parentElement.style.paddingTop = '0';
+                                form.parentElement.style.marginTop = '0';
+                            }
+                            form.style.marginTop = '0';
+                            form.style.paddingTop = '16px';
+                            document.body.style.backgroundColor = '#fff';
+                        })();
+                    """.trimIndent(), null)
+
+                    // 简单滚动到表单顶部
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
@@ -468,56 +496,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        val screenHeight = actCtx.resources.displayMetrics.heightPixels
         val rootView = dialog.window?.decorView ?: return
-
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardHeight = screenHeight - rect.bottom
-                val keyboardNowVisible = keyboardHeight > 150
-
-                Log.d("DongmanIME", "onGlobalLayout screenHeight=$screenHeight rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
+                val keyboardNowVisible = rect.bottom < webView.height - 150
 
                 if (keyboardNowVisible == isKeyboardVisible) return
                 isKeyboardVisible = keyboardNowVisible
 
                 if (keyboardNowVisible) {
-                    val visibleBottom = rect.bottom
-                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY} webView.height=${webView.height}")
-
-                    webView.evaluateJavascript("""
-                        (function(){
-                            var el = document.getElementById('formLogin');
-                            if(!el) return 'NO_ELEMENT';
-                            var dpr = window.devicePixelRatio || 1;
-                            var top = el.offsetTop * dpr;
-                            var bottom = (el.offsetTop + el.offsetHeight) * dpr;
-                            return top + ',' + bottom;
-                        })()
-                    """.trimIndent()) { value ->
-                        Log.d("DongmanIME", "JS回调 value=$value")
-                        val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                        val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
-                        val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                        val formHeight = (bottom - top).toInt()
-                        val targetScrollY = top.toInt() - ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
-                        Handler(Looper.getMainLooper()).post {
-                            webView.scrollTo(0, targetScrollY)
-                            savedScrollY = targetScrollY
-                            Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY} 已保存位置=$savedScrollY")
-                        }
+                    // 键盘弹出时，确保表单可见（简单滚动到顶部）
+                    webView.evaluateJavascript(
+                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
+                        null
+                    )
+                    webView.evaluateJavascript("window.scrollY") { y ->
+                        savedScrollY = y?.toFloatOrNull()?.toInt() ?: 0
                     }
                 } else {
-                    // 键盘收起：延迟恢复滚动位置，对抗系统重置
-                    isKeyboardVisible = false
-                    Log.d("DongmanIME", "键盘收起 延迟恢复 savedScrollY=$savedScrollY")
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        webView.scrollTo(0, savedScrollY)
-                        Log.d("DongmanIME", "恢复后 webView.scrollY=${webView.scrollY}")
-                    }, 100)
+                    // 键盘收起，不做强制滚动，让页面自然停留
+                    Log.d("DongmanIME", "键盘收起，不做滚动")
                 }
             }
         }
