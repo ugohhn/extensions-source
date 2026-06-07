@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（添加日志定位触摸坐标问题）
+    // WebView 登录对话框（修复 bottom=0 问题，使用 rootView.height 作为底部扩展）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -404,7 +404,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 添加日志的触摸监听
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
@@ -451,33 +450,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标（将底部扩展到屏幕底部）
-                    val webViewHeight = this@apply.height
-                    view?.postDelayed({
-                        view.evaluateJavascript("""
-                            (function(){
-                                var dpr = window.devicePixelRatio || 1;
-                                var form = document.getElementById('formLogin');
-                                if(!form) return '';
-                                var r = form.getBoundingClientRect();
-                                var scrollY = window.scrollY;
-                                var screenBottom = $webViewHeight;
-                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+screenBottom;
-                            })()
-                        """.trimIndent()) { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                            if (parts.size == 4) {
-                                formRects.clear()
-                                formRects.add(InputRect(
-                                    parts[0].toFloat(),
-                                    parts[1].toFloat(),
-                                    parts[2].toFloat(),
-                                    parts[3].toFloat()
-                                ))
-                                Log.d("DongmanIME", "缓存表单坐标(底部扩展): $formRects")
-                            }
-                        }
-                    }, 800)
+                    // 延迟缓存表单坐标（底部扩展到 rootView.height）
+                    // 注意：rootView 在 dialog.show() 之后才会初始化，这里需要拿到它
+                    // 由于 rootView 此时可能尚未赋值，我们使用全局 rootViewHeight 变量
+                    // 将在 dialog.show() 后通过成员变量传递
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -534,6 +510,96 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         webView.requestFocus()
 
         val rootView = dialog.window?.decorView ?: return
+        val rootViewHeight = rootView.height.toFloat()  // 获取 Dialog 实际高度，作为底部扩展
+
+        // 补上坐标缓存（因为 onPageCommitVisible 里需要用到 rootViewHeight）
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                // 注入 JS：阻止 formLogin 内部空白区域导致失焦
+                view?.evaluateJavascript("""
+                    (function(){
+                        var form = document.getElementById('formLogin');
+                        if(!form) return;
+                        form.addEventListener('mousedown', function(e) {
+                            if(e.target.tagName !== 'INPUT' && 
+                               e.target.tagName !== 'BUTTON' &&
+                               e.target.tagName !== 'A' &&
+                               !e.target.closest('button') &&
+                               !e.target.closest('a') &&
+                               !e.target.closest('label')) {
+                                e.preventDefault();
+                            }
+                        }, true);
+                        var content = document.getElementById('content');
+                        if(content) content.style.display = 'none';
+                        var remainHeight = document.documentElement.clientHeight - form.offsetTop;
+                        form.style.minHeight = remainHeight + 'px';
+                        form.style.boxSizing = 'border-box';
+                        form.style.paddingTop = '16px';
+                    })();
+                """.trimIndent(), null)
+
+                // 延迟缓存表单坐标，底部扩展到 rootViewHeight
+                view?.postDelayed({
+                    view.evaluateJavascript("""
+                        (function(){
+                            var dpr = window.devicePixelRatio || 1;
+                            var form = document.getElementById('formLogin');
+                            if(!form) return '';
+                            var r = form.getBoundingClientRect();
+                            var scrollY = window.scrollY;
+                            var screenBottom = ${rootViewHeight};
+                            return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+screenBottom;
+                        })()
+                    """.trimIndent()) { value ->
+                        val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                        if (parts.size == 4) {
+                            formRects.clear()
+                            formRects.add(InputRect(
+                                parts[0].toFloat(),
+                                parts[1].toFloat(),
+                                parts[2].toFloat(),
+                                parts[3].toFloat()
+                            ))
+                            Log.d("DongmanIME", "缓存表单坐标(底部扩展 rootViewHeight=$rootViewHeight): $formRects")
+                        }
+                    }
+                }, 800)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+                Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
+                val neoSes = extractCookieValue(cookieStr, "NEO_SES")
+                val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
+                if (neoSes.isNotEmpty()) {
+                    preferences.edit()
+                        .putString(KEY_NEO_SES, neoSes)
+                        .putString(KEY_NEO_CHK, neoChk)
+                        .apply()
+                    if (useIndependentStorage()) {
+                        saveCookieToFile(neoSes, neoChk)
+                    } else {
+                        cachedCookie = buildCookieString(neoSes, neoChk)
+                        lastIndependentState = useIndependentStorage()
+                    }
+                    saveCookieToFile(neoSes, neoChk)
+                    refreshCookieCache()
+                    Handler(Looper.getMainLooper()).post {
+                        loginIndicator.isChecked = true
+                        loginIndicator.summary = buildLoginSummary()
+                        if (::manualCookieSwitch.isInitialized) {
+                            manualCookieSwitch.summary = buildManualSwitchSummary()
+                        }
+                        Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
+                        dialog?.dismiss()
+                    }
+                }
+            }
+        }
+        // 重新设置 webViewClient（因为上面覆盖了，需要重新赋值）
+        webView.webViewClient = (webView.webViewClient as WebViewClient)
+
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
@@ -1132,4 +1198,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
