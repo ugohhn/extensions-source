@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终修复：坐标缓存只一次，底部固定，JS黑名单拦截）
+    // WebView 登录对话框（最终版：坐标缓存一次，document 级别拦截）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -390,7 +390,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var isKeyboardVisible = false
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
-        var formRectCached = false  // 只缓存一次，避免键盘弹出后底部高度变小
+        var formRectCached = false
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -434,31 +434,37 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 注入 JS：阻止空白区域导致失焦（黑名单模式）
+                    // 注入 JS：document 级别拦截空白点击，防止键盘收起
                     view?.evaluateJavascript("""
                         (function(){
-                            var form = document.getElementById('formLogin');
-                            if(!form) { console.log('DongmanIME: formLogin未找到'); return; }
-                            form.addEventListener('mousedown', function(e) {
+                            document.addEventListener('mousedown', function(e) {
                                 var t = e.target;
-                                var blockTags = ['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'SPAN', 'P', 'LI'];
-                                if (blockTags.indexOf(t.tagName) !== -1 &&
-                                    !t.closest('button') &&
-                                    !t.closest('a') &&
-                                    !t.closest('label') &&
-                                    t.tagName !== 'INPUT') {
-                                    e.preventDefault();
-                                    console.log('DongmanIME: preventDefault on ' + t.tagName);
+                                console.log('DongmanIME mousedown target=' + t.tagName + ' id=' + t.id);
+                                // INPUT、BUTTON、A、LABEL 及其子元素直接放行
+                                if (t.tagName === 'INPUT' ||
+                                    t.tagName === 'BUTTON' ||
+                                    t.tagName === 'A' ||
+                                    t.tagName === 'LABEL' ||
+                                    t.closest('button') ||
+                                    t.closest('a') ||
+                                    t.closest('label')) {
+                                    return;
                                 }
+                                // 其他一律 preventDefault，阻止失焦
+                                e.preventDefault();
+                                console.log('DongmanIME: preventDefault on ' + t.tagName);
                             }, true);
-                            console.log('DongmanIME: mousedown监听已注入');
+                            console.log('DongmanIME: document mousedown监听已注入');
                             
-                            var content = document.getElementById('content');
-                            if(content) content.style.display = 'none';
-                            var remainHeight = document.documentElement.clientHeight - form.offsetTop;
-                            form.style.minHeight = remainHeight + 'px';
-                            form.style.boxSizing = 'border-box';
-                            form.style.paddingTop = '16px';
+                            var form = document.getElementById('formLogin');
+                            if(form) {
+                                var content = document.getElementById('content');
+                                if(content) content.style.display = 'none';
+                                var remainHeight = document.documentElement.clientHeight - form.offsetTop;
+                                form.style.minHeight = remainHeight + 'px';
+                                form.style.boxSizing = 'border-box';
+                                form.style.paddingTop = '16px';
+                            }
                         })();
                     """.trimIndent(), null)
 
@@ -1150,4 +1156,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
