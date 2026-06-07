@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：键盘居中滚动 + 异步回调正确获取 visibleBottom）
+    // WebView 登录对话框（含详细日志）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -407,7 +407,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 页面首次可见时滚动到登录表单
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
@@ -467,7 +466,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        // 监听键盘高度变化，使用 webView.scrollTo 并居中显示 formLogin
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
@@ -480,26 +478,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 isKeyboardVisible = keyboardNowVisible
 
                 if (keyboardNowVisible) {
-                    val visibleBottom = rect.bottom  // 先保存，供异步回调使用
-                    webView.evaluateJavascript(
-                        """
+                    val visibleBottom = rect.bottom
+                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY}")
+
+                    webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
-                            if(!el) return '0,0';
+                            if(!el) return 'NO_ELEMENT';
                             var r = el.getBoundingClientRect();
                             return r.top + ',' + r.bottom;
                         })()
-                        """.trimIndent()
-                    ) { value ->
+                    """.trimIndent()) { value ->
+                        Log.d("DongmanIME", "JS回调 value=$value")
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
                         val formHeight = (bottom - top).toInt()
                         val targetScrollY = webView.scrollY + top.toInt() -
                             ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-
+                        Log.d("DongmanIME", "准备scrollTo top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
+                            Log.d("DongmanIME", "scrollTo执行后 webView.scrollY=${webView.scrollY}")
                         }
                     }
                 } else {
@@ -508,6 +508,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     ) { value ->
                         val top = value?.toFloatOrNull() ?: return@evaluateJavascript
                         val targetScrollY = webView.scrollY + top.toInt()
+                        Log.d("DongmanIME", "键盘收起 scrollTo top=$top targetScrollY=$targetScrollY")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                         }
@@ -1094,4 +1095,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
