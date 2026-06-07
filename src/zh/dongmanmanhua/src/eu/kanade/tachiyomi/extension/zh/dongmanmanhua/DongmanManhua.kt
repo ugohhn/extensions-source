@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：坐标缓存 + JS 拦截 + 日志输出）
+    // WebView 登录对话框（最终修复：坐标缓存只一次，底部固定，JS黑名单拦截）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -390,6 +390,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var isKeyboardVisible = false
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
+        var formRectCached = false  // 只缓存一次，避免键盘弹出后底部高度变小
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -401,7 +402,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // 添加 WebChromeClient 输出 JS 日志
             webChromeClient = object : android.webkit.WebChromeClient() {
                 override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
                     Log.d("DongmanIME", "JS: ${msg.message()}")
@@ -434,21 +434,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 注入 JS：阻止 formLogin 内部空白区域导致失焦，并输出日志
+                    // 注入 JS：阻止空白区域导致失焦（黑名单模式）
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
                             if(!form) { console.log('DongmanIME: formLogin未找到'); return; }
                             form.addEventListener('mousedown', function(e) {
-                                console.log('DongmanIME mousedown target=' + e.target.tagName + ' id=' + e.target.id);
-                                if(e.target.tagName !== 'INPUT' && 
-                                   e.target.tagName !== 'BUTTON' &&
-                                   e.target.tagName !== 'A' &&
-                                   !e.target.closest('button') &&
-                                   !e.target.closest('a') &&
-                                   !e.target.closest('label')) {
+                                var t = e.target;
+                                var blockTags = ['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'SPAN', 'P', 'LI'];
+                                if (blockTags.indexOf(t.tagName) !== -1 &&
+                                    !t.closest('button') &&
+                                    !t.closest('a') &&
+                                    !t.closest('label') &&
+                                    t.tagName !== 'INPUT') {
                                     e.preventDefault();
-                                    console.log('DongmanIME: preventDefault执行');
+                                    console.log('DongmanIME: preventDefault on ' + t.tagName);
                                 }
                             }, true);
                             console.log('DongmanIME: mousedown监听已注入');
@@ -462,35 +462,40 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标，底部使用 window.innerHeight * dpr
-                    view?.postDelayed({
-                        view.evaluateJavascript("""
-                            (function(){
-                                var dpr = window.devicePixelRatio || 1;
-                                var form = document.getElementById('formLogin');
-                                if(!form) return '';
-                                var r = form.getBoundingClientRect();
-                                var scrollY = window.scrollY;
-                                var formLeft = 0;
-                                var formTop = (r.top + scrollY) * dpr;
-                                var formRight = r.right * dpr;
-                                var screenBottom = window.innerHeight * dpr;
-                                return '0,' + formTop + ',' + formRight + ',' + screenBottom;
-                            })()
-                        """.trimIndent()) { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                            if (parts.size == 4) {
-                                formRects.clear()
-                                formRects.add(InputRect(
-                                    parts[0].toFloat(),
-                                    parts[1].toFloat(),
-                                    parts[2].toFloat(),
-                                    parts[3].toFloat()
-                                ))
-                                Log.d("DongmanIME", "缓存表单坐标(innerHeight): $formRects")
+                    // 只缓存一次表单坐标，底部使用 rootView 实际高度（不受键盘影响）
+                    if (!formRectCached) {
+                        view?.postDelayed({
+                            val rootView = dialog?.window?.decorView
+                            if (rootView == null) return@postDelayed
+                            val screenBottom = rootView.height.toFloat()
+                            view.evaluateJavascript("""
+                                (function(){
+                                    var dpr = window.devicePixelRatio || 1;
+                                    var form = document.getElementById('formLogin');
+                                    if(!form) return '';
+                                    var r = form.getBoundingClientRect();
+                                    var scrollY = window.scrollY;
+                                    var formLeft = 0;
+                                    var formTop = (r.top + scrollY) * dpr;
+                                    var formRight = r.right * dpr;
+                                    return '0,' + formTop + ',' + formRight;
+                                })()
+                            """.trimIndent()) { value ->
+                                val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                                if (parts.size == 3) {
+                                    formRects.clear()
+                                    formRects.add(InputRect(
+                                        parts[0].toFloat(),
+                                        parts[1].toFloat(),
+                                        parts[2].toFloat(),
+                                        screenBottom
+                                    ))
+                                    formRectCached = true
+                                    Log.d("DongmanIME", "缓存表单坐标(固定底部=屏幕高度): $formRects")
+                                }
                             }
-                        }
-                    }, 800)
+                        }, 1000)
+                    }
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -1145,4 +1150,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
