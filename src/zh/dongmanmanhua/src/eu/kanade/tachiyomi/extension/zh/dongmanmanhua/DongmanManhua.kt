@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（修复输入法无法弹出问题）
+    // WebView 登录对话框（全屏、无标题/按钮、ADJUST_PAN）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,12 +386,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return
         }
 
-        val dialogView = FrameLayout(actCtx).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
+        var dialog: AlertDialog? = null
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -405,8 +400,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             isFocusable = true
             isFocusableInTouchMode = true
-
-            // 只请求焦点，让系统自然弹出键盘
             setOnTouchListener { v, _ ->
                 if (!v.hasFocus()) v.requestFocus()
                 false
@@ -438,26 +431,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 manualCookieSwitch.summary = buildManualSwitchSummary()
                             }
                             Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
+                            dialog?.dismiss()
                         }
-                        (view?.parent as? ViewGroup)?.let {
-                            (it.parent as? AlertDialog)?.dismiss()
-                        }
-                        view?.destroy()
                     }
                 }
             }
             loadUrl("$baseUrl/member/login")
         }
 
-        dialogView.addView(webView)
-
-        val dialog = AlertDialog.Builder(actCtx)
-            .setTitle("咚漫登录")
-            .setView(dialogView)
-            .setNegativeButton("取消") { d, _ ->
-                d.dismiss()
-                webView.destroy()
-            }
+        dialog = AlertDialog.Builder(actCtx)
+            .setView(webView)   // 无标题，无按钮
             .setOnDismissListener {
                 webView.destroy()
             }
@@ -465,20 +448,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         dialog.show()
 
-        // ── 核心修复：让 Dialog 的 Window 真正接受输入焦点 ──────────────────
         dialog.window?.apply {
-            // 清除可能阻止输入焦点的 flag（某些 ROM 可能会设置）
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-
-            // 键盘弹出时 WebView 可滚动，避免遮挡输入框
+            // 使用 PAN 而非 RESIZE，保持 WebView 高度完整
             setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+            )
+            // 全屏显示
+            setLayout(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
         webView.requestFocus()
-        // ───────────────────────────────────────────────────────────────────
     }
 
     // ══════════════════════════════════════════════════════════════════════
