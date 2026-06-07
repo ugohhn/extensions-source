@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
+    // WebView 登录对话框（最终版：保留猫咪，隐藏底部空白，动态计算高度，延迟缓存）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -406,13 +406,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
+                if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
                     val y = event.y + scrollY
-                    val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                    if (!inForm) {
-                        Log.d("DongmanIME", "点击在表单外，吞掉事件")
-                        return@setOnTouchListener true
+                    Log.d("DongmanIME", "触摸 x=$x y=$y formRects=$formRects")
+                    if (formRects.isNotEmpty()) {
+                        val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                        if (!inForm) {
+                            Log.d("DongmanIME", "表单外吞掉")
+                            return@setOnTouchListener true
+                        }
                     }
                 }
                 false
@@ -420,21 +423,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只隐藏底部空白区域（div#content），保留猫咪区域
+                    // 只隐藏底部空白区域，保留猫咪区域
                     view?.evaluateJavascript("""
                         (function(){
+                            var form = document.getElementById('formLogin');
+                            if(!form) return;
                             var content = document.getElementById('content');
                             if(content) content.style.display = 'none';
-                            var form = document.getElementById('formLogin');
-                            if(form) {
-                                form.style.minHeight = '100vh';
-                                form.style.boxSizing = 'border-box';
-                                form.style.paddingTop = '16px';
-                            }
+                            // 动态计算剩余高度，确保表单撑满屏幕（不使用 vh）
+                            var remainHeight = document.documentElement.clientHeight - form.offsetTop;
+                            form.style.minHeight = remainHeight + 'px';
+                            form.style.boxSizing = 'border-box';
+                            form.style.paddingTop = '16px';
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标
+                    // 延迟 800ms 等样式渲染完成后再缓存坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -458,7 +462,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 Log.d("DongmanIME", "缓存表单坐标: $formRects")
                             }
                         }
-                    }, 500)
+                    }, 800)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -1113,4 +1117,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
