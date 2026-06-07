@@ -458,24 +458,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }, 800)
 
                     // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
+                    // 修改：增加 LI 白名单，并打印 DIV 坐标用于调试
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
                                 var t = e.target;
                                 console.log('mousedown target=' + t.tagName + ' id=' + t.id);
-                                // INPUT、BUTTON、A、LABEL 及其子元素放行
+                                if (t.tagName === 'DIV') {
+                                    var r = t.getBoundingClientRect();
+                                    console.log('DongmanIME: DIV位置 top=' + r.top + ' left=' + r.left + ' w=' + r.width + ' h=' + r.height);
+                                }
                                 if (t.tagName === 'INPUT' ||
                                     t.tagName === 'BUTTON' ||
                                     t.tagName === 'A' ||
                                     t.tagName === 'LABEL' ||
+                                    t.tagName === 'LI' ||
                                     t.closest('button') ||
                                     t.closest('a') ||
-                                    t.closest('label')) {
+                                    t.closest('label') ||
+                                    t.closest('li')) {
                                     return;
                                 }
-                                // 其他一律 preventDefault，阻止失焦
                                 e.preventDefault();
-                                console.log('preventDefault on ' + t.tagName);
+                                console.log('DongmanIME: preventDefault on ' + t.tagName);
                             }, true);
                             console.log('document mousedown监听已注入');
                         })();
