@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（全屏、ADJUST_NOTHING、onPageCommitVisible 滚动）
+    // WebView 登录对话框（监听键盘 + 手动 JS 滚动，解决遮挡问题）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,6 +386,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         var dialog: AlertDialog? = null
+        var lastKeyboardHeight = 0
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -406,7 +407,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 页面首次可见时立即滚动到登录表单
+                    // 页面首次可见时滚动到登录表单
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
@@ -414,7 +415,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // 只做 Cookie 检查，不滚动
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
@@ -459,9 +459,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-            // 关键：让 WebView 自己处理键盘滚动
+            // 使用 ADJUST_RESIZE 以便获取键盘高度变化
             setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
             )
             setLayout(
@@ -470,6 +470,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             )
         }
         webView.requestFocus()
+
+        // 监听键盘高度变化，手动滚动 WebView 内的页面
+        val rootView = dialog.window?.decorView ?: return
+        rootView.viewTreeObserver.addOnGlobalLayoutListener(object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+            private var lastScrollApplied = false
+            override fun onGlobalLayout() {
+                val rect = android.graphics.Rect()
+                rootView.getWindowVisibleDisplayFrame(rect)
+                val keyboardHeight = rootView.height - rect.bottom
+                // 阈值 150 表示键盘弹出
+                if (keyboardHeight > 150) {
+                    if (keyboardHeight != lastKeyboardHeight) {
+                        lastKeyboardHeight = keyboardHeight
+                        // 键盘弹出时，滚动到 formLogin 元素，使其顶部对齐键盘顶部
+                        webView.evaluateJavascript(
+                            "var el = document.getElementById('formLogin'); if(el) { el.scrollIntoView({behavior:'instant', block:'start'}); }",
+                            null
+                        )
+                        lastScrollApplied = true
+                    }
+                } else {
+                    if (lastScrollApplied) {
+                        // 键盘收起时，重新将表单滚动到可见位置
+                        webView.evaluateJavascript(
+                            "var el = document.getElementById('formLogin'); if(el) { el.scrollIntoView({behavior:'instant', block:'start'}); }",
+                            null
+                        )
+                        lastScrollApplied = false
+                    }
+                }
+            }
+        })
     }
 
     // ══════════════════════════════════════════════════════════════════════
