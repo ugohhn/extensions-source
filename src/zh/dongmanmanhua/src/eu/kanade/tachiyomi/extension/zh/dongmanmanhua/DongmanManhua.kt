@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（使用 window.innerHeight 作为底部高度，避免 bottom=0）
+    // WebView 登录对话框（最终版：坐标缓存 + JS 拦截 + 日志输出）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -401,6 +401,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
+            // 添加 WebChromeClient 输出 JS 日志
+            webChromeClient = object : android.webkit.WebChromeClient() {
+                override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
+                    Log.d("DongmanIME", "JS: ${msg.message()}")
+                    return true
+                }
+            }
+
             isFocusable = true
             isFocusableInTouchMode = true
 
@@ -426,12 +434,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 注入 JS：阻止 formLogin 内部空白区域导致失焦
+                    // 注入 JS：阻止 formLogin 内部空白区域导致失焦，并输出日志
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
-                            if(!form) return;
+                            if(!form) { console.log('DongmanIME: formLogin未找到'); return; }
                             form.addEventListener('mousedown', function(e) {
+                                console.log('DongmanIME mousedown target=' + e.target.tagName + ' id=' + e.target.id);
                                 if(e.target.tagName !== 'INPUT' && 
                                    e.target.tagName !== 'BUTTON' &&
                                    e.target.tagName !== 'A' &&
@@ -439,8 +448,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                    !e.target.closest('a') &&
                                    !e.target.closest('label')) {
                                     e.preventDefault();
+                                    console.log('DongmanIME: preventDefault执行');
                                 }
                             }, true);
+                            console.log('DongmanIME: mousedown监听已注入');
+                            
                             var content = document.getElementById('content');
                             if(content) content.style.display = 'none';
                             var remainHeight = document.documentElement.clientHeight - form.offsetTop;
@@ -450,7 +462,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标，底部使用 window.innerHeight * dpr，避免依赖 Android 布局时机
+                    // 延迟缓存表单坐标，底部使用 window.innerHeight * dpr
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -459,7 +471,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 if(!form) return '';
                                 var r = form.getBoundingClientRect();
                                 var scrollY = window.scrollY;
-                                var formLeft = 0;  // 表单左边界固定为0
+                                var formLeft = 0;
                                 var formTop = (r.top + scrollY) * dpr;
                                 var formRight = r.right * dpr;
                                 var screenBottom = window.innerHeight * dpr;
