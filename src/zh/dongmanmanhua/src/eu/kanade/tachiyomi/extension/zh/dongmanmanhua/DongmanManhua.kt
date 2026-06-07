@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（修复键盘误判 + 收起不回弹）
+    // WebView 登录对话框（最终修复：固定屏幕高度 + 保存滚动位置 + 阻止失焦）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -387,6 +387,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
+        var savedScrollY = 0  // 保存滚动位置，用于对抗系统重置
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -407,6 +408,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 注入 JS：阻止输入框失焦（除非用户主动切换到另一个输入框）
+                    view?.evaluateJavascript("""
+                        document.querySelectorAll('input').forEach(function(inp) {
+                            inp.addEventListener('blur', function(e) {
+                                setTimeout(function() {
+                                    // 如果当前没有任何输入框处于焦点，重新聚焦当前输入框
+                                    if (!document.activeElement || document.activeElement.tagName !== 'INPUT') {
+                                        inp.focus();
+                                    }
+                                }, 100);
+                                e.preventDefault();
+                            });
+                        });
+                    """.trimIndent(), null)
+
+                    // 首次可见时滚动到登录表单
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
@@ -466,7 +483,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        // 获取固定的屏幕高度，避免 ADJUST_RESIZE 导致的误判
         val screenHeight = actCtx.resources.displayMetrics.heightPixels
         val rootView = dialog.window?.decorView ?: return
 
@@ -474,7 +490,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                // 使用屏幕总高度，而不是 rootView.height
                 val keyboardHeight = screenHeight - rect.bottom
                 val keyboardNowVisible = keyboardHeight > 150
 
@@ -506,12 +521,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
-                            Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
+                            savedScrollY = targetScrollY
+                            Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY} 已保存位置=$savedScrollY")
                         }
                     }
                 } else {
-                    // 键盘收起：不做任何滚动，避免干扰用户
-                    Log.d("DongmanIME", "键盘收起 不回弹")
+                    // 键盘收起：延迟恢复滚动位置，对抗系统重置
+                    isKeyboardVisible = false
+                    Log.d("DongmanIME", "键盘收起 延迟恢复 savedScrollY=$savedScrollY")
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        webView.scrollTo(0, savedScrollY)
+                        Log.d("DongmanIME", "恢复后 webView.scrollY=${webView.scrollY}")
+                    }, 100)
                 }
             }
         }
@@ -1094,4 +1115,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
