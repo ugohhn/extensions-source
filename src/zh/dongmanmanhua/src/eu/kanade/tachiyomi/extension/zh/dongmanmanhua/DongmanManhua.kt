@@ -10,7 +10,6 @@ import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -372,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（全屏、无标题/按钮、ADJUST_PAN）
+    // WebView 登录对话框（全屏、无标题/按钮、ADJUST_PAN、JS滚动优化）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -407,6 +406,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
+                    // 1. 滚动到登录表单，使表单出现在屏幕顶部
+                    view?.evaluateJavascript(
+                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
+                        null
+                    )
+                    // 2. 为所有输入框添加焦点监听，键盘弹出后滚动到可视区域中央
+                    view?.evaluateJavascript("""
+                        document.querySelectorAll('input').forEach(function(inp) {
+                            inp.addEventListener('focus', function() {
+                                setTimeout(function() {
+                                    inp.scrollIntoView({behavior:'instant', block:'center'});
+                                }, 300);
+                            });
+                        });
+                    """.trimIndent(), null)
+
+                    // 3. 原有 Cookie 检查逻辑
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
@@ -440,7 +456,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         dialog = AlertDialog.Builder(actCtx)
-            .setView(webView)   // 无标题，无按钮
+            .setView(webView)
             .setOnDismissListener {
                 webView.destroy()
             }
@@ -451,12 +467,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-            // 使用 PAN 而非 RESIZE，保持 WebView 高度完整
             setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
             )
-            // 全屏显示
             setLayout(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
