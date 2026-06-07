@@ -458,27 +458,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }, 800)
 
                     // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
-                    // 修改：增加 LI 白名单，并打印 DIV 坐标用于调试
+                    // 修改版：对 LI 进行细分处理（属于自动补全列表时放行，否则拦截）
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
                                 var t = e.target;
-                                console.log('mousedown target=' + t.tagName + ' id=' + t.id);
-                                if (t.tagName === 'DIV') {
-                                    var r = t.getBoundingClientRect();
-                                    console.log('DongmanIME: DIV位置 top=' + r.top + ' left=' + r.left + ' w=' + r.width + ' h=' + r.height);
-                                }
+                                // 原有白名单元素直接放行
                                 if (t.tagName === 'INPUT' ||
                                     t.tagName === 'BUTTON' ||
                                     t.tagName === 'A' ||
                                     t.tagName === 'LABEL' ||
-                                    t.tagName === 'LI' ||
                                     t.closest('button') ||
                                     t.closest('a') ||
-                                    t.closest('label') ||
-                                    t.closest('li')) {
+                                    t.closest('label')) {
                                     return;
                                 }
+                                // 处理 LI 元素
+                                if (t.tagName === 'LI' || t.closest('li')) {
+                                    // 检查是否属于自动补全列表容器
+                                    var list = t.closest('ul, datalist, [role="listbox"], [role="option"]');
+                                    console.log('DongmanIME: LI parent=' + (list ? list.tagName + ' role=' + list.getAttribute('role') : 'null'));
+                                    if (list) {
+                                        // 属于补全列表 → 放行，让浏览器正常处理点击（选择补全项）
+                                        return;
+                                    }
+                                    // 不属于补全列表 → 视为空白区域，阻止失焦
+                                    e.preventDefault();
+                                    return;
+                                }
+                                // 其他元素（如 DIV）一律阻止默认行为，防止键盘收起
                                 e.preventDefault();
                                 console.log('DongmanIME: preventDefault on ' + t.tagName);
                             }, true);
