@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（三层防护：Android 拦截 + JS mousedown 拦截 + 底部扩展）
+    // WebView 登录对话框（添加日志定位触摸坐标问题）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -404,18 +404,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
+            // 添加日志的触摸监听
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
                     val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y formRects=$formRects")
+                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formRects=$formRects")
                     if (formRects.isNotEmpty()) {
                         val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                        Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
                         if (!inForm) {
                             Log.d("DongmanIME", "表单外吞掉")
                             return@setOnTouchListener true
                         }
+                    } else {
+                        Log.d("DongmanIME", "formRects为空，放行")
                     }
                 }
                 false
