@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（添加详细日志）
+    // WebView 登录对话框（最终版：Android层只拦截formLogin上方，JS处理内部空白）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -388,8 +388,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
-        val interactiveRects = mutableListOf<InputRect>()
         var formTop = 0f
 
         val webView = WebView(actCtx).apply {
@@ -402,34 +400,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
+            // 添加 WebChromeClient 以便查看 JS 日志
+            webChromeClient = object : android.webkit.WebChromeClient() {
+                override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
+                    Log.d("DongmanIME", "JS: ${msg.message()}")
+                    return true
+                }
+            }
+
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 仅打印日志，不吞事件
+            // Android 层触摸拦截：只处理 formLogin 上方区域
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
-                    val x = event.x
                     val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY interactiveRects数量=${interactiveRects.size} formTop=$formTop")
-                    if (interactiveRects.isNotEmpty()) {
-                        val onInteractive = interactiveRects.any { rect ->
-                            x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-                        }
-                        Log.d("DongmanIME", "onInteractive=$onInteractive")
-                        interactiveRects.forEachIndexed { idx, r ->
-                            Log.d("DongmanIME", "  rect[$idx]: left=${r.left} top=${r.top} right=${r.right} bottom=${r.bottom}")
-                        }
-                    } else {
-                        Log.d("DongmanIME", "interactiveRects为空")
+                    Log.d("DongmanIME", "触摸 y=$y scrollY=$scrollY formTop=$formTop")
+                    if (formTop > 0 && y < formTop) {
+                        Log.d("DongmanIME", "formLogin上方，吞掉")
+                        return@setOnTouchListener true
                     }
                 }
-                false  // 全部放行，不吞
+                false
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 样式调整
+                    // 样式调整：隐藏底部空白，撑高表单
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -444,54 +442,44 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 缓存交互元素坐标
+                    // 获取 formLogin 顶部坐标（用于 Android 层拦截）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
-                                var scrollY = window.scrollY;
-                                var rects = [];
-                                var selectors = 'input, button, a, label, [onclick], .btn';
-                                document.querySelectorAll(selectors).forEach(function(el) {
-                                    var r = el.getBoundingClientRect();
-                                    rects.push(
-                                        ((r.left - 20) * dpr) + ',' +
-                                        ((r.top + scrollY - 20) * dpr) + ',' +
-                                        ((r.right + 20) * dpr) + ',' +
-                                        ((r.bottom + scrollY + 20) * dpr)
-                                    );
-                                });
                                 var form = document.getElementById('formLogin');
-                                var formTop = form ? form.getBoundingClientRect().top * dpr : 0;
-                                return formTop + '|' + rects.join(';');
+                                if(!form) return '0';
+                                return (form.getBoundingClientRect().top * dpr);
                             })()
                         """.trimIndent()) { value ->
-                            Log.d("DongmanIME", "原始JS返回: $value")
-                            val raw = value?.trim('"') ?: return@evaluateJavascript
-                            val parts = raw.split("|")
-                            if (parts.size != 2) {
-                                Log.d("DongmanIME", "解析失败 parts.size=${parts.size}")
-                                return@evaluateJavascript
-                            }
-                            formTop = parts[0].toFloatOrNull() ?: 0f
-                            interactiveRects.clear()
-                            parts[1].split(";").forEach { rect ->
-                                val coords = rect.split(",")
-                                if (coords.size == 4) {
-                                    interactiveRects.add(InputRect(
-                                        coords[0].toFloat(),
-                                        coords[1].toFloat(),
-                                        coords[2].toFloat(),
-                                        coords[3].toFloat()
-                                    ))
-                                }
-                            }
-                            Log.d("DongmanIME", "formTop=$formTop interactiveRects数量=${interactiveRects.size}")
-                            interactiveRects.forEachIndexed { idx, r ->
-                                Log.d("DongmanIME", "  缓存rect[$idx]: left=${r.left} top=${r.top} right=${r.right} bottom=${r.bottom}")
-                            }
+                            formTop = value?.trim('"')?.toFloatOrNull() ?: 0f
+                            Log.d("DongmanIME", "formTop=$formTop")
                         }
-                    }, 1000)
+                    }, 800)
+
+                    // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
+                    view?.evaluateJavascript("""
+                        (function(){
+                            document.addEventListener('mousedown', function(e) {
+                                var t = e.target;
+                                console.log('mousedown target=' + t.tagName + ' id=' + t.id);
+                                // INPUT、BUTTON、A、LABEL 及其子元素放行
+                                if (t.tagName === 'INPUT' ||
+                                    t.tagName === 'BUTTON' ||
+                                    t.tagName === 'A' ||
+                                    t.tagName === 'LABEL' ||
+                                    t.closest('button') ||
+                                    t.closest('a') ||
+                                    t.closest('label')) {
+                                    return;
+                                }
+                                // 其他一律 preventDefault，阻止失焦
+                                e.preventDefault();
+                                console.log('preventDefault on ' + t.tagName);
+                            }, true);
+                            console.log('document mousedown监听已注入');
+                        })();
+                    """.trimIndent(), null)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -1146,4 +1134,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
