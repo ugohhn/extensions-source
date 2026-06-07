@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（Android 层精确拦截，基于交互元素坐标）
+    // WebView 登录对话框（添加详细日志）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -405,31 +405,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
+            // 仅打印日志，不吞事件
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN && interactiveRects.isNotEmpty()) {
+                if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
                     val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formTop=$formTop")
-                    if (y < formTop) {
-                        Log.d("DongmanIME", "formLogin上方区域吞掉")
-                        return@setOnTouchListener true
+                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY interactiveRects数量=${interactiveRects.size} formTop=$formTop")
+                    if (interactiveRects.isNotEmpty()) {
+                        val onInteractive = interactiveRects.any { rect ->
+                            x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                        }
+                        Log.d("DongmanIME", "onInteractive=$onInteractive")
+                        interactiveRects.forEachIndexed { idx, r ->
+                            Log.d("DongmanIME", "  rect[$idx]: left=${r.left} top=${r.top} right=${r.right} bottom=${r.bottom}")
+                        }
+                    } else {
+                        Log.d("DongmanIME", "interactiveRects为空")
                     }
-                    val onInteractive = interactiveRects.any { rect ->
-                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-                    }
-                    if (!onInteractive) {
-                        Log.d("DongmanIME", "非交互区域吞掉")
-                        return@setOnTouchListener true
-                    }
-                    Log.d("DongmanIME", "可交互元素放行")
                 }
-                false
+                false  // 全部放行，不吞
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 调整样式：隐藏底部空白，撑高表单
+                    // 样式调整
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -444,7 +444,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 缓存交互元素坐标和 formLogin 顶部
+                    // 缓存交互元素坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -454,7 +454,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 var selectors = 'input, button, a, label, [onclick], .btn';
                                 document.querySelectorAll(selectors).forEach(function(el) {
                                     var r = el.getBoundingClientRect();
-                                    // 扩展点击容差 20px
                                     rects.push(
                                         ((r.left - 20) * dpr) + ',' +
                                         ((r.top + scrollY - 20) * dpr) + ',' +
@@ -467,9 +466,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 return formTop + '|' + rects.join(';');
                             })()
                         """.trimIndent()) { value ->
+                            Log.d("DongmanIME", "原始JS返回: $value")
                             val raw = value?.trim('"') ?: return@evaluateJavascript
                             val parts = raw.split("|")
-                            if (parts.size != 2) return@evaluateJavascript
+                            if (parts.size != 2) {
+                                Log.d("DongmanIME", "解析失败 parts.size=${parts.size}")
+                                return@evaluateJavascript
+                            }
                             formTop = parts[0].toFloatOrNull() ?: 0f
                             interactiveRects.clear()
                             parts[1].split(";").forEach { rect ->
@@ -483,7 +486,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     ))
                                 }
                             }
-                            Log.d("DongmanIME", "缓存可交互元素 ${interactiveRects.size} 个 formTop=$formTop")
+                            Log.d("DongmanIME", "formTop=$formTop interactiveRects数量=${interactiveRects.size}")
+                            interactiveRects.forEachIndexed { idx, r ->
+                                Log.d("DongmanIME", "  缓存rect[$idx]: left=${r.left} top=${r.top} right=${r.right} bottom=${r.bottom}")
+                            }
                         }
                     }, 1000)
                 }
@@ -570,7 +576,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录
+    // 密码登录（保持不变）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
