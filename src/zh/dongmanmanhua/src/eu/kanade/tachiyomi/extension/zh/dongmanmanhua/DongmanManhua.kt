@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：Android层只拦截formLogin上方，JS处理内部空白）
+    // WebView 登录对话框（最终版：Android层拦截等待formTop就绪，JS处理LI）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -411,13 +411,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // Android 层触摸拦截：只处理 formLogin 上方区域
+            // Android 层触摸拦截：formTop 未就绪时全部拦截，就绪后只拦截上方区域
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
                     val y = event.y + scrollY
                     Log.d("DongmanIME", "触摸 y=$y scrollY=$scrollY formTop=$formTop")
-                    if (formTop > 0 && y < formTop) {
+                    // 修复1：formTop 未就绪（<=0）时，暂时拦截所有触摸，等待缓存
+                    if (formTop <= 0) {
+                        Log.d("DongmanIME", "formTop未就绪，暂时拦截")
+                        return@setOnTouchListener true
+                    }
+                    if (y < formTop) {
                         Log.d("DongmanIME", "formLogin上方，吞掉")
                         return@setOnTouchListener true
                     }
@@ -458,7 +463,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }, 800)
 
                     // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
-                    // 修改版：对 LI 进行细分处理（属于自动补全列表时放行，否则拦截）
+                    // 修复2：LI 父容器直接找 UL，不再依赖 role 属性
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
@@ -473,20 +478,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     t.closest('label')) {
                                     return;
                                 }
-                                // 处理 LI 元素
+                                // 处理 LI 元素：只要在 UL 内就视为自动补全列表，放行
                                 if (t.tagName === 'LI' || t.closest('li')) {
-                                    // 检查是否属于自动补全列表容器
-                                    var list = t.closest('ul, datalist, [role="listbox"], [role="option"]');
-                                    console.log('DongmanIME: LI parent=' + (list ? list.tagName + ' role=' + list.getAttribute('role') : 'null'));
+                                    var list = t.closest('ul');
                                     if (list) {
-                                        // 属于补全列表 → 放行，让浏览器正常处理点击（选择补全项）
+                                        // 属于自动补全列表 → 放行
                                         return;
                                     }
                                     // 不属于补全列表 → 视为空白区域，阻止失焦
                                     e.preventDefault();
                                     return;
                                 }
-                                // 其他元素（如 DIV）一律阻止默认行为，防止键盘收起
+                                // 其他元素（如 DIV、BODY）一律阻止默认行为，防止键盘收起
                                 e.preventDefault();
                                 console.log('DongmanIME: preventDefault on ' + t.tagName);
                             }, true);
@@ -557,6 +560,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (keyboardNowVisible == isKeyboardVisible) return
                 isKeyboardVisible = keyboardNowVisible
+                // 恢复日志输出，记录键盘状态变化时间
+                Log.d("DongmanIME", "键盘状态变化: isKeyboardVisible=$isKeyboardVisible time=${System.currentTimeMillis()}")
 
                 if (keyboardNowVisible) {
                     webView.evaluateJavascript(
@@ -1147,4 +1152,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
