@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（全屏、无标题/按钮、ADJUST_PAN、JS滚动优化）
+    // WebView 登录对话框（全屏、ADJUST_NOTHING、onPageCommitVisible 滚动）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -405,24 +405,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
 
             webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    // 1. 滚动到登录表单，使表单出现在屏幕顶部
+                override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 页面首次可见时立即滚动到登录表单
                     view?.evaluateJavascript(
                         "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
                         null
                     )
-                    // 2. 为所有输入框添加焦点监听，键盘弹出后滚动到可视区域中央
-                    view?.evaluateJavascript("""
-                        document.querySelectorAll('input').forEach(function(inp) {
-                            inp.addEventListener('focus', function() {
-                                setTimeout(function() {
-                                    inp.scrollIntoView({behavior:'instant', block:'center'});
-                                }, 300);
-                            });
-                        });
-                    """.trimIndent(), null)
+                }
 
-                    // 3. 原有 Cookie 检查逻辑
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    // 只做 Cookie 检查，不滚动
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
@@ -467,8 +459,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            // 关键：让 WebView 自己处理键盘滚动
             setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
             )
             setLayout(
