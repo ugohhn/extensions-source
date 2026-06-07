@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（精确隐藏无用区域 + 触摸拦截 + 表单撑满）
+    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -404,7 +404,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 触摸拦截：只有点在表单区域内才放行
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
@@ -421,29 +420,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 精确隐藏无用区域（根据 DOM 结构）
+                    // 只隐藏底部空白区域（div#content），保留猫咪区域
                     view?.evaluateJavascript("""
                         (function(){
-                            // 隐藏顶部猫咪和返回箭头
-                            var header = document.querySelector('.login_header_container');
-                            if(header) header.style.display = 'none';
-                            var arrow = document.querySelector('.left_arrow_c');
-                            if(arrow) arrow.style.display = 'none';
-                            // 隐藏底部空白区域（div#content）
                             var content = document.getElementById('content');
                             if(content) content.style.display = 'none';
-                            // 让 formLogin 撑满剩余高度
                             var form = document.getElementById('formLogin');
                             if(form) {
                                 form.style.minHeight = '100vh';
                                 form.style.boxSizing = 'border-box';
                                 form.style.paddingTop = '16px';
                             }
-                            document.body.style.backgroundColor = '#fff';
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标（等页面渲染和隐藏生效）
+                    // 延迟缓存表单坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -1122,4 +1113,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
