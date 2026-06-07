@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（含详细日志）
+    // WebView 登录对话框（使用 offsetTop 修正负数滚动）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -479,38 +479,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (keyboardNowVisible) {
                     val visibleBottom = rect.bottom
-                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY}")
-
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
-                            if(!el) return 'NO_ELEMENT';
-                            var r = el.getBoundingClientRect();
-                            return r.top + ',' + r.bottom;
+                            if(!el) return '0,0';
+                            var top = el.offsetTop;
+                            var bottom = top + el.offsetHeight;
+                            return top + ',' + bottom;
                         })()
                     """.trimIndent()) { value ->
-                        Log.d("DongmanIME", "JS回调 value=$value")
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
                         val formHeight = (bottom - top).toInt()
-                        val targetScrollY = webView.scrollY + top.toInt() -
-                            ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-                        Log.d("DongmanIME", "准备scrollTo top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
+                        val targetScrollY = top.toInt() - ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
-                            Log.d("DongmanIME", "scrollTo执行后 webView.scrollY=${webView.scrollY}")
                         }
                     }
                 } else {
                     webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.getBoundingClientRect().top"
+                        "document.getElementById('formLogin')?.offsetTop"
                     ) { value ->
                         val top = value?.toFloatOrNull() ?: return@evaluateJavascript
-                        val targetScrollY = webView.scrollY + top.toInt()
-                        Log.d("DongmanIME", "键盘收起 scrollTo top=$top targetScrollY=$targetScrollY")
                         Handler(Looper.getMainLooper()).post {
-                            webView.scrollTo(0, targetScrollY)
+                            webView.scrollTo(0, top.toInt())
                         }
                     }
                 }
