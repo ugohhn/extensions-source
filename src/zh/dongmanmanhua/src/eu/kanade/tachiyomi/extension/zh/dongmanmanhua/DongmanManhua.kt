@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
@@ -371,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（包含 DOM 结构打印和临时隐藏逻辑）
+    // WebView 登录对话框（精确隐藏无用区域 + 触摸拦截 + 表单撑满）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -387,6 +388,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
+        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+        val formRects = mutableListOf<InputRect>()
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -400,80 +403,71 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             isFocusable = true
             isFocusableInTouchMode = true
-            setOnTouchListener { v, _ ->
+
+            // 触摸拦截：只有点在表单区域内才放行
+            setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
+                if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
+                    val x = event.x
+                    val y = event.y + scrollY
+                    val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                    if (!inForm) {
+                        Log.d("DongmanIME", "点击在表单外，吞掉事件")
+                        return@setOnTouchListener true
+                    }
+                }
                 false
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 打印 DOM 结构（调试用）
+                    // 精确隐藏无用区域（根据 DOM 结构）
                     view?.evaluateJavascript("""
                         (function(){
+                            // 隐藏顶部猫咪和返回箭头
+                            var header = document.querySelector('.login_header_container');
+                            if(header) header.style.display = 'none';
+                            var arrow = document.querySelector('.left_arrow_c');
+                            if(arrow) arrow.style.display = 'none';
+                            // 隐藏底部空白区域（div#content）
+                            var content = document.getElementById('content');
+                            if(content) content.style.display = 'none';
+                            // 让 formLogin 撑满剩余高度
                             var form = document.getElementById('formLogin');
-                            if(!form) return 'NO_FORM';
-                            var result = '';
-                            var node = form.parentElement;
-                            var depth = 0;
-                            while(node && depth < 5) {
-                                result += 'depth' + depth + ':' + node.tagName + 
-                                          ' id=' + node.id + 
-                                          ' class=' + node.className + 
-                                          ' scrollHeight=' + node.scrollHeight + 
-                                          ' clientHeight=' + node.clientHeight + 
-                                          ' minHeight=' + node.style.minHeight + 
-                                          ' padding=' + window.getComputedStyle(node).paddingTop + '|';
-                                node = node.parentElement;
-                                depth++;
+                            if(form) {
+                                form.style.minHeight = '100vh';
+                                form.style.boxSizing = 'border-box';
+                                form.style.paddingTop = '16px';
                             }
-                            result += 'PREV:';
-                            node = form.previousElementSibling;
-                            while(node) {
-                                result += node.tagName + '#' + node.id + '.' + node.className + ',';
-                                node = node.previousElementSibling;
-                            }
-                            result += 'NEXT:';
-                            node = form.nextElementSibling;
-                            while(node) {
-                                result += node.tagName + '#' + node.id + '.' + node.className + ',';
-                                node = node.nextElementSibling;
-                            }
-                            return result;
-                        })()
-                    """.trimIndent()) { value ->
-                        Log.d("DongmanIME", "DOM结构: $value")
-                    }
-
-                    // 临时隐藏 formLogin 上下兄弟元素（后续根据结构精确调整）
-                    view?.evaluateJavascript("""
-                        (function(){
-                            var form = document.getElementById('formLogin');
-                            if(!form) return;
-                            var node = form.previousElementSibling;
-                            while(node) {
-                                node.style.display = 'none';
-                                node = node.previousElementSibling;
-                            }
-                            node = form.nextElementSibling;
-                            while(node) {
-                                node.style.display = 'none';
-                                node = node.nextElementSibling;
-                            }
-                            if(form.parentElement) {
-                                form.parentElement.style.paddingTop = '0';
-                                form.parentElement.style.marginTop = '0';
-                            }
-                            form.style.marginTop = '0';
-                            form.style.paddingTop = '16px';
                             document.body.style.backgroundColor = '#fff';
                         })();
                     """.trimIndent(), null)
 
-                    // 滚动到表单顶部
-                    view?.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
+                    // 延迟缓存表单坐标（等页面渲染和隐藏生效）
+                    view?.postDelayed({
+                        view.evaluateJavascript("""
+                            (function(){
+                                var dpr = window.devicePixelRatio || 1;
+                                var form = document.getElementById('formLogin');
+                                if(!form) return '';
+                                var r = form.getBoundingClientRect();
+                                var scrollY = window.scrollY;
+                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+((r.bottom+scrollY)*dpr);
+                            })()
+                        """.trimIndent()) { value ->
+                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                            if (parts.size == 4) {
+                                formRects.clear()
+                                formRects.add(InputRect(
+                                    parts[0].toFloat(),
+                                    parts[1].toFloat(),
+                                    parts[2].toFloat(),
+                                    parts[3].toFloat()
+                                ))
+                                Log.d("DongmanIME", "缓存表单坐标: $formRects")
+                            }
+                        }
+                    }, 500)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
