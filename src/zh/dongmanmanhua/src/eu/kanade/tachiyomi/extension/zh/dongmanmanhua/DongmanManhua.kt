@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：坐标缓存一次，document 级别拦截）
+    // WebView 登录对话框（Android 层精确拦截，基于交互元素坐标）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -389,8 +389,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
-        val formRects = mutableListOf<InputRect>()
-        var formRectCached = false
+        val interactiveRects = mutableListOf<InputRect>()
+        var formTop = 0f
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -402,60 +402,36 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            webChromeClient = object : android.webkit.WebChromeClient() {
-                override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
-                    Log.d("DongmanIME", "JS: ${msg.message()}")
-                    return true
-                }
-            }
-
             isFocusable = true
             isFocusableInTouchMode = true
 
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN) {
+                if (event.action == MotionEvent.ACTION_DOWN && interactiveRects.isNotEmpty()) {
                     val x = event.x
                     val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formRects=$formRects")
-                    if (formRects.isNotEmpty()) {
-                        val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                        Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
-                        if (!inForm) {
-                            Log.d("DongmanIME", "表单外吞掉")
-                            return@setOnTouchListener true
-                        }
-                    } else {
-                        Log.d("DongmanIME", "formRects为空，放行")
+                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formTop=$formTop")
+                    if (y < formTop) {
+                        Log.d("DongmanIME", "formLogin上方区域吞掉")
+                        return@setOnTouchListener true
                     }
+                    val onInteractive = interactiveRects.any { rect ->
+                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                    }
+                    if (!onInteractive) {
+                        Log.d("DongmanIME", "非交互区域吞掉")
+                        return@setOnTouchListener true
+                    }
+                    Log.d("DongmanIME", "可交互元素放行")
                 }
                 false
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 注入 JS：document 级别拦截空白点击，防止键盘收起
+                    // 调整样式：隐藏底部空白，撑高表单
                     view?.evaluateJavascript("""
                         (function(){
-                            document.addEventListener('mousedown', function(e) {
-                                var t = e.target;
-                                console.log('DongmanIME mousedown target=' + t.tagName + ' id=' + t.id);
-                                // INPUT、BUTTON、A、LABEL 及其子元素直接放行
-                                if (t.tagName === 'INPUT' ||
-                                    t.tagName === 'BUTTON' ||
-                                    t.tagName === 'A' ||
-                                    t.tagName === 'LABEL' ||
-                                    t.closest('button') ||
-                                    t.closest('a') ||
-                                    t.closest('label')) {
-                                    return;
-                                }
-                                // 其他一律 preventDefault，阻止失焦
-                                e.preventDefault();
-                                console.log('DongmanIME: preventDefault on ' + t.tagName);
-                            }, true);
-                            console.log('DongmanIME: document mousedown监听已注入');
-                            
                             var form = document.getElementById('formLogin');
                             if(form) {
                                 var content = document.getElementById('content');
@@ -468,40 +444,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 只缓存一次表单坐标，底部使用 rootView 实际高度（不受键盘影响）
-                    if (!formRectCached) {
-                        view?.postDelayed({
-                            val rootView = dialog?.window?.decorView
-                            if (rootView == null) return@postDelayed
-                            val screenBottom = rootView.height.toFloat()
-                            view.evaluateJavascript("""
-                                (function(){
-                                    var dpr = window.devicePixelRatio || 1;
-                                    var form = document.getElementById('formLogin');
-                                    if(!form) return '';
-                                    var r = form.getBoundingClientRect();
-                                    var scrollY = window.scrollY;
-                                    var formLeft = 0;
-                                    var formTop = (r.top + scrollY) * dpr;
-                                    var formRight = r.right * dpr;
-                                    return '0,' + formTop + ',' + formRight;
-                                })()
-                            """.trimIndent()) { value ->
-                                val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                                if (parts.size == 3) {
-                                    formRects.clear()
-                                    formRects.add(InputRect(
-                                        parts[0].toFloat(),
-                                        parts[1].toFloat(),
-                                        parts[2].toFloat(),
-                                        screenBottom
+                    // 缓存交互元素坐标和 formLogin 顶部
+                    view?.postDelayed({
+                        view.evaluateJavascript("""
+                            (function(){
+                                var dpr = window.devicePixelRatio || 1;
+                                var scrollY = window.scrollY;
+                                var rects = [];
+                                var selectors = 'input, button, a, label, [onclick], .btn';
+                                document.querySelectorAll(selectors).forEach(function(el) {
+                                    var r = el.getBoundingClientRect();
+                                    // 扩展点击容差 20px
+                                    rects.push(
+                                        ((r.left - 20) * dpr) + ',' +
+                                        ((r.top + scrollY - 20) * dpr) + ',' +
+                                        ((r.right + 20) * dpr) + ',' +
+                                        ((r.bottom + scrollY + 20) * dpr)
+                                    );
+                                });
+                                var form = document.getElementById('formLogin');
+                                var formTop = form ? form.getBoundingClientRect().top * dpr : 0;
+                                return formTop + '|' + rects.join(';');
+                            })()
+                        """.trimIndent()) { value ->
+                            val raw = value?.trim('"') ?: return@evaluateJavascript
+                            val parts = raw.split("|")
+                            if (parts.size != 2) return@evaluateJavascript
+                            formTop = parts[0].toFloatOrNull() ?: 0f
+                            interactiveRects.clear()
+                            parts[1].split(";").forEach { rect ->
+                                val coords = rect.split(",")
+                                if (coords.size == 4) {
+                                    interactiveRects.add(InputRect(
+                                        coords[0].toFloat(),
+                                        coords[1].toFloat(),
+                                        coords[2].toFloat(),
+                                        coords[3].toFloat()
                                     ))
-                                    formRectCached = true
-                                    Log.d("DongmanIME", "缓存表单坐标(固定底部=屏幕高度): $formRects")
                                 }
                             }
-                        }, 1000)
-                    }
+                            Log.d("DongmanIME", "缓存可交互元素 ${interactiveRects.size} 个 formTop=$formTop")
+                        }
+                    }, 1000)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
