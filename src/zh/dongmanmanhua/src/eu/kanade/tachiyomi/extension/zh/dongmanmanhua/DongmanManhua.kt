@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（监听键盘 + 手动 JS 滚动，解决遮挡问题）
+    // WebView 登录对话框（监听键盘 + 状态锁 + 清理监听器）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,7 +386,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         var dialog: AlertDialog? = null
-        var lastKeyboardHeight = 0
+        var isKeyboardVisible = false  // 状态锁
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -449,9 +449,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         dialog = AlertDialog.Builder(actCtx)
             .setView(webView)
-            .setOnDismissListener {
-                webView.destroy()
-            }
             .create()
 
         dialog.show()
@@ -459,7 +456,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-            // 使用 ADJUST_RESIZE 以便获取键盘高度变化
             setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
@@ -471,37 +467,43 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
-        // 监听键盘高度变化，手动滚动 WebView 内的页面
+        // 监听键盘高度变化，状态锁 + 防抖
         val rootView = dialog.window?.decorView ?: return
-        rootView.viewTreeObserver.addOnGlobalLayoutListener(object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
-            private var lastScrollApplied = false
+        val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
                 val keyboardHeight = rootView.height - rect.bottom
-                // 阈值 150 表示键盘弹出
-                if (keyboardHeight > 150) {
-                    if (keyboardHeight != lastKeyboardHeight) {
-                        lastKeyboardHeight = keyboardHeight
-                        // 键盘弹出时，滚动到 formLogin 元素，使其顶部对齐键盘顶部
-                        webView.evaluateJavascript(
-                            "var el = document.getElementById('formLogin'); if(el) { el.scrollIntoView({behavior:'instant', block:'start'}); }",
-                            null
-                        )
-                        lastScrollApplied = true
-                    }
+
+                val keyboardNowVisible = keyboardHeight > 150
+
+                // 状态没变就不处理，避免重复触发
+                if (keyboardNowVisible == isKeyboardVisible) return
+                isKeyboardVisible = keyboardNowVisible
+
+                if (keyboardNowVisible) {
+                    webView.evaluateJavascript("""
+                        var el = document.getElementById('formLogin');
+                        if(el) {
+                            var top = el.getBoundingClientRect().top + window.scrollY;
+                            window.scrollTo({top: top, behavior: 'instant'});
+                        }
+                    """.trimIndent(), null)
                 } else {
-                    if (lastScrollApplied) {
-                        // 键盘收起时，重新将表单滚动到可见位置
-                        webView.evaluateJavascript(
-                            "var el = document.getElementById('formLogin'); if(el) { el.scrollIntoView({behavior:'instant', block:'start'}); }",
-                            null
-                        )
-                        lastScrollApplied = false
-                    }
+                    webView.evaluateJavascript(
+                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
+                        null
+                    )
                 }
             }
-        })
+        }
+        rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
+
+        // Dialog 关闭时移除监听器，防止内存泄漏
+        dialog.setOnDismissListener {
+            rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            webView.destroy()
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
