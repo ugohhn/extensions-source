@@ -371,7 +371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（使用 devicePixelRatio 修正单位）
+    // WebView 登录对话框（修复键盘误判 + 收起不回弹）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -466,15 +466,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         webView.requestFocus()
 
+        // 获取固定的屏幕高度，避免 ADJUST_RESIZE 导致的误判
+        val screenHeight = actCtx.resources.displayMetrics.heightPixels
         val rootView = dialog.window?.decorView ?: return
+
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardHeight = rootView.height - rect.bottom
+                // 使用屏幕总高度，而不是 rootView.height
+                val keyboardHeight = screenHeight - rect.bottom
                 val keyboardNowVisible = keyboardHeight > 150
 
-                Log.d("DongmanIME", "onGlobalLayout rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
+                Log.d("DongmanIME", "onGlobalLayout screenHeight=$screenHeight rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
 
                 if (keyboardNowVisible == isKeyboardVisible) return
                 isKeyboardVisible = keyboardNowVisible
@@ -506,21 +510,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }
                 } else {
-                    Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
-                    webView.evaluateJavascript("""
-                        (function(){
-                            var el = document.getElementById('formLogin');
-                            if(!el) return '0';
-                            return String(el.offsetTop * (window.devicePixelRatio || 1));
-                        })()
-                    """.trimIndent()) { value ->
-                        val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
-                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top")
-                        Handler(Looper.getMainLooper()).post {
-                            webView.scrollTo(0, top.toInt())
-                            Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
-                        }
-                    }
+                    // 键盘收起：不做任何滚动，避免干扰用户
+                    Log.d("DongmanIME", "键盘收起 不回弹")
                 }
             }
         }
@@ -1103,4 +1094,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
