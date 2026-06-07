@@ -415,8 +415,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
+                    val x = event.x
                     val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 y=$y scrollY=$scrollY formTop=$formTop")
+                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formTop=$formTop")
                     // 修复1：formTop 未就绪（<=0）时，暂时拦截所有触摸，等待缓存
                     if (formTop <= 0) {
                         Log.d("DongmanIME", "formTop未就绪，暂时拦截")
@@ -558,10 +559,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 rootView.getWindowVisibleDisplayFrame(rect)
                 val keyboardNowVisible = rect.bottom < webView.height - 150
 
-                if (keyboardNowVisible == isKeyboardVisible) return
-                isKeyboardVisible = keyboardNowVisible
-                // 恢复日志输出，记录键盘状态变化时间
-                Log.d("DongmanIME", "键盘状态变化: isKeyboardVisible=$isKeyboardVisible time=${System.currentTimeMillis()}")
+                if (keyboardNowVisible != isKeyboardVisible) {
+                    Log.d("DongmanIME", "键盘状态变化 -> $keyboardNowVisible rectBottom=${rect.bottom} time=${System.currentTimeMillis()}")
+                    isKeyboardVisible = keyboardNowVisible
+                }
 
                 if (keyboardNowVisible) {
                     webView.evaluateJavascript(
