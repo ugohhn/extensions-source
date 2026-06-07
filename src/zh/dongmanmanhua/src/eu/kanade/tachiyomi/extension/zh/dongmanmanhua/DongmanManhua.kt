@@ -372,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：保留猫咪，隐藏底部空白，动态计算高度，延迟缓存）
+    // WebView 登录对话框（三层防护：Android 拦截 + JS mousedown 拦截 + 底部扩展）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -404,6 +404,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
+            // Android 层触摸拦截：表单外区域吞掉事件
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
@@ -423,14 +424,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只隐藏底部空白区域，保留猫咪区域
+                    // 注入 JS：阻止 formLogin 内部空白区域导致失焦
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
                             if(!form) return;
+                            // 拦截非交互元素的 mousedown，防止焦点转移
+                            form.addEventListener('mousedown', function(e) {
+                                if(e.target.tagName !== 'INPUT' && 
+                                   e.target.tagName !== 'BUTTON' &&
+                                   e.target.tagName !== 'A' &&
+                                   !e.target.closest('button') &&
+                                   !e.target.closest('a') &&
+                                   !e.target.closest('label')) {
+                                    e.preventDefault();
+                                }
+                            }, true);
+                            // 隐藏底部空白区域（div#content）
                             var content = document.getElementById('content');
                             if(content) content.style.display = 'none';
-                            // 动态计算剩余高度，确保表单撑满屏幕（不使用 vh）
+                            // 动态撑高表单，覆盖底部物理空白
                             var remainHeight = document.documentElement.clientHeight - form.offsetTop;
                             form.style.minHeight = remainHeight + 'px';
                             form.style.boxSizing = 'border-box';
@@ -438,7 +451,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟 800ms 等样式渲染完成后再缓存坐标
+                    // 延迟缓存表单坐标（将底部扩展到屏幕底部）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -447,7 +460,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 if(!form) return '';
                                 var r = form.getBoundingClientRect();
                                 var scrollY = window.scrollY;
-                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+((r.bottom+scrollY)*dpr);
+                                // 底部扩展到屏幕物理高度，覆盖下方空白
+                                var screenBottom = ${webView.height};
+                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+screenBottom;
                             })()
                         """.trimIndent()) { value ->
                             val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
@@ -459,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     parts[2].toFloat(),
                                     parts[3].toFloat()
                                 ))
-                                Log.d("DongmanIME", "缓存表单坐标: $formRects")
+                                Log.d("DongmanIME", "缓存表单坐标(底部扩展): $formRects")
                             }
                         }
                     }, 800)
