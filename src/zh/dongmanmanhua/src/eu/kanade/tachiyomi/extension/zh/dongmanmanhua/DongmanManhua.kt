@@ -224,7 +224,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         editor.apply()
 
-        // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
@@ -237,7 +236,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 手动备用Cookie开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_MANUAL_COOKIE_SWITCH
             title = "启用手动备用Cookie模式"
@@ -252,7 +250,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        // 登录状态指示灯（仅显示，不可点击）
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
@@ -262,7 +259,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录触发器（拨动开关弹出对话框，自动弹回）
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -278,7 +274,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -287,7 +282,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 密码输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -309,7 +303,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 彻底退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "彻底退出登录"
@@ -321,7 +314,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 仅清除独立存储备份
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_CLEAR_BACKUP
             title = "清除独立存储备份"
@@ -333,7 +325,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 搜索模式开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -341,7 +332,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -349,7 +339,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -359,7 +348,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // User-Agent 自定义
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -372,7 +360,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：Android层只拦截formLogin上方，JS处理内部空白）
+    // WebView 登录对话框（最终完整版：onTouchEvent 白名单 + 精确坐标）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -388,9 +376,32 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var formTop = 0f
 
-        val webView = WebView(actCtx).apply {
+        data class Rect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
+            fun contains(x: Float, y: Float) = x >= left && x <= right && y >= top && y <= bottom
+        }
+
+        val allowedRects = mutableListOf<Rect>()
+        var rectsReady = false
+
+        val webView = object : WebView(actCtx) {
+            override fun onTouchEvent(event: MotionEvent): Boolean {
+                if (!rectsReady) return super.onTouchEvent(event)
+                val action = event.actionMasked
+                if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
+                    val idx = event.actionIndex
+                    val x = event.getX(idx)
+                    val y = event.getY(idx)
+                    val allowed = allowedRects.any { it.contains(x, y) }
+                    Log.d("DongmanIME", "onTouchEvent x=$x y=$y allowed=$allowed")
+                    if (!allowed) {
+                        Log.d("DongmanIME", "吞掉触摸（非可交互区域）")
+                        return true
+                    }
+                }
+                return super.onTouchEvent(event)
+            }
+        }.apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -399,8 +410,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.domStorageEnabled = true
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
+            isFocusable = true
+            isFocusableInTouchMode = true
 
-            // 添加 WebChromeClient 以便查看 JS 日志
             webChromeClient = object : android.webkit.WebChromeClient() {
                 override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
                     Log.d("DongmanIME", "JS: ${msg.message()}")
@@ -408,78 +420,80 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
 
-            isFocusable = true
-            isFocusableInTouchMode = true
-
-            // Android 层触摸拦截：只处理 formLogin 上方区域
-            setOnTouchListener { v, event ->
-                if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 y=$y scrollY=$scrollY formTop=$formTop")
-                    if (formTop > 0 && y < formTop) {
-                        Log.d("DongmanIME", "formLogin上方，吞掉")
-                        return@setOnTouchListener true
-                    }
-                }
-                false
-            }
-
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 样式调整：隐藏底部空白，撑高表单
+                    // 基础样式：隐藏头部，手机号输入框撑满
                     view?.evaluateJavascript("""
                         (function(){
-                            var form = document.getElementById('formLogin');
-                            if(form) {
-                                var content = document.getElementById('content');
-                                if(content) content.style.display = 'none';
-                                var remainHeight = document.documentElement.clientHeight - form.offsetTop;
-                                form.style.minHeight = remainHeight + 'px';
-                                form.style.boxSizing = 'border-box';
-                                form.style.paddingTop = '16px';
-                            }
+                            var h = document.querySelector('.login_header_container');
+                            if(h) h.style.display='none';
+                            var arrow = document.querySelector('.left_arrow_c');
+                            if(arrow) arrow.style.display='none';
+                            var phone = document.getElementById('PHONE_NUMBERid');
+                            if(phone) phone.style.width='100%';
                         })();
                     """.trimIndent(), null)
 
-                    // 获取 formLogin 顶部坐标（用于 Android 层拦截）
+                    // 延迟获取精确可交互区域坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
+                                var sy = window.scrollY;
+                                var result = [];
+                                var ids = ['PHONE_NUMBERid','testingCodeInp','getTestingCode','agreeChk'];
+                                ids.forEach(function(id){
+                                    var el = document.getElementById(id);
+                                    if(!el) return;
+                                    var r = el.getBoundingClientRect();
+                                    if(r.width===0 && r.height===0) return;
+                                    result.push([
+                                        Math.max(0,(r.left-30)*dpr),
+                                        Math.max(0,(r.top+sy-30)*dpr),
+                                        (r.right+30)*dpr,
+                                        (r.bottom+sy+30)*dpr
+                                    ].join(','));
+                                });
+                                var classes = ['.switch_btn_container','.agree_check','.login_btn','[class*=login]','[class*=agree]','[class*=check]'];
+                                classes.forEach(function(sel){
+                                    document.querySelectorAll(sel).forEach(function(el){
+                                        var r = el.getBoundingClientRect();
+                                        if(r.width===0 && r.height===0) return;
+                                        result.push([
+                                            Math.max(0,(r.left-30)*dpr),
+                                            Math.max(0,(r.top+sy-30)*dpr),
+                                            (r.right+30)*dpr,
+                                            (r.bottom+sy+30)*dpr
+                                        ].join(','));
+                                    });
+                                });
                                 var form = document.getElementById('formLogin');
-                                if(!form) return '0';
-                                return (form.getBoundingClientRect().top * dpr);
+                                if(form){
+                                    var fr = form.getBoundingClientRect();
+                                    result.push([0,(fr.bottom+sy)*dpr,window.innerWidth*dpr,99999].join(','));
+                                }
+                                return result.join('|');
                             })()
                         """.trimIndent()) { value ->
-                            formTop = value?.trim('"')?.toFloatOrNull() ?: 0f
-                            Log.d("DongmanIME", "formTop=$formTop")
+                            val raw = value?.trim('"') ?: return@evaluateJavascript
+                            allowedRects.clear()
+                            raw.split("|").forEach { part ->
+                                val c = part.split(",")
+                                if (c.size == 4) {
+                                    val l = c[0].toFloatOrNull() ?: return@forEach
+                                    val t = c[1].toFloatOrNull() ?: return@forEach
+                                    val r = c[2].toFloatOrNull() ?: return@forEach
+                                    val b = c[3].toFloatOrNull() ?: return@forEach
+                                    if (t >= 0 && b > t) allowedRects.add(Rect(l, t, r, b))
+                                }
+                            }
+                            rectsReady = true
+                            Log.d("DongmanIME", "allowedRects就绪 共${allowedRects.size}个")
+                            allowedRects.forEach {
+                                Log.d("DongmanIME", "  rect: ${it.left},${it.top},${it.right},${it.bottom}")
+                            }
                         }
                     }, 800)
-
-                    // 注入 JS：document 级别 mousedown 拦截，防止表单内部空白导致键盘收起
-                    view?.evaluateJavascript("""
-                        (function(){
-                            document.addEventListener('mousedown', function(e) {
-                                var t = e.target;
-                                console.log('mousedown target=' + t.tagName + ' id=' + t.id);
-                                // INPUT、BUTTON、A、LABEL 及其子元素放行
-                                if (t.tagName === 'INPUT' ||
-                                    t.tagName === 'BUTTON' ||
-                                    t.tagName === 'A' ||
-                                    t.tagName === 'LABEL' ||
-                                    t.closest('button') ||
-                                    t.closest('a') ||
-                                    t.closest('label')) {
-                                    return;
-                                }
-                                // 其他一律 preventDefault，阻止失焦
-                                e.preventDefault();
-                                console.log('preventDefault on ' + t.tagName);
-                            }, true);
-                            console.log('document mousedown监听已注入');
-                        })();
-                    """.trimIndent(), null)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -542,16 +556,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 rootView.getWindowVisibleDisplayFrame(rect)
                 val keyboardNowVisible = rect.bottom < webView.height - 150
 
-                if (keyboardNowVisible == isKeyboardVisible) return
-                isKeyboardVisible = keyboardNowVisible
+                if (keyboardNowVisible != isKeyboardVisible) {
+                    isKeyboardVisible = keyboardNowVisible
+                    Log.d("DongmanIME", "键盘状态变化->$keyboardNowVisible time=${System.currentTimeMillis()} rectBottom=${rect.bottom} webView.height=${webView.height} webView.scrollY=${webView.scrollY}")
+                }
 
                 if (keyboardNowVisible) {
-                    webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
-                } else {
-                    Log.d("DongmanIME", "键盘收起，不做滚动")
+                    val visibleBottom = rect.bottom
+                    webView.evaluateJavascript("""
+                        (function(){
+                            var dpr = window.devicePixelRatio || 1;
+                            var form = document.getElementById('formLogin');
+                            if(!form) return '0';
+                            return String(form.offsetTop * dpr);
+                        })()
+                    """.trimIndent()) { value ->
+                        val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
+                        val targetScrollY = (top - (visibleBottom - top * 0.3f).coerceAtLeast(0f)).toInt().coerceAtLeast(0)
+                        Handler(Looper.getMainLooper()).post {
+                            webView.scrollTo(0, targetScrollY)
+                            Log.d("DongmanIME", "scrollTo=$targetScrollY visibleBottom=$visibleBottom offsetTop=$top")
+                        }
+                    }
                 }
             }
         }
@@ -564,7 +590,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录（保持不变）
+    // 密码登录
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -729,7 +755,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页（触发探针）
+    // 首页 & 最新更新 & 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -747,10 +773,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 最新更新（Latest）
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -773,10 +795,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 搜索（支持混合模式）
-    // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
@@ -867,7 +885,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 漫画详情
+    // 漫画详情 & 章节列表
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
@@ -901,10 +919,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 章节列表
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
@@ -953,7 +967,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（原始抛异常行为）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
