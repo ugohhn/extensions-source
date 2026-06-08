@@ -360,7 +360,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终完整版）
+    // WebView 登录对话框（最终完整修复版）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -419,9 +419,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 样式调整 + 输入框宽度100%
+                    // 注入完整修复脚本
                     view?.evaluateJavascript("""
                         (function(){
+                            // 1. 基础样式调整：隐藏底部空白，撑高表单
                             var form = document.getElementById('formLogin');
                             if(form) {
                                 var content = document.getElementById('content');
@@ -431,11 +432,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 form.style.boxSizing = 'border-box';
                                 form.style.paddingTop = '16px';
                             }
-                            // 让手机号和验证码输入框宽度100%，消除右侧空白
+
+                            // 2. 手机号输入框宽度100%，消除右侧父容器空白
                             var phone = document.getElementById('PHONE_NUMBERid');
                             if(phone) phone.style.width = '100%';
-                            var code = document.getElementById('testingCodeInp');
-                            if(code) code.style.width = '100%';
+
+                            // 3. 验证码行：父容器拦截非输入框/非按钮区域的点击，防止失焦
+                            var codeInput = document.getElementById('testingCodeInp');
+                            if(codeInput) {
+                                var parent = codeInput.parentElement;
+                                if(parent) {
+                                    parent.addEventListener('mousedown', function(e) {
+                                        if(e.target.tagName !== 'INPUT' && 
+                                           !e.target.closest('span') &&
+                                           !e.target.closest('a')) {
+                                            e.preventDefault();
+                                        }
+                                    }, true);
+                                }
+                            }
                         })();
                     """.trimIndent(), null)
 
@@ -453,7 +468,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }, 800)
 
-                    // JS 拦截 mousedown：打印详细日志，自动补全列表放行
+                    // 辅助 JS：打印日志 + 自动补全放行 + 阻止其他元素默认行为
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
@@ -742,7 +757,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页 & 最新更新 & 搜索（保持不变）
+    // 首页 & 最新更新 & 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -1135,4 +1150,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
