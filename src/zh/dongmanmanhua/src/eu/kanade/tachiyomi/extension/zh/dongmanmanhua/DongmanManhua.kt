@@ -224,7 +224,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         editor.apply()
 
-        // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
@@ -237,7 +236,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 手动备用Cookie开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_MANUAL_COOKIE_SWITCH
             title = "启用手动备用Cookie模式"
@@ -252,7 +250,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        // 登录状态指示灯（仅显示，不可点击）
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
@@ -262,7 +259,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录触发器（拨动开关弹出对话框，自动弹回）
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -278,7 +274,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -287,7 +282,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 密码输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -309,7 +303,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 彻底退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "彻底退出登录"
@@ -321,7 +314,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 仅清除独立存储备份
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_CLEAR_BACKUP
             title = "清除独立存储备份"
@@ -333,7 +325,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 搜索模式开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -341,7 +332,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -349,7 +339,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -359,7 +348,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // User-Agent 自定义
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -372,7 +360,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框
+    // WebView 登录对话框（最终完整版）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -388,7 +376,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var formTop = 0f  // 单位：物理像素，相对于 WebView 内容区顶部（包含滚动偏移）
+        var formTop = 0f
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -410,7 +398,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 触摸拦截：使用视口坐标，formTop 为内容绝对坐标，需减去当前 scrollY 得到视口内位置
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
@@ -432,7 +419,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 样式调整
+                    // 样式调整 + 输入框宽度100%
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -444,10 +431,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 form.style.boxSizing = 'border-box';
                                 form.style.paddingTop = '16px';
                             }
+                            // 让手机号和验证码输入框宽度100%，消除右侧空白
+                            var phone = document.getElementById('PHONE_NUMBERid');
+                            if(phone) phone.style.width = '100%';
+                            var code = document.getElementById('testingCodeInp');
+                            if(code) code.style.width = '100%';
                         })();
                     """.trimIndent(), null)
 
-                    // 获取 formLogin 顶部坐标（绝对坐标，含滚动偏移，单位物理像素）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -462,11 +453,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }, 800)
 
-                    // JS 拦截：LI 白名单（自动补全列表放行）
+                    // JS 拦截 mousedown：打印详细日志，自动补全列表放行
                     view?.evaluateJavascript("""
                         (function(){
                             document.addEventListener('mousedown', function(e) {
                                 var t = e.target;
+                                var r = t.getBoundingClientRect();
+                                console.log('DongmanIME mousedown tag=' + t.tagName + ' id=' + t.id + ' class=' + t.className + ' x=' + r.left + '~' + r.right + ' y=' + r.top + '~' + r.bottom);
                                 if (t.tagName === 'INPUT' ||
                                     t.tagName === 'BUTTON' ||
                                     t.tagName === 'A' ||
@@ -557,7 +550,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (keyboardNowVisible) {
                     val visibleBottom = rect.bottom
-                    // 获取 formLogin 相对于视口顶部的偏移（物理像素），计算出合适的滚动位置
                     webView.evaluateJavascript("""
                         (function(){
                             var dpr = window.devicePixelRatio || 1;
@@ -567,7 +559,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })()
                     """.trimIndent()) { value ->
                         val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
-                        // 目标滚动位置：使表单顶部位于可视区域上部，留出约 30% 屏幕高度的空间
                         val targetScrollY = (top - (visibleBottom - top * 0.3f).coerceAtLeast(0f)).toInt().coerceAtLeast(0)
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
@@ -586,7 +577,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录（保持不变）
+    // 密码登录
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -751,7 +742,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页
+    // 首页 & 最新更新 & 搜索（保持不变）
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
@@ -791,10 +782,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 搜索
-    // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
@@ -885,7 +872,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 漫画详情
+    // 漫画详情 & 章节列表
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
@@ -919,10 +906,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // 章节列表
-    // ══════════════════════════════════════════════════════════════════════
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
@@ -1152,4 +1135,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
