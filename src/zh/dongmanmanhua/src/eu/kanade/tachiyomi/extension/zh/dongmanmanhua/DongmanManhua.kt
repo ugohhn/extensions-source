@@ -400,6 +400,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 隐藏头部，手机号输入框撑满
                     view?.evaluateJavascript("""
                         (function(){
                             var h = document.querySelector('.login_header_container');
@@ -411,12 +412,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
+                    // 延迟获取可交互区域坐标（只使用精确 ID 选择器）
                     view?.postDelayed({
-                        view.evaluateJavascript("""
+                        view?.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var sy = window.scrollY;
                                 var result = [];
+                                // 精确 ID 选择器
                                 var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
                                 ids.forEach(function(id){
                                     var el = document.getElementById(id);
@@ -424,29 +427,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     var r = el.getBoundingClientRect();
                                     if(r.width===0 && r.height===0) return;
                                     result.push([
-                                        Math.max(0,(r.left-30)*dpr),
-                                        Math.max(0,(r.top+sy-30)*dpr),
-                                        (r.right+30)*dpr,
-                                        (r.bottom+sy+30)*dpr
+                                        Math.max(0, (r.left-30) * dpr),
+                                        Math.max(0, (r.top+sy-30) * dpr),
+                                        (r.right+30) * dpr,
+                                        (r.bottom+sy+30) * dpr
                                     ].join(','));
                                 });
-                                var classes = ['.switch_btn_container', '.login_btn', '.agree_check'];
-                                classes.forEach(function(sel){
-                                    document.querySelectorAll(sel).forEach(function(el){
-                                        var r = el.getBoundingClientRect();
-                                        if(r.width===0 && r.height===0) return;
+                                // 切换密码按钮（仅一个，且不在顶部）
+                                var switchBtn = document.querySelector('.switch_btn_container');
+                                if(switchBtn){
+                                    var r = switchBtn.getBoundingClientRect();
+                                    if(r.width>0 && r.height>0){
                                         result.push([
-                                            Math.max(0,(r.left-30)*dpr),
-                                            Math.max(0,(r.top+sy-30)*dpr),
-                                            (r.right+30)*dpr,
-                                            (r.bottom+sy+30)*dpr
+                                            Math.max(0, (r.left-30) * dpr),
+                                            Math.max(0, (r.top+sy-30) * dpr),
+                                            (r.right+30) * dpr,
+                                            (r.bottom+sy+30) * dpr
                                         ].join(','));
-                                    });
-                                });
+                                    }
+                                }
+                                // 表单底部以下全部放行
                                 var form = document.getElementById('formLogin');
                                 if(form){
                                     var fr = form.getBoundingClientRect();
-                                    result.push([0,(fr.bottom+sy)*dpr,window.innerWidth*dpr,99999].join(','));
+                                    result.push([0, (fr.bottom+sy) * dpr, window.innerWidth * dpr, 99999].join(','));
                                 }
                                 return result.join('|');
                             })()
@@ -1083,4 +1087,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
