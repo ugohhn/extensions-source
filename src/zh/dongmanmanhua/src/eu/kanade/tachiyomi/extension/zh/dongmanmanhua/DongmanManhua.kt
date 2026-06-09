@@ -413,14 +413,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟获取可交互区域坐标（带调试日志）
+                    // 延迟获取可交互区域坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var sy = window.scrollY;
                                 var result = [];
-                                // ID 选择器
+                                // 调试：打印 agree 相关元素的 class
+                                console.log('DongmanIME agreeParent=' + document.querySelector('.agree')?.className + '|' + document.querySelector('[class*=agree]')?.className);
+                                // 只使用这三个 ID
                                 var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
                                 ids.forEach(function(id){
                                     var el = document.getElementById(id);
@@ -435,22 +437,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                         (r.bottom+sy+30) * dpr
                                     ].join(','));
                                 });
-                                // class 选择器
-                                var classes = ['.switch_btn_container', '.login_btn', '.agree_check'];
-                                classes.forEach(function(sel){
-                                    document.querySelectorAll(sel).forEach(function(el){
-                                        var r = el.getBoundingClientRect();
-                                        if(r.width===0 && r.height===0) return;
-                                        console.log('DongmanIME sel=' + sel + ' class=' + el.className + ' top=' + r.top + ' bottom=' + r.bottom);
-                                        result.push([
-                                            Math.max(0, (r.left-30) * dpr),
-                                            Math.max(0, (r.top+sy-30) * dpr),
-                                            (r.right+30) * dpr,
-                                            (r.bottom+sy+30) * dpr
-                                        ].join(','));
-                                    });
-                                });
-                                // 表单底部以下全部放行
+                                // 注意：移除了所有 class 选择器，避免意外匹配顶部猫咪区域
+                                // 如果需要切换密码按钮或登录按钮，可以单独添加，但为了干净先不加
+                                // 表单底部以下放行
                                 var form = document.getElementById('formLogin');
                                 if(form){
                                     var fr = form.getBoundingClientRect();
@@ -472,6 +461,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 }
                             }
                             rectsReady = true
+                            Log.d("DongmanIME", "allowedRects 数量: ${allowedRects.size}")
                         }
                     }, 800)
                 }
@@ -1091,4 +1081,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
