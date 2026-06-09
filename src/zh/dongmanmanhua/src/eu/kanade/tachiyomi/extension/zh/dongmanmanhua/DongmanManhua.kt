@@ -51,6 +51,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Handler(Looper.getMainLooper()).post {
             CookieManager.getInstance().setAcceptCookie(true)
         }
+        Log.d("DongmanCookie", "扩展初始化完成")
     }
 
     override val name = "Dongman Manhua"
@@ -64,6 +65,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val appContext by lazy { Injekt.get<android.app.Application>() }
     private var dialogContext: Context? = null
 
+    // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
     private fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
 
@@ -73,9 +75,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
+            Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
-        } catch (e: Exception) { }
+        } catch (e: Exception) {
+            Log.e("DongmanCookie", "写入文件失败", e)
+        }
     }
 
     private fun readCookieFromFile(): Pair<String, String> {
@@ -91,7 +96,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun deleteCookieFile() {
         try {
             getCookieFile().delete()
-        } catch (e: Exception) { }
+            Log.d("DongmanCookie", "Cookie 文件已删除")
+        } catch (e: Exception) {
+            Log.e("DongmanCookie", "删除文件失败", e)
+        }
     }
 
     private fun buildCookieString(neoSes: String, neoChk: String): String = buildString {
@@ -101,6 +109,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
 
+    // ===================== 手动备用Cookie开关 =====================
     private fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
 
     private fun clearManualBackup() {
@@ -118,6 +127,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return "开启：请求头使用本地保存的NEO鉴权Cookie；关闭：使用原有策略\n本地缓存：${if (hasLocal) "存在" else "无"}"
     }
 
+    // ===================== 探针校验 =====================
     private var lastProbeTime: Long = 0L
     private var cacheLoginValid: Boolean? = null
 
@@ -192,10 +202,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         cachedCookie = cookie?.ifEmpty { null }
         lastIndependentState = independent
+        Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
     private lateinit var loginIndicator: SwitchPreferenceCompat
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 设置页
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
@@ -344,6 +359,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // WebView 登录对话框（白名单拦截 + 详细日志）
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun showWebViewLoginDialog() {
         val actCtx = dialogContext
         if (actCtx == null) {
@@ -367,14 +386,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         val webView = object : WebView(actCtx) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
-                if (!rectsReady) return super.onTouchEvent(event)
+                // 未就绪或没有任何可交互区域时，放行所有触摸（避免完全点不动）
+                if (!rectsReady || allowedRects.isEmpty()) {
+                    return super.onTouchEvent(event)
+                }
                 val action = event.actionMasked
                 if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
                     val idx = event.actionIndex
                     val x = event.getX(idx)
                     val y = event.getY(idx)
                     val allowed = allowedRects.any { it.contains(x, y) }
+                    Log.d("DongmanIME", "onTouchEvent x=$x y=$y allowed=$allowed")
                     if (!allowed) {
+                        Log.d("DongmanIME", "吞掉触摸（非可交互区域）")
                         return true
                     }
                 }
@@ -413,16 +437,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟获取可交互区域坐标
+                    // 延迟打印所有可见元素的 class 和坐标（用于定位顶部猫咪区域）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var sy = window.scrollY;
                                 var result = [];
-                                // 调试：打印 agree 相关元素的 class
+                                // ========== 新增：打印所有可见元素的 class 和 top ==========
+                                var allVisible = Array.from(document.querySelectorAll('#formLogin *')).filter(function(el){
+                                    var r = el.getBoundingClientRect();
+                                    return r.width > 0 && r.height > 0;
+                                }).map(function(el){
+                                    var r = el.getBoundingClientRect();
+                                    return el.tagName + '#' + el.id + '.' + el.className + '|top=' + r.top;
+                                }).join('\n');
+                                console.log('DongmanIME allEls=\n' + allVisible);
+                                // ========================================================
+                                // 原有日志
                                 console.log('DongmanIME agreeParent=' + document.querySelector('.agree')?.className + '|' + document.querySelector('[class*=agree]')?.className);
-                                // 只使用这三个 ID
+                                // 精确 ID 选择器
                                 var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
                                 ids.forEach(function(id){
                                     var el = document.getElementById(id);
@@ -437,9 +471,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                         (r.bottom+sy+30) * dpr
                                     ].join(','));
                                 });
-                                // 注意：移除了所有 class 选择器，避免意外匹配顶部猫咪区域
-                                // 如果需要切换密码按钮或登录按钮，可以单独添加，但为了干净先不加
-                                // 表单底部以下放行
+                                // 可选：切换密码按钮（如果存在）
+                                var switchBtn = document.querySelector('.switch_btn_container');
+                                if(switchBtn){
+                                    var r = switchBtn.getBoundingClientRect();
+                                    if(r.width>0 && r.height>0){
+                                        console.log('DongmanIME switch_btn top=' + r.top + ' bottom=' + r.bottom);
+                                        result.push([
+                                            Math.max(0, (r.left-30) * dpr),
+                                            Math.max(0, (r.top+sy-30) * dpr),
+                                            (r.right+30) * dpr,
+                                            (r.bottom+sy+30) * dpr
+                                        ].join(','));
+                                    }
+                                }
+                                // 登录按钮（如果存在）
+                                var loginBtn = document.querySelector('.login_btn');
+                                if(loginBtn){
+                                    var r = loginBtn.getBoundingClientRect();
+                                    if(r.width>0 && r.height>0){
+                                        console.log('DongmanIME login_btn top=' + r.top + ' bottom=' + r.bottom);
+                                        result.push([
+                                            Math.max(0, (r.left-30) * dpr),
+                                            Math.max(0, (r.top+sy-30) * dpr),
+                                            (r.right+30) * dpr,
+                                            (r.bottom+sy+30) * dpr
+                                        ].join(','));
+                                    }
+                                }
+                                // 表单底部以下全部放行
                                 var form = document.getElementById('formLogin');
                                 if(form){
                                     var fr = form.getBoundingClientRect();
@@ -462,12 +522,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             }
                             rectsReady = true
                             Log.d("DongmanIME", "allowedRects 数量: ${allowedRects.size}")
+                            if (allowedRects.isEmpty()) {
+                                Log.d("DongmanIME", "警告：allowedRects为空，触摸将全部放行")
+                            }
                         }
                     }, 800)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+                    Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                     val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
@@ -527,6 +591,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (keyboardNowVisible != isKeyboardVisible) {
                     isKeyboardVisible = keyboardNowVisible
+                    Log.d("DongmanIME", "键盘状态变化->$keyboardNowVisible time=${System.currentTimeMillis()} rectBottom=${rect.bottom} webView.height=${webView.height} webView.scrollY=${webView.scrollY}")
                 }
 
                 if (keyboardNowVisible) {
@@ -543,6 +608,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val targetScrollY = (top - (visibleBottom - top * 0.3f).coerceAtLeast(0f)).toInt().coerceAtLeast(0)
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
+                            Log.d("DongmanIME", "scrollTo=$targetScrollY visibleBottom=$visibleBottom offsetTop=$top")
                         }
                     }
                 }
@@ -556,9 +622,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 密码登录（保持不变）
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
+                Log.d("DongmanCookie", "=== 开始密码登录 ===")
                 val rsaResp = client.newCall(GET("$baseUrl/member/login/rsa/getKeys", headers)).execute()
                 val rsaJson = JSONObject(rsaResp.body.string())
                 val keyName = rsaJson.getString("keyName")
@@ -581,6 +652,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
                     val setCookie = loginResp.header("Set-Cookie") ?: ""
+                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $setCookie")
                     val neoSes = extractCookieValue(setCookie, "NEO_SES")
                     val neoChk = extractCookieValue(setCookie, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
@@ -621,6 +693,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun saveLoginCookie(neoSes: String, neoChk: String) {
+        Log.d("DongmanCookie", "saveLoginCookie: neoSes=$neoSes, neoChk=$neoChk")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
@@ -632,6 +705,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun fullLogout() {
+        Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
         if (useIndependentStorage()) {
@@ -650,6 +724,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun clearBackupOnly() {
+        Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
         if (useIndependentStorage()) {
             deleteCookieFile()
@@ -682,6 +757,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun cookieHeader(): String {
         if (cachedCookie != null && lastIndependentState == useIndependentStorage()) {
+            Log.d("DongmanCookie", "cookieHeader: 使用缓存 $cachedCookie")
             return cachedCookie!!
         }
         refreshCookieCache()
@@ -700,11 +776,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ua = currentUserAgent()
         if (ua.isNotEmpty()) builder.set("User-Agent", ua)
         val cookie = cookieHeader()
-        if (cookie.isNotEmpty()) builder.set("Cookie", cookie)
+        if (cookie.isNotEmpty()) {
+            Log.d("DongmanCookie", "headersBuilder: 注入 Cookie -> $cookie")
+            builder.set("Cookie", cookie)
+        } else {
+            Log.d("DongmanCookie", "headersBuilder: 没有 Cookie 可注入")
+        }
         return builder
     }
 
     override val client = network.client
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 首页 & 最新更新 & 搜索（保持不变）
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
         probeIsLoginValid()
@@ -832,6 +917,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return ""
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 漫画详情 & 章节列表
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
@@ -910,6 +999,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 阅读页面 & 自动解锁
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun pageListRequest(chapter: SChapter): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
@@ -927,6 +1020,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
+        Log.d("DongmanCookie", "=== 自动解锁开始 titleNo=$titleNo, episodeNo=$episodeNo ===")
         val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
         val savedCookie = cookieHeader()
         val reqHeaders = headersBuilder()
@@ -934,6 +1028,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .set("X-Requested-With", "XMLHttpRequest")
             .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
             .build()
+        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.get("Cookie")}")
 
         val priceResp = client.newCall(GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders)).execute()
         val priceJson = org.json.JSONObject(priceResp.body.string())
@@ -951,6 +1046,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val payResp = client.newCall(GET("$baseUrl/episode/unlock/pay?$params", reqHeaders)).execute()
         val payJson = org.json.JSONObject(payResp.body.string())
         if (payJson.optInt("code") != 200) return
+        Log.d("DongmanCookie", "自动解锁成功")
     }
 
     private fun extractUrlParam(url: String, key: String): String {
@@ -977,6 +1073,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 工具函数
+    // ══════════════════════════════════════════════════════════════════════
 
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
