@@ -360,7 +360,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（白名单拦截 + 详细日志）
+    // WebView 登录对话框（最终完整版：白名单拦截 + 每个元素单独打印日志）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,7 +386,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         val webView = object : WebView(actCtx) {
             override fun onTouchEvent(event: MotionEvent): Boolean {
-                // 未就绪或没有任何可交互区域时，放行所有触摸（避免完全点不动）
                 if (!rectsReady || allowedRects.isEmpty()) {
                     return super.onTouchEvent(event)
                 }
@@ -425,7 +424,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 隐藏头部，手机号输入框撑满
+                    // 基础样式调整：隐藏头部，手机号输入框撑满
                     view?.evaluateJavascript("""
                         (function(){
                             var h = document.querySelector('.login_header_container');
@@ -437,24 +436,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟打印所有可见元素的 class 和坐标（用于定位顶部猫咪区域）
+                    // 延迟获取可交互区域坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var sy = window.scrollY;
                                 var result = [];
-                                // ========== 新增：打印所有可见元素的 class 和 top ==========
+                                // ========== 打印所有可见元素（每个元素单独一行，避免截断） ==========
                                 var allVisible = Array.from(document.querySelectorAll('#formLogin *')).filter(function(el){
                                     var r = el.getBoundingClientRect();
                                     return r.width > 0 && r.height > 0;
-                                }).map(function(el){
+                                });
+                                allVisible.forEach(function(el){
                                     var r = el.getBoundingClientRect();
-                                    return el.tagName + '#' + el.id + '.' + el.className + '|top=' + r.top;
-                                }).join('\n');
-                                console.log('DongmanIME allEls=\n' + allVisible);
-                                // ========================================================
-                                // 原有日志
+                                    console.log('DongmanIME el=' + el.tagName + '#' + el.id + '.' + el.className + ' top=' + r.top + ' bottom=' + r.bottom);
+                                });
+                                // =========================================================================
                                 console.log('DongmanIME agreeParent=' + document.querySelector('.agree')?.className + '|' + document.querySelector('[class*=agree]')?.className);
                                 // 精确 ID 选择器
                                 var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
@@ -471,7 +469,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                         (r.bottom+sy+30) * dpr
                                     ].join(','));
                                 });
-                                // 可选：切换密码按钮（如果存在）
+                                // 切换密码按钮
                                 var switchBtn = document.querySelector('.switch_btn_container');
                                 if(switchBtn){
                                     var r = switchBtn.getBoundingClientRect();
@@ -485,7 +483,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                         ].join(','));
                                     }
                                 }
-                                // 登录按钮（如果存在）
+                                // 登录按钮
                                 var loginBtn = document.querySelector('.login_btn');
                                 if(loginBtn){
                                     var r = loginBtn.getBoundingClientRect();
@@ -623,7 +621,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录（保持不变）
+    // 密码登录
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -788,7 +786,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val client = network.client
 
     // ══════════════════════════════════════════════════════════════════════
-    // 首页 & 最新更新 & 搜索（保持不变）
+    // 首页 & 最新更新 & 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     override fun popularMangaRequest(page: Int): Request {
