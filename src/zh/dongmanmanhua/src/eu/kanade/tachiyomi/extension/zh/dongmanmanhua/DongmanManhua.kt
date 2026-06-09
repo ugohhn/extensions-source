@@ -394,6 +394,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webChromeClient = object : android.webkit.WebChromeClient() {
                 override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
+                    Log.d("DongmanIME", "JS: ${msg.message()}")
                     return true
                 }
             }
@@ -412,20 +413,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟获取可交互区域坐标（只使用精确 ID 选择器）
+                    // 延迟获取可交互区域坐标（带调试日志）
                     view?.postDelayed({
-                        view?.evaluateJavascript("""
+                        view.evaluateJavascript("""
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var sy = window.scrollY;
                                 var result = [];
-                                // 精确 ID 选择器
+                                // ID 选择器
                                 var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
                                 ids.forEach(function(id){
                                     var el = document.getElementById(id);
                                     if(!el) return;
                                     var r = el.getBoundingClientRect();
                                     if(r.width===0 && r.height===0) return;
+                                    console.log('DongmanIME id=' + id + ' top=' + r.top + ' bottom=' + r.bottom);
                                     result.push([
                                         Math.max(0, (r.left-30) * dpr),
                                         Math.max(0, (r.top+sy-30) * dpr),
@@ -433,19 +435,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                         (r.bottom+sy+30) * dpr
                                     ].join(','));
                                 });
-                                // 切换密码按钮（仅一个，且不在顶部）
-                                var switchBtn = document.querySelector('.switch_btn_container');
-                                if(switchBtn){
-                                    var r = switchBtn.getBoundingClientRect();
-                                    if(r.width>0 && r.height>0){
+                                // class 选择器
+                                var classes = ['.switch_btn_container', '.login_btn', '.agree_check'];
+                                classes.forEach(function(sel){
+                                    document.querySelectorAll(sel).forEach(function(el){
+                                        var r = el.getBoundingClientRect();
+                                        if(r.width===0 && r.height===0) return;
+                                        console.log('DongmanIME sel=' + sel + ' class=' + el.className + ' top=' + r.top + ' bottom=' + r.bottom);
                                         result.push([
                                             Math.max(0, (r.left-30) * dpr),
                                             Math.max(0, (r.top+sy-30) * dpr),
                                             (r.right+30) * dpr,
                                             (r.bottom+sy+30) * dpr
                                         ].join(','));
-                                    }
-                                }
+                                    });
+                                });
                                 // 表单底部以下全部放行
                                 var form = document.getElementById('formLogin');
                                 if(form){
