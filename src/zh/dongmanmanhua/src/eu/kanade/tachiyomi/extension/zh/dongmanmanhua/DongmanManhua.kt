@@ -388,6 +388,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
+        var lastLayoutTime = 0L                         // 防抖时间戳
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
 
@@ -517,9 +518,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
+                val now = System.currentTimeMillis()
+                if (now - lastLayoutTime < 100) return
+                lastLayoutTime = now
+
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardHeight = rootView.height - rect.bottom
+                var keyboardHeight = rootView.height - rect.bottom
+                if (keyboardHeight < 0) return
+
                 val keyboardNowVisible = keyboardHeight > 150
 
                 Log.d("DongmanIME", "onGlobalLayout t=${System.currentTimeMillis()} rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
