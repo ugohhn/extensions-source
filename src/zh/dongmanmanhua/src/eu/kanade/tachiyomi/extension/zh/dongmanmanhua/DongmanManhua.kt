@@ -388,7 +388,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var lastLayoutTime = 0L                         // 防抖时间戳
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
 
@@ -421,7 +420,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 隐藏底部空白区域（div#content），保留猫咪区域
+                    // 只隐藏底部空白区域（div#content），保留猫咪区域
                     view?.evaluateJavascript("""
                         (function(){
                             var content = document.getElementById('content');
@@ -433,11 +432,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 form.style.paddingTop = '16px';
                             }
                         })();
-                    """.trimIndent(), null)
-
-                    // 关键修复：先让页面自然滚动到表单位置，避免键盘弹出时跳跃不够
-                    view?.evaluateJavascript("""
-                        document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});
                     """.trimIndent(), null)
 
                     // 延迟缓存表单坐标
@@ -523,15 +517,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
-                val now = System.currentTimeMillis()
-                if (now - lastLayoutTime < 100) return
-                lastLayoutTime = now
-
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                var keyboardHeight = rootView.height - rect.bottom
-                if (keyboardHeight < 0) return
-
+                val keyboardHeight = rootView.height - rect.bottom
                 val keyboardNowVisible = keyboardHeight > 150
 
                 Log.d("DongmanIME", "onGlobalLayout t=${System.currentTimeMillis()} rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
