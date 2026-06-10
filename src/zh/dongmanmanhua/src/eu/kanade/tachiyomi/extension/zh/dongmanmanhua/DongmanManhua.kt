@@ -412,13 +412,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
+                if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
                     val y = event.y
-                    val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                    if (!inForm) {
-                        Log.d("DongmanIME", "点击在表单外，吞掉事件")
-                        return@setOnTouchListener true
+                    Log.d("DongmanIME", "ACTION_DOWN x=$x y=$y webView.scrollY=${scrollY} formRects=$formRects")
+                    if (formRects.isNotEmpty()) {
+                        val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                        Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
+                        if (!inForm) {
+                            Log.d("DongmanIME", "点击在表单外，吞掉事件")
+                            return@setOnTouchListener true
+                        }
+                    } else {
+                        Log.d("DongmanIME", "formRects为空，放行所有点击")
                     }
                 }
                 false
@@ -446,10 +452,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 var form = document.getElementById('formLogin');
                                 if(!form) return '';
                                 var r = form.getBoundingClientRect();
-                                return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr);
+                                return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|dpr='+dpr+'|scrollY='+window.scrollY;
                             })()
                         """.trimIndent()) { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                            Log.d("DongmanIME", "formRects JS原始返回: $value webView.scrollY=${view.scrollY}")
+                            val raw = value?.trim('"') ?: return@evaluateJavascript
+                            val coordPart = raw.substringBefore("|")
+                            val parts = coordPart.split(",")
                             if (parts.size == 4) {
                                 formRects.clear()
                                 formRects.add(InputRect(
@@ -458,7 +467,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     parts[2].toFloat(),
                                     parts[3].toFloat()
                                 ))
-                                Log.d("DongmanIME", "缓存表单坐标: $formRects")
+                                Log.d("DongmanIME", "缓存表单坐标: $formRects (来自: $raw)")
                             }
                         }
                     }, 500)
@@ -562,6 +571,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
+                            // 滚动完成后重新缓存表单视口坐标（视口已变化）
+                            webView.postDelayed({
+                                webView.evaluateJavascript("""
+                                    (function(){
+                                        var dpr = window.devicePixelRatio || 1;
+                                        var form = document.getElementById('formLogin');
+                                        if(!form) return '';
+                                        var r = form.getBoundingClientRect();
+                                        return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
+                                    })()
+                                """.trimIndent()) { v2 ->
+                                    Log.d("DongmanIME", "键盘弹出后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
+                                    val raw2 = v2?.trim('"') ?: return@evaluateJavascript
+                                    val coords = raw2.substringBefore("|").split(",")
+                                    if (coords.size == 4) {
+                                        formRects.clear()
+                                        formRects.add(InputRect(
+                                            coords[0].toFloat(), coords[1].toFloat(),
+                                            coords[2].toFloat(), coords[3].toFloat()
+                                        ))
+                                        Log.d("DongmanIME", "键盘弹出后formRects已更新: $formRects")
+                                    }
+                                }
+                            }, 200)
                         }
                     }
                 } else {
@@ -578,6 +611,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
+                            // 收起后重新缓存表单视口坐标
+                            webView.postDelayed({
+                                webView.evaluateJavascript("""
+                                    (function(){
+                                        var dpr = window.devicePixelRatio || 1;
+                                        var form = document.getElementById('formLogin');
+                                        if(!form) return '';
+                                        var r = form.getBoundingClientRect();
+                                        return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
+                                    })()
+                                """.trimIndent()) { v2 ->
+                                    Log.d("DongmanIME", "键盘收起后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
+                                    val raw2 = v2?.trim('"') ?: return@evaluateJavascript
+                                    val coords = raw2.substringBefore("|").split(",")
+                                    if (coords.size == 4) {
+                                        formRects.clear()
+                                        formRects.add(InputRect(
+                                            coords[0].toFloat(), coords[1].toFloat(),
+                                            coords[2].toFloat(), coords[3].toFloat()
+                                        ))
+                                        Log.d("DongmanIME", "键盘收起后formRects已更新: $formRects")
+                                    }
+                                }
+                            }, 200)
                         }
                     }
                 }
