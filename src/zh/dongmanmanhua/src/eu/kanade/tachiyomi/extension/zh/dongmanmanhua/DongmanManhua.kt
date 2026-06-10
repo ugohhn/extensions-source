@@ -374,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（修复验证码点击问题）
+    // WebView 登录对话框（增加验证码容器探测日志，不改变原有触摸拦截）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -410,7 +410,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 修复后的触摸监听器：仅在键盘弹出时拦截表单外点击，键盘收起时放行所有点击（验证码可点）
+            // 原有触摸拦截逻辑（未改动）
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
@@ -433,6 +433,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 原有表单样式调整
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -444,6 +445,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
+                    // 延迟缓存表单坐标（原有逻辑）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -470,6 +472,58 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             }
                         }
                     }, 500)
+
+                    // ========== 新增：验证码容器探测（MutationObserver + 轮询）==========
+                    // 注入 MutationObserver 监控验证码容器出现
+                    view?.evaluateJavascript("""
+                        (function(){
+                            if (window.__captchaObserver) return;
+                            window.__captchaInfo = null;
+                            var observer = new MutationObserver(function() {
+                                var el = document.querySelector('.verify-img-out') ||
+                                         document.querySelector('[class*="captcha"]') ||
+                                         document.querySelector('[class*="verify"]');
+                                if (el && !window.__captchaReported) {
+                                    window.__captchaReported = true;
+                                    var r = el.getBoundingClientRect();
+                                    var style = getComputedStyle(el);
+                                    window.__captchaInfo = {
+                                        top: r.top,
+                                        bottom: r.bottom,
+                                        left: r.left,
+                                        right: r.right,
+                                        width: r.width,
+                                        height: r.height,
+                                        display: style.display,
+                                        visibility: style.visibility
+                                    };
+                                    console.log('Captcha detected:', JSON.stringify(window.__captchaInfo));
+                                }
+                            });
+                            observer.observe(document.body, { childList: true, subtree: true });
+                            window.__captchaObserver = observer;
+                        })();
+                    """.trimIndent(), null)
+
+                    // 启动轮询，定期读取 __captchaInfo 并打印到 Android Log
+                    val pollHandler = Handler(Looper.getMainLooper())
+                    val pollRunnable = object : Runnable {
+                        override fun run() {
+                            view?.evaluateJavascript("window.__captchaInfo ? JSON.stringify(window.__captchaInfo) : 'null'") { result ->
+                                if (result != "null" && !result.contains("null")) {
+                                    Log.d("DongmanIME", "【验证码容器信息】$result")
+                                    // 可选：停止轮询（如需持续监控，可保留）
+                                    // pollHandler.removeCallbacks(this)
+                                }
+                                // 持续轮询，每 1 秒一次
+                                pollHandler.postDelayed(this, 1000)
+                            }
+                        }
+                    }
+                    pollHandler.postDelayed(pollRunnable, 1000)
+
+                    // 存储 handler 和 runnable 以便在 dismiss 时停止（防止内存泄漏）
+                    view?.setTag(android.R.id.tag, pollHandler to pollRunnable)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -642,6 +696,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isLoginDialogShowing = false
             loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            // 停止轮询
+            (webView.getTag(android.R.id.tag) as? Pair<*, *>)?.let {
+                (it.first as? Handler)?.removeCallbacks(it.second as? Runnable)
+            }
             webView.destroy()
         }
     }
