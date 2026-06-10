@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
@@ -371,7 +372,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（使用 devicePixelRatio 修正单位）
+    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -387,6 +388,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
+        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+        val formRects = mutableListOf<InputRect>()
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -400,17 +403,62 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             isFocusable = true
             isFocusableInTouchMode = true
-            setOnTouchListener { v, _ ->
+
+            setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
+                if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
+                    val x = event.x
+                    val y = event.y + scrollY
+                    val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                    if (!inForm) {
+                        Log.d("DongmanIME", "点击在表单外，吞掉事件")
+                        return@setOnTouchListener true
+                    }
+                }
                 false
             }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    view?.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
+                    // 只隐藏底部空白区域（div#content），保留猫咪区域
+                    view?.evaluateJavascript("""
+                        (function(){
+                            var content = document.getElementById('content');
+                            if(content) content.style.display = 'none';
+                            var form = document.getElementById('formLogin');
+                            if(form) {
+                                form.style.minHeight = '100vh';
+                                form.style.boxSizing = 'border-box';
+                                form.style.paddingTop = '16px';
+                            }
+                        })();
+                    """.trimIndent(), null)
+
+                    // 延迟缓存表单坐标
+                    view?.postDelayed({
+                        view.evaluateJavascript("""
+                            (function(){
+                                var dpr = window.devicePixelRatio || 1;
+                                var form = document.getElementById('formLogin');
+                                if(!form) return '';
+                                var r = form.getBoundingClientRect();
+                                var scrollY = window.scrollY;
+                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+((r.bottom+scrollY)*dpr);
+                            })()
+                        """.trimIndent()) { value ->
+                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                            if (parts.size == 4) {
+                                formRects.clear()
+                                formRects.add(InputRect(
+                                    parts[0].toFloat(),
+                                    parts[1].toFloat(),
+                                    parts[2].toFloat(),
+                                    parts[3].toFloat()
+                                ))
+                                Log.d("DongmanIME", "缓存表单坐标: $formRects")
+                            }
+                        }
+                    }, 500)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -1103,4 +1151,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
