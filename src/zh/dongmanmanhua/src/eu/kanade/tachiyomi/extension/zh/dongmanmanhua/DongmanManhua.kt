@@ -374,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
+    // WebView 登录对话框（修复验证码点击问题）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -393,7 +393,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        var lastLayoutTime = 0L                         // 防抖时间戳
+        var lastLayoutTime = 0L
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
 
@@ -410,21 +410,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
+            // 修复后的触摸监听器：仅在键盘弹出时拦截表单外点击，键盘收起时放行所有点击（验证码可点）
             setOnTouchListener { v, event ->
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
                     val y = event.y
-                    Log.d("DongmanIME", "ACTION_DOWN x=$x y=$y webView.scrollY=${scrollY} formRects=$formRects")
-                    if (formRects.isNotEmpty()) {
+                    Log.d("DongmanIME", "ACTION_DOWN x=$x y=$y webView.scrollY=${scrollY} formRects=$formRects isKeyboardVisible=$isKeyboardVisible")
+                    if (isKeyboardVisible && formRects.isNotEmpty()) {
                         val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
                         Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
                         if (!inForm) {
-                            Log.d("DongmanIME", "点击在表单外，吞掉事件")
+                            Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉事件")
                             return@setOnTouchListener true
                         }
                     } else {
-                        Log.d("DongmanIME", "formRects为空，放行所有点击")
+                        Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
                     }
                 }
                 false
@@ -432,7 +433,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 不再隐藏 #content（验证码容器），只调整表单样式
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -444,7 +444,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -565,13 +564,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                        // 直接滚动到表单顶部
                         val targetScrollY = top.toInt()
                         Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
-                            // 滚动完成后重新缓存表单视口坐标（视口已变化）
                             webView.postDelayed({
                                 webView.evaluateJavascript("""
                                     (function(){
@@ -611,7 +608,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
-                            // 收起后重新缓存表单视口坐标
                             webView.postDelayed({
                                 webView.evaluateJavascript("""
                                     (function(){
@@ -1228,4 +1224,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
