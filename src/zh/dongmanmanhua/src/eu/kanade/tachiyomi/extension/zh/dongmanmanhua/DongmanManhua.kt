@@ -421,7 +421,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只隐藏底部空白区域（div#content），保留猫咪区域
+                    // 隐藏底部空白区域（div#content），保留猫咪区域
                     view?.evaluateJavascript("""
                         (function(){
                             var content = document.getElementById('content');
@@ -433,6 +433,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 form.style.paddingTop = '16px';
                             }
                         })();
+                    """.trimIndent(), null)
+
+                    // 关键修复：先让页面自然滚动到表单位置，避免键盘弹出时跳跃不够
+                    view?.evaluateJavascript("""
+                        document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});
                     """.trimIndent(), null)
 
                     // 延迟缓存表单坐标
