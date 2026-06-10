@@ -421,11 +421,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 隐藏底部空白区域（div#content），保留猫咪区域
+                    // 不再隐藏 #content（验证码容器），只调整表单样式
                     view?.evaluateJavascript("""
                         (function(){
-                            var content = document.getElementById('content');
-                            if(content) content.style.display = 'none';
                             var form = document.getElementById('formLogin');
                             if(form) {
                                 form.style.minHeight = '100vh';
@@ -553,7 +551,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                        // 修改：不再居中，直接滚动到表单顶部
+                        // 直接滚动到表单顶部
                         val targetScrollY = top.toInt()
                         Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
