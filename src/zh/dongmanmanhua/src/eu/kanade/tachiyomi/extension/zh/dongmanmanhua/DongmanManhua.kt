@@ -360,7 +360,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终完整版：白名单拦截 + 每个元素单独打印日志）
+    // WebView 登录对话框（硬编码坐标，完全移除动态查询）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -436,92 +436,45 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟获取可交互区域坐标
+                    // 延迟获取 formLogin 的实际偏移量（绝对物理像素），然后使用硬编码坐标
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
-                                var dpr = window.devicePixelRatio || 1;
-                                var sy = window.scrollY;
-                                var result = [];
-                                // ========== 打印所有可见元素（每个元素单独一行，避免截断） ==========
-                                var allVisible = Array.from(document.querySelectorAll('#formLogin *')).filter(function(el){
-                                    var r = el.getBoundingClientRect();
-                                    return r.width > 0 && r.height > 0;
-                                });
-                                allVisible.forEach(function(el){
-                                    var r = el.getBoundingClientRect();
-                                    console.log('DongmanIME el=' + el.tagName + '#' + el.id + '.' + el.className + ' top=' + r.top + ' bottom=' + r.bottom);
-                                });
-                                // =========================================================================
-                                console.log('DongmanIME agreeParent=' + document.querySelector('.agree')?.className + '|' + document.querySelector('[class*=agree]')?.className);
-                                // 精确 ID 选择器
-                                var ids = ['PHONE_NUMBERid', 'testingCodeInp', 'getTestingCode'];
-                                ids.forEach(function(id){
-                                    var el = document.getElementById(id);
-                                    if(!el) return;
-                                    var r = el.getBoundingClientRect();
-                                    if(r.width===0 && r.height===0) return;
-                                    console.log('DongmanIME id=' + id + ' top=' + r.top + ' bottom=' + r.bottom);
-                                    result.push([
-                                        Math.max(0, (r.left-30) * dpr),
-                                        Math.max(0, (r.top+sy-30) * dpr),
-                                        (r.right+30) * dpr,
-                                        (r.bottom+sy+30) * dpr
-                                    ].join(','));
-                                });
-                                // 切换密码按钮
-                                var switchBtn = document.querySelector('.switch_btn_container');
-                                if(switchBtn){
-                                    var r = switchBtn.getBoundingClientRect();
-                                    if(r.width>0 && r.height>0){
-                                        console.log('DongmanIME switch_btn top=' + r.top + ' bottom=' + r.bottom);
-                                        result.push([
-                                            Math.max(0, (r.left-30) * dpr),
-                                            Math.max(0, (r.top+sy-30) * dpr),
-                                            (r.right+30) * dpr,
-                                            (r.bottom+sy+30) * dpr
-                                        ].join(','));
-                                    }
-                                }
-                                // 登录按钮
-                                var loginBtn = document.querySelector('.login_btn');
-                                if(loginBtn){
-                                    var r = loginBtn.getBoundingClientRect();
-                                    if(r.width>0 && r.height>0){
-                                        console.log('DongmanIME login_btn top=' + r.top + ' bottom=' + r.bottom);
-                                        result.push([
-                                            Math.max(0, (r.left-30) * dpr),
-                                            Math.max(0, (r.top+sy-30) * dpr),
-                                            (r.right+30) * dpr,
-                                            (r.bottom+sy+30) * dpr
-                                        ].join(','));
-                                    }
-                                }
-                                // 表单底部以下全部放行
                                 var form = document.getElementById('formLogin');
-                                if(form){
-                                    var fr = form.getBoundingClientRect();
-                                    result.push([0, (fr.bottom+sy) * dpr, window.innerWidth * dpr, 99999].join(','));
-                                }
-                                return result.join('|');
+                                if(!form) return '0';
+                                var r = form.getBoundingClientRect();
+                                return String((r.top + window.scrollY) * (window.devicePixelRatio || 1));
                             })()
                         """.trimIndent()) { value ->
-                            val raw = value?.trim('"') ?: return@evaluateJavascript
-                            allowedRects.clear()
-                            raw.split("|").forEach { part ->
-                                val c = part.split(",")
-                                if (c.size == 4) {
-                                    val l = c[0].toFloatOrNull() ?: return@forEach
-                                    val t = c[1].toFloatOrNull() ?: return@forEach
-                                    val r = c[2].toFloatOrNull() ?: return@forEach
-                                    val b = c[3].toFloatOrNull() ?: return@forEach
-                                    if (t >= 0 && b > t) allowedRects.add(Rect(l, t, r, b))
-                                }
+                            val formTopPx = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
+                            val dpr = 3f  // 固定设备像素比 (RMX3888)
+
+                            // 辅助函数：将 CSS 坐标转换为物理像素 Rect，增加 30px 容差
+                            fun makeRect(cssTop: Float, cssBottom: Float, cssLeft: Float = 0f, cssRight: Float = 329f): Rect {
+                                return Rect(
+                                    (cssLeft * dpr - 30f).coerceAtLeast(0f),
+                                    formTopPx + cssTop * dpr - 30f,
+                                    cssRight * dpr + 30f,
+                                    formTopPx + cssBottom * dpr + 30f
+                                )
                             }
+
+                            allowedRects.clear()
+                            // UL.login_inp_list 整个输入区域（手机号+验证码+获取验证码）
+                            allowedRects.add(makeRect(0f, 88.34f))
+                            // P.switch_btn_container 切换密码登录
+                            allowedRects.add(makeRect(118.64f, 138.77f))
+                            // P.terms_btn_container 同意协议整行
+                            allowedRects.add(makeRect(172.99f, 193.12f))
+                            // DIV.login_btn 注册/登录按钮
+                            allowedRects.add(makeRect(193.12f, 255.00f))
+                            // formLogin 底部以下全部放行
+                            allowedRects.add(Rect(0f, formTopPx + 255f * dpr, 9999f, 99999f))
+
                             rectsReady = true
-                            Log.d("DongmanIME", "allowedRects 数量: ${allowedRects.size}")
-                            if (allowedRects.isEmpty()) {
-                                Log.d("DongmanIME", "警告：allowedRects为空，触摸将全部放行")
+                            Log.d("DongmanIME", "allowedRects就绪 formTopPx=$formTopPx 共${allowedRects.size}个")
+                            allowedRects.forEach {
+                                Log.d("DongmanIME", "  rect: ${it.left},${it.top},${it.right},${it.bottom}")
                             }
                         }
                     }, 800)
@@ -1179,4 +1132,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
