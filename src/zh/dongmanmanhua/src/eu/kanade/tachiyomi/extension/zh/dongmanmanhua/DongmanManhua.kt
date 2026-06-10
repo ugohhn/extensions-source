@@ -698,8 +698,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isLoginDialogShowing = false
             loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
-            // 停止轮询
-            captchaPollHandler?.removeCallbacks(captchaPollRunnable)
+            // 停止轮询（安全处理可空类型）
+            captchaPollHandler?.let { handler ->
+                captchaPollRunnable?.let { runnable ->
+                    handler.removeCallbacks(runnable)
+                }
+            }
             webView.destroy()
         }
     }
@@ -1282,4 +1286,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
