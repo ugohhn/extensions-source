@@ -374,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（增加验证码容器探测日志，不改变原有触摸拦截）
+    // WebView 登录对话框（增加验证码容器探测，已修复编译错误）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -396,6 +396,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var lastLayoutTime = 0L
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
+
+        // 用于轮询验证码的 Handler 和 Runnable
+        var captchaPollHandler: Handler? = null
+        var captchaPollRunnable: Runnable? = null
 
         val webView = WebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
@@ -506,24 +510,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     """.trimIndent(), null)
 
                     // 启动轮询，定期读取 __captchaInfo 并打印到 Android Log
-                    val pollHandler = Handler(Looper.getMainLooper())
-                    val pollRunnable = object : Runnable {
+                    val handler = Handler(Looper.getMainLooper())
+                    val runnable = object : Runnable {
                         override fun run() {
                             view?.evaluateJavascript("window.__captchaInfo ? JSON.stringify(window.__captchaInfo) : 'null'") { result ->
                                 if (result != "null" && !result.contains("null")) {
                                     Log.d("DongmanIME", "【验证码容器信息】$result")
                                     // 可选：停止轮询（如需持续监控，可保留）
-                                    // pollHandler.removeCallbacks(this)
                                 }
                                 // 持续轮询，每 1 秒一次
-                                pollHandler.postDelayed(this, 1000)
+                                handler.postDelayed(this, 1000)
                             }
                         }
                     }
-                    pollHandler.postDelayed(pollRunnable, 1000)
-
-                    // 存储 handler 和 runnable 以便在 dismiss 时停止（防止内存泄漏）
-                    view?.setTag(android.R.id.tag, pollHandler to pollRunnable)
+                    captchaPollHandler = handler
+                    captchaPollRunnable = runnable
+                    handler.postDelayed(runnable, 1000)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -697,9 +699,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
             // 停止轮询
-            (webView.getTag(android.R.id.tag) as? Pair<*, *>)?.let {
-                (it.first as? Handler)?.removeCallbacks(it.second as? Runnable)
-            }
+            captchaPollHandler?.removeCallbacks(captchaPollRunnable)
             webView.destroy()
         }
     }
