@@ -65,6 +65,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val appContext by lazy { Injekt.get<android.app.Application>() }
     private var dialogContext: Context? = null
 
+    // 登录对话框相关
+    private var currentLoginDialog: AlertDialog? = null
+    private var loginSuccessHandled = false
+
     // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
     private fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
@@ -372,7 +376,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
+    // WebView 登录对话框
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -386,7 +390,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return
         }
 
-        var dialog: AlertDialog? = null
+        // 重置标志位
+        loginSuccessHandled = false
+
         var isKeyboardVisible = false
         var lastLayoutTime = 0L                         // 防抖时间戳
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
@@ -461,11 +467,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
+                    // 只在登录页检测 Cookie，避免首页重定向时再次触发
+                    if (url == null || !url.contains("/member/login")) return
+
                     val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-                    Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
+                    Log.d("DongmanCookie", "WebView onPageFinished CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                     val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                    if (neoSes.isNotEmpty()) {
+                    if (!loginSuccessHandled && neoSes.isNotEmpty()) {
+                        loginSuccessHandled = true
                         preferences.edit()
                             .putString(KEY_NEO_SES, neoSes)
                             .putString(KEY_NEO_CHK, neoChk)
@@ -485,7 +495,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 manualCookieSwitch.summary = buildManualSwitchSummary()
                             }
                             Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
-                            dialog?.dismiss()
+                            currentLoginDialog?.dismiss()
                         }
                     }
                 }
@@ -493,9 +503,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loadUrl("$baseUrl/member/login")
         }
 
-        dialog = AlertDialog.Builder(actCtx)
+        val dialog = AlertDialog.Builder(actCtx)
             .setView(webView)
             .create()
+        currentLoginDialog = dialog
 
         dialog.show()
 
@@ -581,6 +592,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
 
         dialog.setOnDismissListener {
+            currentLoginDialog = null
+            loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
             webView.destroy()
         }
@@ -626,12 +639,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         refreshCookieCache()
                     }
                     Handler(Looper.getMainLooper()).post {
-                        loginIndicator.isChecked = true
-                        loginIndicator.summary = buildLoginSummary()
-                        if (::manualCookieSwitch.isInitialized) {
-                            manualCookieSwitch.summary = buildManualSwitchSummary()
+                        if (!loginSuccessHandled) {
+                            loginSuccessHandled = true
+                            loginIndicator.isChecked = true
+                            loginIndicator.summary = buildLoginSummary()
+                            if (::manualCookieSwitch.isInitialized) {
+                                manualCookieSwitch.summary = buildManualSwitchSummary()
+                            }
+                            Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            currentLoginDialog?.dismiss()
                         }
-                        Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                     }
                 } else {
                     val msg = loginJson.optString("loginMessage", "登录失败")
