@@ -522,9 +522,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val keyboardHeight = rootView.height - rect.bottom
                 val keyboardNowVisible = keyboardHeight > 150
 
-                Log.d("DongmanIME", "onGlobalLayout rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
+                Log.d("DongmanIME", "onGlobalLayout t=${System.currentTimeMillis()} rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
 
                 if (keyboardNowVisible == isKeyboardVisible) return
+                Log.d("DongmanIME", "★ 状态切换: $isKeyboardVisible -> $keyboardNowVisible (keyboardHeight=$keyboardHeight)")
                 isKeyboardVisible = keyboardNowVisible
 
                 if (keyboardNowVisible) {
@@ -547,7 +548,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
                         val formHeight = (bottom - top).toInt()
                         val targetScrollY = top.toInt() - ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY")
+                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
@@ -563,7 +564,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })()
                     """.trimIndent()) { value ->
                         val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
-                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top")
+                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
