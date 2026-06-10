@@ -388,6 +388,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
+        var lastLayoutTime = 0L                         // 防抖时间戳
         data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
 
@@ -420,7 +421,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只隐藏底部空白区域（div#content），保留猫咪区域
+                    // 隐藏底部空白区域（div#content），保留猫咪区域
                     view?.evaluateJavascript("""
                         (function(){
                             var content = document.getElementById('content');
@@ -517,9 +518,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
+                val now = System.currentTimeMillis()
+                if (now - lastLayoutTime < 100) return
+                lastLayoutTime = now
+
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardHeight = rootView.height - rect.bottom
+                var keyboardHeight = rootView.height - rect.bottom
+                if (keyboardHeight < 0) return
+
                 val keyboardNowVisible = keyboardHeight > 150
 
                 Log.d("DongmanIME", "onGlobalLayout t=${System.currentTimeMillis()} rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
@@ -546,9 +553,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
                         val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
-                        val formHeight = (bottom - top).toInt()
-                        val targetScrollY = top.toInt() - ((visibleBottom - formHeight) / 2).coerceAtLeast(0)
-                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom formHeight=$formHeight targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
+                        // 修改：不再居中，直接滚动到表单顶部
+                        val targetScrollY = top.toInt()
+                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
