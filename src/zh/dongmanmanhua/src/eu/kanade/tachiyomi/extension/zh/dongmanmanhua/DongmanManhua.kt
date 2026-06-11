@@ -1,25 +1,15 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
-import android.app.AlertDialog
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.MotionEvent
-import android.view.ViewGroup
-import android.view.WindowManager
 import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import java.math.BigInteger
-import java.security.KeyFactory
-import java.security.spec.RSAPublicKeySpec
-import javax.crypto.Cipher
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -30,13 +20,13 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import org.jsoup.nodes.Element
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.nodes.Element
 import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -60,19 +50,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    private val cdnBase = "https://cdn.dongmanmanhua.cn"
-    private val preferences by getPreferencesLazy()
-    private val appContext by lazy { Injekt.get<android.app.Application>() }
-    private var dialogContext: Context? = null
+    internal val cdnBase = "https://cdn.dongmanmanhua.cn"
+    internal val preferences by getPreferencesLazy()
+    internal val appContext by lazy { Injekt.get<android.app.Application>() }
+    internal var dialogContext: Context? = null
+    internal var isLoginDialogShowing = false
+    internal var loginSuccessHandled = false
 
-    // ---------- 独立存储 ----------
-    private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
-    private fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
+    // ══════════════════════════════════════════════════════════════════════
+    // 独立存储（Cookie 文件读写）
+    // ══════════════════════════════════════════════════════════════════════
 
-    private var cachedCookie: String? = null
-    private var lastIndependentState: Boolean? = null
+    internal fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
+    internal fun getCookieFile(): File = File(getCookieDir(), "cookie.dat")
 
-    private fun saveCookieToFile(neoSes: String, neoChk: String) {
+    internal var cachedCookie: String? = null
+    internal var lastIndependentState: Boolean? = null
+
+    internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
             Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
@@ -83,7 +78,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun readCookieFromFile(): Pair<String, String> {
+    internal fun readCookieFromFile(): Pair<String, String> {
         return try {
             val content = getCookieFile().readText()
             val parts = content.split("|")
@@ -93,7 +88,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun deleteCookieFile() {
+    internal fun deleteCookieFile() {
         try {
             getCookieFile().delete()
             Log.d("DongmanCookie", "Cookie 文件已删除")
@@ -102,32 +97,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun buildCookieString(neoSes: String, neoChk: String): String = buildString {
+    internal fun buildCookieString(neoSes: String, neoChk: String): String = buildString {
         if (neoSes.isNotEmpty()) append("NEO_SES=$neoSes; ")
         if (neoChk.isNotEmpty()) append("NEO_CHK=$neoChk")
     }.trimEnd(';', ' ')
 
-    private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
+    internal fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
 
-    // ===================== 手动备用Cookie开关 =====================
-    private fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
+    // ══════════════════════════════════════════════════════════════════════
+    // 手动备用 Cookie 开关
+    // ══════════════════════════════════════════════════════════════════════
 
-    private fun clearManualBackup() {
+    internal fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
+
+    internal fun clearManualBackup() {
         deleteCookieFile()
         preferences.edit().putBoolean(PREF_MANUAL_COOKIE_SWITCH, false).apply()
     }
 
-    private fun hasManualBackup(): Boolean {
+    internal fun hasManualBackup(): Boolean {
         val (ses, _) = readCookieFromFile()
         return ses.isNotBlank()
     }
 
-    private fun buildManualSwitchSummary(): String {
+    internal fun buildManualSwitchSummary(): String {
         val hasLocal = hasManualBackup()
         return "开启：请求头使用本地保存的NEO鉴权Cookie；关闭：使用原有策略\n本地缓存：${if (hasLocal) "存在" else "无"}"
     }
 
-    // ===================== 探针校验 =====================
+    // ══════════════════════════════════════════════════════════════════════
+    // 探针校验（登录状态探测）
+    // ══════════════════════════════════════════════════════════════════════
+
     private var lastProbeTime: Long = 0L
     private var cacheLoginValid: Boolean? = null
 
@@ -151,10 +152,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!valid) {
                 clearManualBackup()
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
-                if (::manualCookieSwitch.isInitialized) {
-                    manualCookieSwitch.summary = buildManualSwitchSummary()
-                }
+                syncLoginIndicator()
             }
             valid
         } catch (_: Exception) {
@@ -162,15 +160,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun refreshCookieCache() {
+    internal fun refreshCookieCache() {
         val independent = useIndependentStorage()
         val cookie = if (getManualCookieEnable()) {
             val file = getCookieFile()
             if (file.exists()) {
                 val (neoSes, neoChk) = readCookieFromFile()
-                if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) {
-                    buildCookieString(neoSes, neoChk)
-                } else null
+                if (neoSes.isNotEmpty() && neoChk.isNotEmpty()) buildCookieString(neoSes, neoChk) else null
             } else null
         } else {
             if (independent) {
@@ -205,8 +201,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
-    private lateinit var loginIndicator: SwitchPreferenceCompat
-    private lateinit var manualCookieSwitch: SwitchPreferenceCompat
+    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+
+    internal fun syncLoginIndicator() {
+        if (::loginIndicator.isInitialized) {
+            loginIndicator.isChecked = isLoginKnown()
+            loginIndicator.summary = buildLoginSummary()
+        }
+        if (::manualCookieSwitch.isInitialized) {
+            manualCookieSwitch.summary = buildManualSwitchSummary()
+        }
+    }
+
+    internal lateinit var loginIndicator: SwitchPreferenceCompat
+    internal lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -224,7 +232,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         editor.apply()
 
-        // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
@@ -232,12 +239,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 true
             }
         }.also(screen::addPreference)
 
-        // 手动备用Cookie开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_MANUAL_COOKIE_SWITCH
             title = "启用手动备用Cookie模式"
@@ -245,24 +251,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 summary = buildManualSwitchSummary()
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        // 登录状态指示灯（仅显示，不可点击）
+        refreshCookieCache()
+
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
+            isChecked = isLoginKnown()
             setEnabled(false)
             loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录触发器（拨动开关弹出对话框，自动弹回）
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -278,7 +285,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -287,7 +293,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        // 密码输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -309,7 +314,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 彻底退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "彻底退出登录"
@@ -321,7 +325,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 仅清除独立存储备份
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_CLEAR_BACKUP
             title = "清除独立存储备份"
@@ -333,7 +336,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        // 搜索模式开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -341,7 +343,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -349,7 +350,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        // User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -359,7 +359,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
-        // User-Agent 自定义
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -372,181 +371,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（恢复猫咪区域，只隐藏底部空白）
-    // ══════════════════════════════════════════════════════════════════════
-
-    private fun showWebViewLoginDialog() {
-        val actCtx = dialogContext
-        if (actCtx == null) {
-            Toast.makeText(appContext, "无法显示登录窗口：上下文丢失", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (actCtx is android.app.Activity && (actCtx.isFinishing || actCtx.isDestroyed)) {
-            Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        var dialog: AlertDialog? = null
-        var isKeyboardVisible = false
-        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
-        val formRects = mutableListOf<InputRect>()
-
-        val webView = WebView(actCtx).apply {
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
-            CookieManager.getInstance().setAcceptCookie(true)
-
-            isFocusable = true
-            isFocusableInTouchMode = true
-
-            setOnTouchListener { v, event ->
-                if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN && formRects.isNotEmpty()) {
-                    val x = event.x
-                    val y = event.y + scrollY
-                    val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                    if (!inForm) {
-                        Log.d("DongmanIME", "点击在表单外，吞掉事件")
-                        return@setOnTouchListener true
-                    }
-                }
-                false
-            }
-
-            webViewClient = object : WebViewClient() {
-                override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 只隐藏底部空白区域（div#content），保留猫咪区域
-                    view?.evaluateJavascript("""
-                        (function(){
-                            var content = document.getElementById('content');
-                            if(content) content.style.display = 'none';
-                            var form = document.getElementById('formLogin');
-                            if(form) {
-                                form.style.minHeight = '100vh';
-                                form.style.boxSizing = 'border-box';
-                                form.style.paddingTop = '16px';
-                            }
-                        })();
-                    """.trimIndent(), null)
-
-                    // 延迟缓存表单坐标
-                    view?.postDelayed({
-                        view.evaluateJavascript("""
-                            (function(){
-                                var dpr = window.devicePixelRatio || 1;
-                                var form = document.getElementById('formLogin');
-                                if(!form) return '';
-                                var r = form.getBoundingClientRect();
-                                var scrollY = window.scrollY;
-                                return (r.left*dpr)+','+((r.top+scrollY)*dpr)+','+(r.right*dpr)+','+((r.bottom+scrollY)*dpr);
-                            })()
-                        """.trimIndent()) { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
-                            if (parts.size == 4) {
-                                formRects.clear()
-                                formRects.add(InputRect(
-                                    parts[0].toFloat(),
-                                    parts[1].toFloat(),
-                                    parts[2].toFloat(),
-                                    parts[3].toFloat()
-                                ))
-                                Log.d("DongmanIME", "缓存表单坐标: $formRects")
-                            }
-                        }
-                    }, 500)
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-                    Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
-                    val neoSes = extractCookieValue(cookieStr, "NEO_SES")
-                    val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                    if (neoSes.isNotEmpty()) {
-                        preferences.edit()
-                            .putString(KEY_NEO_SES, neoSes)
-                            .putString(KEY_NEO_CHK, neoChk)
-                            .apply()
-                        if (useIndependentStorage()) {
-                            saveCookieToFile(neoSes, neoChk)
-                        } else {
-                            cachedCookie = buildCookieString(neoSes, neoChk)
-                            lastIndependentState = useIndependentStorage()
-                        }
-                        saveCookieToFile(neoSes, neoChk)
-                        refreshCookieCache()
-                        Handler(Looper.getMainLooper()).post {
-                            loginIndicator.isChecked = true
-                            loginIndicator.summary = buildLoginSummary()
-                            if (::manualCookieSwitch.isInitialized) {
-                                manualCookieSwitch.summary = buildManualSwitchSummary()
-                            }
-                            Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
-                            dialog?.dismiss()
-                        }
-                    }
-                }
-            }
-            loadUrl("$baseUrl/member/login")
-        }
-
-        dialog = AlertDialog.Builder(actCtx)
-            .setView(webView)
-            .create()
-
-        dialog.show()
-
-        dialog.window?.apply {
-            clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-            clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
-            setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
-                WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
-            )
-            setLayout(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
-        webView.requestFocus()
-
-        val rootView = dialog.window?.decorView ?: return
-        val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
-            override fun onGlobalLayout() {
-                val rect = android.graphics.Rect()
-                rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardNowVisible = rect.bottom < webView.height - 150
-
-                if (keyboardNowVisible == isKeyboardVisible) return
-                isKeyboardVisible = keyboardNowVisible
-
-                if (keyboardNowVisible) {
-                    webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
-                } else {
-                    Log.d("DongmanIME", "键盘收起，不做滚动")
-                }
-            }
-        }
-        rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
-
-        dialog.setOnDismissListener {
-            rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
-            webView.destroy()
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
     // 密码登录
     // ══════════════════════════════════════════════════════════════════════
 
-    private fun loginWithPassword(username: String, password: String) {
+    internal fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
                 Log.d("DongmanCookie", "=== 开始密码登录 ===")
@@ -571,23 +399,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val loginJson = JSONObject(loginResp.body.string())
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
-                    val setCookie = loginResp.header("Set-Cookie") ?: ""
-                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $setCookie")
-                    val neoSes = extractCookieValue(setCookie, "NEO_SES")
-                    val neoChk = extractCookieValue(setCookie, "NEO_CHK")
+                    val allSetCookies = loginResp.headers.values("Set-Cookie").joinToString("; ")
+                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $allSetCookies")
+                    val neoSes = extractCookieValue(allSetCookies, "NEO_SES")
+                    val neoChk = extractCookieValue(allSetCookies, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
                         saveLoginCookie(neoSes, neoChk)
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
                         saveCookieToFile(neoSes, neoChk)
                         refreshCookieCache()
-                    }
-                    Handler(Looper.getMainLooper()).post {
-                        loginIndicator.isChecked = true
-                        loginIndicator.summary = buildLoginSummary()
-                        if (::manualCookieSwitch.isInitialized) {
-                            manualCookieSwitch.summary = buildManualSwitchSummary()
+                        Handler(Looper.getMainLooper()).post {
+                            if (!loginSuccessHandled) {
+                                loginSuccessHandled = true
+                                syncLoginIndicator()
+                                Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Handler(Looper.getMainLooper()).post {
+                            Toast.makeText(appContext, "登录失败：未获取到登录凭证", Toast.LENGTH_LONG).show()
+                        }
                     }
                 } else {
                     val msg = loginJson.optString("loginMessage", "登录失败")
@@ -601,18 +432,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }.start()
     }
 
-    private fun rsaEncryptToHex(data: String, modulusHex: String, exponentHex: String): String {
-        val modulus = BigInteger(modulusHex, 16)
-        val exponent = BigInteger(exponentHex, 16)
-        val keySpec = RSAPublicKeySpec(modulus, exponent)
-        val publicKey = KeyFactory.getInstance("RSA").generatePublic(keySpec)
-        val cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding")
-        cipher.init(Cipher.ENCRYPT_MODE, publicKey)
-        val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
-        return encrypted.joinToString("") { "%02x".format(it) }
-    }
-
-    private fun saveLoginCookie(neoSes: String, neoChk: String) {
+    internal fun saveLoginCookie(neoSes: String, neoChk: String) {
         Log.d("DongmanCookie", "saveLoginCookie: neoSes=$neoSes, neoChk=$neoChk")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
@@ -624,43 +444,32 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    private fun fullLogout() {
+    internal fun fullLogout() {
         Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         CookieManager.getInstance().removeAllCookies(null)
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        if (useIndependentStorage()) {
-            deleteCookieFile()
-        }
+        if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.isChecked = false
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) {
-            manualCookieSwitch.summary = buildManualSwitchSummary()
-        }
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun clearBackupOnly() {
-        Log.d("DongmanCookie", "clearBackupOnly: 仅清除独立存储备份，不影响WebView登录态")
+    internal fun clearBackupOnly() {
+        Log.d("DongmanCookie", "clearBackupOnly")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        if (useIndependentStorage()) {
-            deleteCookieFile()
-        }
+        if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) {
-            manualCookieSwitch.summary = buildManualSwitchSummary()
-        }
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun buildLoginSummary(): String {
+    internal fun buildLoginSummary(): String {
         val isLoggedIn = cachedCookie?.isNotEmpty() == true
         val status = if (isLoggedIn) "已登录" else "未登录"
         val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
@@ -668,12 +477,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return "存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
     }
 
-    private fun extractCookieValue(cookieStr: String, key: String): String =
-        cookieStr.split(";")
-            .map { it.trim() }
-            .firstOrNull { it.startsWith("$key=") }
-            ?.removePrefix("$key=")
-            ?.trim() ?: ""
+    // ══════════════════════════════════════════════════════════════════════
+    // 请求头
+    // ══════════════════════════════════════════════════════════════════════
+
+    internal fun currentUserAgent(): String {
+        return when (val pref = preferences.getString(PREF_UA, UA_MOBILE) ?: UA_MOBILE) {
+            PREF_UA_CUSTOM_FLAG -> preferences.getString(PREF_UA_CUSTOM, "").orEmpty()
+            else -> pref
+        }
+    }
 
     private fun cookieHeader(): String {
         if (cachedCookie != null && lastIndependentState == useIndependentStorage()) {
@@ -682,13 +495,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         refreshCookieCache()
         return cachedCookie ?: ""
-    }
-
-    private fun currentUserAgent(): String {
-        return when (val pref = preferences.getString(PREF_UA, UA_MOBILE) ?: UA_MOBILE) {
-            PREF_UA_CUSTOM_FLAG -> preferences.getString(PREF_UA_CUSTOM, "").orEmpty()
-            else -> pref
-        }
     }
 
     override fun headersBuilder(): Headers.Builder {
@@ -728,7 +534,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 最新更新（Latest）
+    // 最新更新
     // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
@@ -754,7 +560,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 搜索（支持混合模式）
+    // 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
@@ -783,7 +589,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        return if (response.request.url.toString().contains("/searchResult")) parseSearchResultJson(response) else parseSearchHtml(response)
+        return if (response.request.url.toString().contains("/searchResult")) {
+            parseSearchResultJson(response)
+        } else {
+            parseSearchHtml(response)
+        }
     }
 
     private fun parseSearchHtml(response: Response): MangasPage {
@@ -796,7 +606,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
         val hasNextPage = total > totalEntries
         if (hasNextPage) {
-            val keyword = extractKeywordFromBody(response)
+            val keyword = extractKeywordFromBody(response.request.body)
             if (keyword.isNotEmpty()) nextStartMap[keyword] = totalEntries + 1
         }
         return MangasPage(entries, hasNextPage)
@@ -821,7 +631,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     thumbnail_url = buildThumbnailUrl(
                         item.optString("thumbnailMobile", "")
                             .ifEmpty { item.optString("thumbnail", "") }
-                            .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") }
+                            .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") },
+                        cdnBase
                     )
                 }
                 if (manga.title.isNotEmpty()) entries.add(manga)
@@ -829,20 +640,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val hasNextPage = rawCount > 0 && (start - 1 + rawCount) < total
         if (hasNextPage && isMixedMode()) {
-            val keyword = extractKeywordFromBody(response)
+            val keyword = extractKeywordFromBody(response.request.body)
             if (keyword.isNotEmpty()) nextStartMap[keyword] = start + rawCount
         }
         return MangasPage(entries, hasNextPage)
-    }
-
-    private fun extractKeywordFromBody(response: Response): String {
-        val body = response.request.body
-        if (body is FormBody) {
-            for (i in 0 until body.size) {
-                if (body.name(i) == "keyword") return body.value(i)
-            }
-        }
-        return ""
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -884,6 +685,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
     // 章节列表
     // ══════════════════════════════════════════════════════════════════════
+
+    private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
@@ -929,10 +732,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return chapters.reversed()
     }
 
-    private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
-
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（原始抛异常行为）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -981,11 +782,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "自动解锁成功")
     }
 
-    private fun extractUrlParam(url: String, key: String): String {
-        val regex = Regex("""[?&]$key=([^&]+)""")
-        return regex.find(url)?.groupValues?.get(1) ?: ""
-    }
-
     override fun pageListParse(response: Response): List<Page> {
         val html = response.body.string()
         val imageRegex = Regex("""url\s*:\s*"(https://cdn\.dongmanmanhua\.cn/[^"]+)"""")
@@ -1007,29 +803,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // ══════════════════════════════════════════════════════════════════════
-    // 工具函数
+    // 元素解析（依赖 HttpSource 的 setUrlWithoutDomain）
     // ══════════════════════════════════════════════════════════════════════
-
-    private fun extractSerialStatus(html: String): String {
-        val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
-        return regex.find(html)?.groupValues?.get(1) ?: ""
-    }
-
-    private fun extractUpdateTag(html: String): String {
-        val regex = Regex("""在(周[一二三四五六七日天])更新""")
-        val match = regex.find(html) ?: return ""
-        return "每${match.groupValues[1]}更新"
-    }
-
-    private fun buildThumbnailUrl(raw: String): String {
-        if (raw.isEmpty()) return ""
-        return when {
-            raw.startsWith("http") -> raw
-            raw.startsWith("//") -> "https:$raw"
-            raw.startsWith("/") -> "$cdnBase$raw"
-            else -> raw
-        }
-    }
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         setUrlWithoutDomain(element.absUrl("href"))
@@ -1045,72 +820,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         thumbnail_url = extractThumbnailUrl(element)
     }
 
-    private fun extractThumbnailUrl(element: Element): String {
-        val img = element.selectFirst(".pic img, img, a img")
-        if (img != null) {
-            img.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
-            img.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
-            img.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
-            img.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
-            img.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
-            img.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
-            extractUrlFromStyle(img.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
-        }
-        val style = element.attr("style")
-        if (style.isNotEmpty()) {
-            extractUrlFromStyle(style).takeIf { it.isNotEmpty() }?.let { return it }
-        }
-        val picDiv = element.selectFirst(".pic, .thmb, .chapter-img-c")
-        if (picDiv != null) {
-            val picStyle = picDiv.attr("style")
-            if (picStyle.isNotEmpty()) {
-                extractUrlFromStyle(picStyle).takeIf { it.isNotEmpty() }?.let { return it }
-            }
-            val picImg = picDiv.selectFirst("img")
-            if (picImg != null) {
-                picImg.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
-                picImg.attr("data-src").takeIf { it.isNotEmpty() }?.let { return it }
-                picImg.absUrl("src").takeIf { it.isNotEmpty() && !it.contains("placeholder") && !it.contains("transparent") }?.let { return it }
-                picImg.attr("data-original").takeIf { it.isNotEmpty() }?.let { return it }
-                picImg.attr("data-url").takeIf { it.isNotEmpty() }?.let { return it }
-                picImg.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
-                extractUrlFromStyle(picImg.attr("style")).takeIf { it.isNotEmpty() }?.let { return it }
-            }
-        }
-        element.attr("data-image-url").takeIf { it.isNotEmpty() }?.let { return it }
-        element.attr("data-cover").takeIf { it.isNotEmpty() }?.let { return it }
-        element.attr("data-thumbnail").takeIf { it.isNotEmpty() }?.let { return it }
-        return ""
-    }
-
-    private fun extractUrlFromStyle(style: String): String {
-        if (style.isEmpty()) return ""
-        val regex = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'"()]+)['"]?\)""")
-        val match = regex.find(style)
-        if (match != null) return match.groupValues[1].trim()
-        val from = style.indexOf("url(").takeIf { it != -1 }?.plus(4) ?: return ""
-        val end = style.indexOf(")", from).takeIf { it != -1 } ?: return ""
-        return style.substring(from, end).trim().removeSurrounding("\"").removeSurrounding("'")
-    }
+    // ══════════════════════════════════════════════════════════════════════
+    // 常量
+    // ══════════════════════════════════════════════════════════════════════
 
     companion object {
-        private const val PREF_UA = "pref_user_agent"
-        private const val PREF_UA_CUSTOM = "pref_user_agent_custom"
-        private const val PREF_UA_CUSTOM_FLAG = "__custom__"
-        private const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
-        private const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
-        private const val PREF_LOGIN_USERNAME = "pref_login_username"
-        private const val PREF_LOGIN_PASSWORD = "pref_login_password"
-        private const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
-        private const val PREF_CLEAR_BACKUP = "pref_clear_backup"
-        private const val PREF_SEARCH_MODE = "pref_search_mode"
-        private const val PREF_AUTO_PAY = "pref_auto_pay"
-        private const val KEY_NEO_SES = "neo_ses"
-        private const val KEY_NEO_CHK = "neo_chk"
+        internal const val PREF_UA = "pref_user_agent"
+        internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
+        internal const val PREF_UA_CUSTOM_FLAG = "__custom__"
+        internal const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
+        internal const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
+        internal const val PREF_LOGIN_USERNAME = "pref_login_username"
+        internal const val PREF_LOGIN_PASSWORD = "pref_login_password"
+        internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
+        internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
+        internal const val PREF_SEARCH_MODE = "pref_search_mode"
+        internal const val PREF_AUTO_PAY = "pref_auto_pay"
+        internal const val KEY_NEO_SES = "neo_ses"
+        internal const val KEY_NEO_CHK = "neo_chk"
 
-        private const val UA_MOBILE =
+        internal const val UA_MOBILE =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
-        private const val UA_DESKTOP =
+        internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
