@@ -1,8 +1,8 @@
 package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 
 import android.util.Log
-import org.jsoup.nodes.Element
 import eu.kanade.tachiyomi.source.model.SManga
+import org.jsoup.nodes.Element
 import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.spec.RSAPublicKeySpec
@@ -59,19 +59,7 @@ internal fun buildThumbnailUrl(raw: String, cdnBase: String): String {
     }
 }
 
-internal fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-    setUrlWithoutDomain(element.absUrl("href"))
-    title = element.selectFirst(
-        "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02, .chapter-title-01"
-    )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
-    thumbnail_url = extractThumbnailUrl(element)
-}
 
-internal fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-    setUrlWithoutDomain(element.absUrl("href"))
-    title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
-    thumbnail_url = extractThumbnailUrl(element)
-}
 
 internal fun extractThumbnailUrl(element: Element): String {
     val img = element.selectFirst(".pic img, img, a img")
