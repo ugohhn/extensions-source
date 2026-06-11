@@ -45,6 +45,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
+// 表单坐标数据类，提升为顶层类以避免可见性问题
 data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
@@ -113,6 +114,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun useIndependentStorage(): Boolean = preferences.getBoolean(PREF_INDEPENDENT_STORAGE, false)
 
+    // ===================== 手动备用Cookie开关 =====================
     private fun getManualCookieEnable(): Boolean = preferences.getBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
 
     private fun clearManualBackup() {
@@ -130,6 +132,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return "开启：请求头使用本地保存的NEO鉴权Cookie；关闭：使用原有策略\n本地缓存：${if (hasLocal) "存在" else "无"}"
     }
 
+    // ===================== 探针校验 =====================
     private var lastProbeTime: Long = 0L
     private var cacheLoginValid: Boolean? = null
 
@@ -210,6 +213,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private lateinit var loginIndicator: SwitchPreferenceCompat
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 设置页
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val ctx = screen.context
         dialogContext = ctx
@@ -222,6 +229,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         editor.apply()
 
+        // 独立存储开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
@@ -234,6 +242,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 手动备用Cookie开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_MANUAL_COOKIE_SWITCH
             title = "启用手动备用Cookie模式"
@@ -248,6 +257,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
+        // 登录状态指示灯（仅显示，不可点击）
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
@@ -257,6 +267,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator = this
         }.also(screen::addPreference)
 
+        // WebView 登录触发器（拨动开关弹出对话框，自动弹回）
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -272,6 +283,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 账号输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_USERNAME
             title = "账号（手机号或邮箱）"
@@ -280,6 +292,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
+        // 密码输入框
         EditTextPreference(ctx).apply {
             key = PREF_LOGIN_PASSWORD
             title = "密码"
@@ -301,6 +314,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 彻底退出登录
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
             title = "彻底退出登录"
@@ -312,6 +326,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 仅清除独立存储备份
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_CLEAR_BACKUP
             title = "清除独立存储备份"
@@ -323,6 +338,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
+        // 搜索模式开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
@@ -330,6 +346,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        // 自动扣费开关
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_AUTO_PAY
             title = "自动购买付费章节"
@@ -337,6 +354,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        // User-Agent 预设
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -346,6 +364,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(UA_MOBILE)
         }.also(screen::addPreference)
 
+        // User-Agent 自定义
         EditTextPreference(ctx).apply {
             key = PREF_UA_CUSTOM
             title = "User-Agent 自定义值"
@@ -357,10 +376,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // 自定义 WebView - 已移除有问题的触摸拦截逻辑
+    // ══════════════════════════════════════════════════════════════════════
+    // 自定义 WebView，重写 dispatchTouchEvent 捕获 ACTION_DOWN
+    // ══════════════════════════════════════════════════════════════════════
+
     inner class LoginWebView(context: Context) : WebView(context) {
         private var extIsKeyboardVisible: Boolean = false
         private var extFormRects: List<InputRect> = emptyList()
+        private var swallowingCurrentSequence = false
 
         fun updateKeyboardVisible(visible: Boolean) {
             extIsKeyboardVisible = visible
@@ -377,12 +400,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
-            // 原逻辑会吞掉键盘弹出时表单外的点击，导致验证码无法交互，现完全移除
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    val x = event.x
+                    val y = event.y
+                    if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
+                        val inForm = extFormRects.any { rect ->
+                            x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                        }
+                        Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
+                        if (!inForm) {
+                            Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉整个序列")
+                            swallowingCurrentSequence = true
+                            return true
+                        }
+                    } else {
+                        Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
+                    }
+                    swallowingCurrentSequence = false
+                }
+                MotionEvent.ACTION_MOVE,
+                MotionEvent.ACTION_UP -> {
+                    if (swallowingCurrentSequence) return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    swallowingCurrentSequence = false
+                }
+            }
             return super.onTouchEvent(event)
         }
     }
 
-    // 带修复的登录对话框（阻止验证码创建独立窗口，并移除触摸拦截）
+    // ══════════════════════════════════════════════════════════════════════
+    // WebView 登录对话框（使用自定义 LoginWebView）
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun showWebViewLoginDialog() {
         if (isLoginDialogShowing) return
         val actCtx = dialogContext
@@ -402,6 +454,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var lastLayoutTime = 0L
         val formRects = mutableListOf<InputRect>()
 
+        // 用于轮询验证码的 Handler 和 Runnable
         var captchaPollHandler: Handler? = null
         var captchaPollRunnable: Runnable? = null
 
@@ -410,39 +463,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
-                setSupportMultipleWindows(false)
-            }
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
             isFocusable = true
             isFocusableInTouchMode = true
 
-            webChromeClient = object : android.webkit.WebChromeClient() {
-                override fun onCreateWindow(
-                    view: WebView?,
-                    isDialog: Boolean,
-                    isUserGesture: Boolean,
-                    resultMsg: android.os.Message?
-                ): Boolean {
-                    Log.d("DongmanIME", "拦截 onCreateWindow，阻止弹出独立窗口")
-                    return true
-                }
-            }
-
             webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
-                    val url = request?.url.toString()
-                    if (url.isNotEmpty()) {
-                        view?.loadUrl(url)
-                    }
-                    return true
-                }
-
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 原有表单样式调整
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
@@ -454,22 +485,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })();
                     """.trimIndent(), null)
 
-                    // 修正验证码弹窗位置（防止 left 为负导致部分不可见）
-                    view?.evaluateJavascript("""
-                        (function() {
-                            function fixCaptchaPosition() {
-                                var captcha = document.querySelector('.verifybox, [class*="verify"][class*="box"], .geetest_panel, .captcha_popup');
-                                if (captcha && captcha.getBoundingClientRect().left < 0) {
-                                    captcha.style.left = '0px';
-                                    console.log('Captcha left fixed');
-                                }
-                            }
-                            fixCaptchaPosition();
-                            var observer = new MutationObserver(function() { fixCaptchaPosition(); });
-                            observer.observe(document.body, { childList: true, subtree: true, attributes: true });
-                        })();
-                    """.trimIndent(), null)
-
+                    // 延迟缓存表单坐标（原有逻辑）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -493,11 +509,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     parts[3].toFloat()
                                 ))
                                 Log.d("DongmanIME", "缓存表单坐标: $formRects (来自: $raw)")
+                                // 更新自定义 WebView 中的表单区域数据
                                 updateFormRects(formRects.toList())
                             }
                         }
                     }, 500)
 
+                    // ========== 验证码探测：每秒轮询所有疑似元素 ==========
                     val handler = Handler(Looper.getMainLooper())
                     val runnable = object : Runnable {
                         override fun run() {
@@ -607,9 +625,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (keyboardNowVisible == isKeyboardVisible) return
                 Log.d("DongmanIME", "★ 状态切换: $isKeyboardVisible -> $keyboardNowVisible (keyboardHeight=$keyboardHeight)")
                 isKeyboardVisible = keyboardNowVisible
+                // 更新自定义 WebView 中的键盘状态
                 webView.updateKeyboardVisible(isKeyboardVisible)
 
                 if (keyboardNowVisible) {
+                    val visibleBottom = rect.bottom
+                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY} webView.height=${webView.height}")
+
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
@@ -623,7 +645,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Log.d("DongmanIME", "JS回调 value=$value")
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
+                        val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
                         val targetScrollY = top.toInt()
+                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
@@ -654,6 +678,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }
                 } else {
+                    Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
@@ -662,6 +687,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })()
                     """.trimIndent()) { value ->
                         val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
+                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
@@ -700,6 +726,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isLoginDialogShowing = false
             loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            // 停止轮询
             captchaPollHandler?.let { handler ->
                 captchaPollRunnable?.let { runnable ->
                     handler.removeCallbacks(runnable)
@@ -709,7 +736,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    // ---------- 以下为原有业务代码（未改动）----------
+    // ══════════════════════════════════════════════════════════════════════
+    // 密码登录及其他业务函数（保持不变）
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
@@ -878,6 +908,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override val client = network.client
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 首页（触发探针）
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun popularMangaRequest(page: Int): Request {
         probeIsLoginValid()
         return GET("$baseUrl/?pageName=home", headers)
@@ -893,6 +927,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 最新更新（Latest）
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
 
@@ -915,6 +953,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 搜索（支持混合模式）
+    // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
@@ -1004,6 +1046,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return ""
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 漫画详情
+    // ══════════════════════════════════════════════════════════════════════
+
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
             val cookie = cookieHeader()
@@ -1035,6 +1081,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 章节列表
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().apply {
@@ -1081,6 +1131,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 阅读页面 & 自动解锁
+    // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
         val reqHeaders = headersBuilder().apply {
@@ -1152,6 +1206,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 工具函数
+    // ══════════════════════════════════════════════════════════════════════
 
     private fun extractSerialStatus(html: String): String {
         val regex = Regex("""serial_status['":\s]+([A-Z]+)""")
@@ -1256,4 +1314,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
