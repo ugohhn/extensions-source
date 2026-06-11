@@ -393,15 +393,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-            Log.d("DongmanIME", "dispatchTouchEvent action=${event.action} x=${event.x} y=${event.y}")
-            return super.dispatchTouchEvent(event)
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
             if (event.action == MotionEvent.ACTION_DOWN) {
                 val x = event.x
                 val y = event.y
+                Log.d("DongmanIME", "dispatchTouchEvent DOWN x=$x y=$y isKeyboardVisible=$extIsKeyboardVisible formRects=$extFormRects")
                 if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
                     val inForm = extFormRects.any { rect ->
                         x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
@@ -414,7 +409,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 } else {
                     Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
                 }
+            } else {
+                Log.d("DongmanIME", "dispatchTouchEvent action=${event.action}")
             }
+            return super.dispatchTouchEvent(event)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "onTouchEvent action=${event.action}")
             return super.onTouchEvent(event)
         }
     }
@@ -1302,4 +1304,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
