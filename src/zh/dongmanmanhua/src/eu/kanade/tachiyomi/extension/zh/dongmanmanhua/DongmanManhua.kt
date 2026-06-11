@@ -374,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（增加验证码容器探测，已修复编译错误）
+    // WebView 登录对话框（增强验证码探测）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -477,50 +477,36 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }, 500)
 
-                    // ========== 新增：验证码容器探测（MutationObserver + 轮询）==========
-                    // 注入 MutationObserver 监控验证码容器出现
-                    view?.evaluateJavascript("""
-                        (function(){
-                            if (window.__captchaObserver) return;
-                            window.__captchaInfo = null;
-                            var observer = new MutationObserver(function() {
-                                var el = document.querySelector('.verify-img-out') ||
-                                         document.querySelector('[class*="captcha"]') ||
-                                         document.querySelector('[class*="verify"]');
-                                if (el && !window.__captchaReported) {
-                                    window.__captchaReported = true;
-                                    var r = el.getBoundingClientRect();
-                                    var style = getComputedStyle(el);
-                                    window.__captchaInfo = {
-                                        top: r.top,
-                                        bottom: r.bottom,
-                                        left: r.left,
-                                        right: r.right,
-                                        width: r.width,
-                                        height: r.height,
-                                        display: style.display,
-                                        visibility: style.visibility
-                                    };
-                                    console.log('Captcha detected:', JSON.stringify(window.__captchaInfo));
-                                }
-                            });
-                            observer.observe(document.body, { childList: true, subtree: true });
-                            window.__captchaObserver = observer;
-                        })();
-                    """.trimIndent(), null)
-
-                    // 启动轮询，定期读取 __captchaInfo 并打印到 Android Log
+                    // ========== 验证码探测：每秒轮询所有疑似元素 ==========
                     val handler = Handler(Looper.getMainLooper())
                     val runnable = object : Runnable {
                         override fun run() {
-                            view?.evaluateJavascript("window.__captchaInfo ? JSON.stringify(window.__captchaInfo) : 'null'") { result ->
-                                if (result != "null" && !result.contains("null")) {
-                                    Log.d("DongmanIME", "【验证码容器信息】$result")
-                                    // 可选：停止轮询（如需持续监控，可保留）
-                                }
-                                // 持续轮询，每 1 秒一次
-                                handler.postDelayed(this, 1000)
+                            view?.evaluateJavascript("""
+                                (function(){
+                                    var all = document.querySelectorAll('[class*="verify"],[class*="captcha"],[class*="slider"],[class*="click"],[class*="geetest"]');
+                                    var result = [];
+                                    Array.prototype.forEach.call(all, function(el) {
+                                        var r = el.getBoundingClientRect();
+                                        var style = getComputedStyle(el);
+                                        result.push({
+                                            tag: el.tagName,
+                                            cls: el.className,
+                                            top: r.top,
+                                            bottom: r.bottom,
+                                            left: r.left,
+                                            right: r.right,
+                                            w: r.width,
+                                            h: r.height,
+                                            display: style.display,
+                                            visibility: style.visibility
+                                        });
+                                    });
+                                    return JSON.stringify(result);
+                                })();
+                            """.trimIndent()) { result ->
+                                Log.d("DongmanIME", "【验证码相关元素】$result")
                             }
+                            handler.postDelayed(this, 1000)
                         }
                     }
                     captchaPollHandler = handler
@@ -698,7 +684,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isLoginDialogShowing = false
             loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
-            // 停止轮询（安全处理可空类型）
+            // 停止轮询
             captchaPollHandler?.let { handler ->
                 captchaPollRunnable?.let { runnable ->
                     handler.removeCallbacks(runnable)
