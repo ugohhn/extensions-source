@@ -357,7 +357,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
     }
 
-    // 自定义 WebView
+    // 自定义 WebView - 已移除有问题的触摸拦截逻辑
     inner class LoginWebView(context: Context) : WebView(context) {
         private var extIsKeyboardVisible: Boolean = false
         private var extFormRects: List<InputRect> = emptyList()
@@ -377,27 +377,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         override fun onTouchEvent(event: MotionEvent): Boolean {
             Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
-            if (event.action == MotionEvent.ACTION_DOWN) {
-                val x = event.x
-                val y = event.y
-                if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
-                    val inForm = extFormRects.any { rect ->
-                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-                    }
-                    Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
-                    if (!inForm) {
-                        Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉事件")
-                        return true
-                    }
-                } else {
-                    Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
-                }
-            }
+            // 原逻辑会吞掉键盘弹出时表单外的点击，导致验证码无法交互，现完全移除
             return super.onTouchEvent(event)
         }
     }
 
-    // 带修复的登录对话框（阻止验证码创建独立窗口）
+    // 带修复的登录对话框（阻止验证码创建独立窗口，并移除触摸拦截）
     private fun showWebViewLoginDialog() {
         if (isLoginDialogShowing) return
         val actCtx = dialogContext
@@ -466,6 +451,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 form.style.boxSizing = 'border-box';
                                 form.style.paddingTop = '16px';
                             }
+                        })();
+                    """.trimIndent(), null)
+
+                    // 修正验证码弹窗位置（防止 left 为负导致部分不可见）
+                    view?.evaluateJavascript("""
+                        (function() {
+                            function fixCaptchaPosition() {
+                                var captcha = document.querySelector('.verifybox, [class*="verify"][class*="box"], .geetest_panel, .captcha_popup');
+                                if (captcha && captcha.getBoundingClientRect().left < 0) {
+                                    captcha.style.left = '0px';
+                                    console.log('Captcha left fixed');
+                                }
+                            }
+                            fixCaptchaPosition();
+                            var observer = new MutationObserver(function() { fixCaptchaPosition(); });
+                            observer.observe(document.body, { childList: true, subtree: true, attributes: true });
                         })();
                     """.trimIndent(), null)
 
@@ -573,12 +574,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         dialog.show()
 
-        // ========== 添加 DecorView 触摸监听以诊断事件路由 ==========
-        dialog.window?.decorView?.setOnTouchListener { _, event ->
-            Log.d("DongmanIME", "DecorView TouchListener action=${event.action}")
-            false
-        }
-
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
             clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
@@ -615,9 +610,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 webView.updateKeyboardVisible(isKeyboardVisible)
 
                 if (keyboardNowVisible) {
-                    val visibleBottom = rect.bottom
-                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY} webView.height=${webView.height}")
-
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
@@ -631,9 +623,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Log.d("DongmanIME", "JS回调 value=$value")
                         val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
                         val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
-                        val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
                         val targetScrollY = top.toInt()
-                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, targetScrollY)
                             Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
@@ -664,7 +654,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }
                 } else {
-                    Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
                     webView.evaluateJavascript("""
                         (function(){
                             var el = document.getElementById('formLogin');
@@ -673,7 +662,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         })()
                     """.trimIndent()) { value ->
                         val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
-                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top 当前scrollY=${webView.scrollY}")
                         Handler(Looper.getMainLooper()).post {
                             webView.scrollTo(0, top.toInt())
                             Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
@@ -721,6 +709,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    // ---------- 以下为原有业务代码（未改动）----------
     private fun loginWithPassword(username: String, password: String) {
         Thread {
             try {
