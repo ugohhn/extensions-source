@@ -210,6 +210,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private lateinit var loginIndicator: SwitchPreferenceCompat
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
+    // 表单坐标 data class（提升为类成员）
+    private data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
     // ══════════════════════════════════════════════════════════════════════
@@ -378,7 +381,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     inner class LoginWebView(context: Context) : WebView(context) {
-        // 这些变量由外部传入或访问外部类的成员
         private var extIsKeyboardVisible: Boolean = false
         private var extFormRects: List<InputRect> = emptyList()
 
@@ -400,13 +402,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (event.action == MotionEvent.ACTION_DOWN) {
                 val x = event.x
                 val y = event.y
-                // 原有拦截逻辑
                 if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
-                    val inForm = extFormRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                    val inForm = extFormRects.any { rect ->
+                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                    }
                     Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
                     if (!inForm) {
                         Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉事件")
-                        // 吞掉事件，不再传递
                         return true
                     }
                 } else {
@@ -438,7 +440,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
         var lastLayoutTime = 0L
-        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
         val formRects = mutableListOf<InputRect>()
 
         // 用于轮询验证码的 Handler 和 Runnable
@@ -1301,4 +1302,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
