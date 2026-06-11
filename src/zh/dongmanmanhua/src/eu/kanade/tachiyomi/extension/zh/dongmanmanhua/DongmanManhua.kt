@@ -20,6 +20,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import org.jsoup.nodes.Element
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import okhttp3.FormBody
@@ -795,6 +796,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 元素解析（依赖 HttpSource 的 setUrlWithoutDomain）
+    // ══════════════════════════════════════════════════════════════════════
+
+    private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
+        setUrlWithoutDomain(element.absUrl("href"))
+        title = element.selectFirst(
+            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02, .chapter-title-01"
+        )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
+        thumbnail_url = extractThumbnailUrl(element)
+    }
+
+    private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
+        setUrlWithoutDomain(element.absUrl("href"))
+        title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
+        thumbnail_url = extractThumbnailUrl(element)
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 常量
