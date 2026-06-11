@@ -374,7 +374,51 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（增加 RAW_TOUCH 日志）
+    // 自定义 WebView，重写 dispatchTouchEvent 捕获 ACTION_DOWN
+    // ══════════════════════════════════════════════════════════════════════
+
+    inner class LoginWebView(context: Context) : WebView(context) {
+        // 这些变量由外部传入或访问外部类的成员
+        private var extIsKeyboardVisible: Boolean = false
+        private var extFormRects: List<InputRect> = emptyList()
+
+        fun updateKeyboardVisible(visible: Boolean) {
+            extIsKeyboardVisible = visible
+        }
+
+        fun updateFormRects(rects: List<InputRect>) {
+            extFormRects = rects
+        }
+
+        override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "dispatchTouchEvent action=${event.action} x=${event.x} y=${event.y}")
+            return super.dispatchTouchEvent(event)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                val x = event.x
+                val y = event.y
+                // 原有拦截逻辑
+                if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
+                    val inForm = extFormRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
+                    Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
+                    if (!inForm) {
+                        Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉事件")
+                        // 吞掉事件，不再传递
+                        return true
+                    }
+                } else {
+                    Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // WebView 登录对话框（使用自定义 LoginWebView）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -401,7 +445,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var captchaPollHandler: Handler? = null
         var captchaPollRunnable: Runnable? = null
 
-        val webView = WebView(actCtx).apply {
+        val webView = LoginWebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -413,30 +457,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             isFocusable = true
             isFocusableInTouchMode = true
-
-            // 添加无条件日志，验证触摸事件是否到达此监听器
-            setOnTouchListener { v, event ->
-                // 无条件输出，验证触摸事件是否到达此监听器
-                Log.d("DongmanIME", "RAW_TOUCH action=${event.action}")
-
-                if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    val x = event.x
-                    val y = event.y
-                    Log.d("DongmanIME", "ACTION_DOWN x=$x y=$y webView.scrollY=${scrollY} formRects=$formRects isKeyboardVisible=$isKeyboardVisible")
-                    if (isKeyboardVisible && formRects.isNotEmpty()) {
-                        val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                        Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
-                        if (!inForm) {
-                            Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉事件")
-                            return@setOnTouchListener true
-                        }
-                    } else {
-                        Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
-                    }
-                }
-                false
-            }
 
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
@@ -476,6 +496,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     parts[3].toFloat()
                                 ))
                                 Log.d("DongmanIME", "缓存表单坐标: $formRects (来自: $raw)")
+                                // 更新自定义 WebView 中的表单区域数据
+                                updateFormRects(formRects.toList())
                             }
                         }
                     }, 500)
@@ -590,6 +612,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (keyboardNowVisible == isKeyboardVisible) return
                 Log.d("DongmanIME", "★ 状态切换: $isKeyboardVisible -> $keyboardNowVisible (keyboardHeight=$keyboardHeight)")
                 isKeyboardVisible = keyboardNowVisible
+                // 更新自定义 WebView 中的键盘状态
+                webView.updateKeyboardVisible(isKeyboardVisible)
 
                 if (keyboardNowVisible) {
                     val visibleBottom = rect.bottom
@@ -634,6 +658,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                             coords[2].toFloat(), coords[3].toFloat()
                                         ))
                                         Log.d("DongmanIME", "键盘弹出后formRects已更新: $formRects")
+                                        webView.updateFormRects(formRects.toList())
                                     }
                                 }
                             }, 200)
@@ -673,6 +698,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                             coords[2].toFloat(), coords[3].toFloat()
                                         ))
                                         Log.d("DongmanIME", "键盘收起后formRects已更新: $formRects")
+                                        webView.updateFormRects(formRects.toList())
                                     }
                                 }
                             }, 200)
@@ -698,7 +724,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录
+    // 密码登录及其他业务函数（保持不变）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -1094,7 +1120,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（原始抛异常行为）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
@@ -1275,4 +1301,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
