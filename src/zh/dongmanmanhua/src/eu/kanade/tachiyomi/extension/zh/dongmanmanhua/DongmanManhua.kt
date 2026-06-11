@@ -45,6 +45,9 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
+// 表单坐标数据类，提升为顶层类以避免可见性问题
+data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
     init {
@@ -209,9 +212,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private lateinit var loginIndicator: SwitchPreferenceCompat
     private lateinit var manualCookieSwitch: SwitchPreferenceCompat
-
-    // 表单坐标 data class（提升为类成员）
-    private data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
     // ══════════════════════════════════════════════════════════════════════
     // 设置页
@@ -1302,4 +1302,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
