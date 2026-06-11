@@ -429,7 +429,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
-                // 关键修复：禁止创建新窗口，防止验证码弹出独立 window 抢走焦点
                 setSupportMultipleWindows(false)
             }
             CookieManager.getInstance().setAcceptCookie(true)
@@ -437,7 +436,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 拦截 onCreateWindow
             webChromeClient = object : android.webkit.WebChromeClient() {
                 override fun onCreateWindow(
                     view: WebView?,
@@ -574,6 +572,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .create()
 
         dialog.show()
+
+        // ========== 添加 DecorView 触摸监听以诊断事件路由 ==========
+        dialog.window?.decorView?.setOnTouchListener { _, event ->
+            Log.d("DongmanIME", "DecorView TouchListener action=${event.action}")
+            false
+        }
 
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
