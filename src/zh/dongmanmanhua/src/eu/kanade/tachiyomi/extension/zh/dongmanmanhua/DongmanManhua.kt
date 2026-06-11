@@ -374,7 +374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（增强验证码探测）
+    // WebView 登录对话框（增加 RAW_TOUCH 日志）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -414,8 +414,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isFocusable = true
             isFocusableInTouchMode = true
 
-            // 原有触摸拦截逻辑（未改动）
+            // 添加无条件日志，验证触摸事件是否到达此监听器
             setOnTouchListener { v, event ->
+                // 无条件输出，验证触摸事件是否到达此监听器
+                Log.d("DongmanIME", "RAW_TOUCH action=${event.action}")
+
                 if (!v.hasFocus()) v.requestFocus()
                 if (event.action == MotionEvent.ACTION_DOWN) {
                     val x = event.x
