@@ -152,10 +152,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!valid) {
                 clearManualBackup()
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
-                if (::manualCookieSwitch.isInitialized) {
-                    manualCookieSwitch.summary = buildManualSwitchSummary()
-                }
+                syncLoginIndicator()
             }
             valid
         } catch (_: Exception) {
@@ -204,6 +201,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
+    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+
+    internal fun syncLoginIndicator() {
+        if (::loginIndicator.isInitialized) {
+            loginIndicator.isChecked = isLoginKnown()
+            loginIndicator.summary = buildLoginSummary()
+        }
+        if (::manualCookieSwitch.isInitialized) {
+            manualCookieSwitch.summary = buildManualSwitchSummary()
+        }
+    }
+
     internal lateinit var loginIndicator: SwitchPreferenceCompat
     internal lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
@@ -230,7 +239,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 true
             }
         }.also(screen::addPreference)
@@ -242,18 +251,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 summary = buildManualSwitchSummary()
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
+        refreshCookieCache()
+
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
+            isChecked = isLoginKnown()
             setEnabled(false)
             loginIndicator = this
         }.also(screen::addPreference)
@@ -399,11 +411,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             if (!loginSuccessHandled) {
                                 loginSuccessHandled = true
-                                loginIndicator.isChecked = true
-                                loginIndicator.summary = buildLoginSummary()
-                                if (::manualCookieSwitch.isInitialized) {
-                                    manualCookieSwitch.summary = buildManualSwitchSummary()
-                                }
+                                syncLoginIndicator()
                                 Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -443,9 +451,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.isChecked = false
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
@@ -457,8 +463,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
@@ -839,4 +844,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
