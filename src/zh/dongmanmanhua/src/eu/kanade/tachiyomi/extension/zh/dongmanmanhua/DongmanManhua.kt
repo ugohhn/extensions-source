@@ -679,43 +679,33 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 } else {
                     Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
-                    webView.evaluateJavascript("""
-                        (function(){
-                            var el = document.getElementById('formLogin');
-                            if(!el) return '0';
-                            return String(el.offsetTop * (window.devicePixelRatio || 1));
-                        })()
-                    """.trimIndent()) { value ->
-                        val top = value?.trim('"')?.toFloatOrNull() ?: return@evaluateJavascript
-                        Log.d("DongmanIME", "收起JS回调 value=$value top=$top 当前scrollY=${webView.scrollY}")
-                        Handler(Looper.getMainLooper()).post {
-                            webView.scrollTo(0, top.toInt())
-                            Log.d("DongmanIME", "收起scrollTo后 webView.scrollY=${webView.scrollY}")
-                            webView.postDelayed({
-                                webView.evaluateJavascript("""
-                                    (function(){
-                                        var dpr = window.devicePixelRatio || 1;
-                                        var form = document.getElementById('formLogin');
-                                        if(!form) return '';
-                                        var r = form.getBoundingClientRect();
-                                        return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
-                                    })()
-                                """.trimIndent()) { v2 ->
-                                    Log.d("DongmanIME", "键盘收起后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
-                                    val raw2 = v2?.trim('"') ?: return@evaluateJavascript
-                                    val coords = raw2.substringBefore("|").split(",")
-                                    if (coords.size == 4) {
-                                        formRects.clear()
-                                        formRects.add(InputRect(
-                                            coords[0].toFloat(), coords[1].toFloat(),
-                                            coords[2].toFloat(), coords[3].toFloat()
-                                        ))
-                                        Log.d("DongmanIME", "键盘收起后formRects已更新: $formRects")
-                                        webView.updateFormRects(formRects.toList())
-                                    }
+                    Handler(Looper.getMainLooper()).post {
+                        webView.scrollTo(0, 0)
+                        Log.d("DongmanIME", "键盘收起 scrollTo(0,0) 完成")
+                        webView.postDelayed({
+                            webView.evaluateJavascript("""
+                                (function(){
+                                    var dpr = window.devicePixelRatio || 1;
+                                    var form = document.getElementById('formLogin');
+                                    if(!form) return '';
+                                    var r = form.getBoundingClientRect();
+                                    return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
+                                })()
+                            """.trimIndent()) { v2 ->
+                                Log.d("DongmanIME", "键盘收起后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
+                                val raw2 = v2?.trim('"') ?: return@evaluateJavascript
+                                val coords = raw2.substringBefore("|").split(",")
+                                if (coords.size == 4) {
+                                    formRects.clear()
+                                    formRects.add(InputRect(
+                                        coords[0].toFloat(), coords[1].toFloat(),
+                                        coords[2].toFloat(), coords[3].toFloat()
+                                    ))
+                                    Log.d("DongmanIME", "键盘收起后formRects已更新: $formRects")
+                                    webView.updateFormRects(formRects.toList())
                                 }
-                            }, 200)
-                        }
+                            }
+                        }, 200)
                     }
                 }
             }
@@ -1314,4 +1304,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
