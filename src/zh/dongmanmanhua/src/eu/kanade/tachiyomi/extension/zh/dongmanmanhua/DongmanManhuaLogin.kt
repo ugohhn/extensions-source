@@ -117,7 +117,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         )
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
-        settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
+        settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: DongmanManhua.UA_MOBILE
         CookieManager.getInstance().setAcceptCookie(true)
         isFocusable = true
         isFocusableInTouchMode = true
@@ -159,7 +159,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                 coords[2].toFloat(), coords[3].toFloat()
                             ))
                             Log.d("DongmanIME", "初始 formRects 已缓存: $formRects")
-                            webView.updateFormRects(formRects.toList())
+                            (view as LoginWebView).updateFormRects(formRects.toList())
                         }
                     }
                 }, 500)
@@ -207,8 +207,8 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                 if (!loginSuccessHandled && neoSes.isNotEmpty()) {
                     loginSuccessHandled = true
                     preferences.edit()
-                        .putString(KEY_NEO_SES, neoSes)
-                        .putString(KEY_NEO_CHK, neoChk)
+                        .putString(DongmanManhua.KEY_NEO_SES, neoSes)
+                        .putString(DongmanManhua.KEY_NEO_CHK, neoChk)
                         .apply()
                     if (useIndependentStorage()) {
                         saveCookieToFile(neoSes, neoChk)
@@ -221,9 +221,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                     Handler(Looper.getMainLooper()).post {
                         loginIndicator.isChecked = true
                         loginIndicator.summary = buildLoginSummary()
-                        if (::manualCookieSwitch.isInitialized) {
-                            manualCookieSwitch.summary = buildManualSwitchSummary()
-                        }
+                        try { manualCookieSwitch.summary = buildManualSwitchSummary() } catch (_: UninitializedPropertyAccessException) {}
                         Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
                         dialog?.dismiss()
                     }
