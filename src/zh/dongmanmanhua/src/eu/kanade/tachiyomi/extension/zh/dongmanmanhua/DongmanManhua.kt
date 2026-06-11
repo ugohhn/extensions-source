@@ -45,6 +45,9 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
+// 表单坐标数据类，提升为顶层类以避免可见性问题
+data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
     init {
@@ -64,6 +67,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val preferences by getPreferencesLazy()
     private val appContext by lazy { Injekt.get<android.app.Application>() }
     private var dialogContext: Context? = null
+    private var isLoginDialogShowing = false
+    private var loginSuccessHandled = false
 
     // ---------- 独立存储 ----------
     private fun getCookieDir(): File = File(appContext.filesDir, "dongmanmanhua").apply { mkdirs() }
@@ -372,10 +377,70 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（最终版：坐标缓存 + JS 拦截 + 日志输出）
+    // 自定义 WebView，重写 dispatchTouchEvent 捕获 ACTION_DOWN
+    // ══════════════════════════════════════════════════════════════════════
+
+    inner class LoginWebView(context: Context) : WebView(context) {
+        private var extIsKeyboardVisible: Boolean = false
+        private var extFormRects: List<InputRect> = emptyList()
+        private var swallowingCurrentSequence = false
+
+        fun updateKeyboardVisible(visible: Boolean) {
+            extIsKeyboardVisible = visible
+        }
+
+        fun updateFormRects(rects: List<InputRect>) {
+            extFormRects = rects
+        }
+
+        override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "dispatchTouchEvent action=${event.action} x=${event.x} y=${event.y}")
+            return super.dispatchTouchEvent(event)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    val x = event.x
+                    val y = event.y
+                    // 实时查询键盘是否显示，不依赖延迟更新的extIsKeyboardVisible
+                    val imm = context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    val keyboardActuallyVisible = imm.isAcceptingText
+                    Log.d("DongmanIME", "ACTION_DOWN keyboardActuallyVisible=$keyboardActuallyVisible extIsKeyboardVisible=$extIsKeyboardVisible formRects=$extFormRects")
+                    if (keyboardActuallyVisible && extFormRects.isNotEmpty()) {
+                        val inForm = extFormRects.any { rect ->
+                            x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                        }
+                        Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
+                        if (!inForm) {
+                            Log.d("DongmanIME", "键盘弹出时点击在表单外，吞掉整个序列")
+                            swallowingCurrentSequence = true
+                            return true
+                        }
+                    } else {
+                        Log.d("DongmanIME", "键盘未显示或formRects为空，放行所有点击")
+                    }
+                    swallowingCurrentSequence = false
+                }
+                MotionEvent.ACTION_MOVE,
+                MotionEvent.ACTION_UP -> {
+                    if (swallowingCurrentSequence) return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    swallowingCurrentSequence = false
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // WebView 登录对话框（使用自定义 LoginWebView）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
+        if (isLoginDialogShowing) return
         val actCtx = dialogContext
         if (actCtx == null) {
             Toast.makeText(appContext, "无法显示登录窗口：上下文丢失", Toast.LENGTH_SHORT).show()
@@ -385,13 +450,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
             return
         }
+        isLoginDialogShowing = true
+        loginSuccessHandled = false
 
         var dialog: AlertDialog? = null
         var isKeyboardVisible = false
-        data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+        var lastLayoutTime = 0L
         val formRects = mutableListOf<InputRect>()
 
-        val webView = WebView(actCtx).apply {
+        // 用于轮询验证码的 Handler 和 Runnable
+        var captchaPollHandler: Handler? = null
+        var captchaPollRunnable: Runnable? = null
+
+        val webView = LoginWebView(actCtx).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -401,68 +472,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             settings.userAgentString = currentUserAgent().takeIf { it.isNotEmpty() } ?: UA_MOBILE
             CookieManager.getInstance().setAcceptCookie(true)
 
-            // 添加 WebChromeClient 输出 JS 日志
-            webChromeClient = object : android.webkit.WebChromeClient() {
-                override fun onConsoleMessage(msg: android.webkit.ConsoleMessage): Boolean {
-                    Log.d("DongmanIME", "JS: ${msg.message()}")
-                    return true
-                }
-            }
-
             isFocusable = true
             isFocusableInTouchMode = true
 
-            setOnTouchListener { v, event ->
-                if (!v.hasFocus()) v.requestFocus()
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    val x = event.x
-                    val y = event.y + scrollY
-                    Log.d("DongmanIME", "触摸 x=$x y=$y scrollY=$scrollY formRects=$formRects")
-                    if (formRects.isNotEmpty()) {
-                        val inForm = formRects.any { x >= it.left && x <= it.right && y >= it.top && y <= it.bottom }
-                        Log.d("DongmanIME", "inForm=$inForm rect=${formRects.firstOrNull()}")
-                        if (!inForm) {
-                            Log.d("DongmanIME", "表单外吞掉")
-                            return@setOnTouchListener true
-                        }
-                    } else {
-                        Log.d("DongmanIME", "formRects为空，放行")
-                    }
-                }
-                false
-            }
-
             webViewClient = object : WebViewClient() {
                 override fun onPageCommitVisible(view: WebView?, url: String?) {
-                    // 注入 JS：阻止 formLogin 内部空白区域导致失焦，并输出日志
+                    // 原有表单样式调整
                     view?.evaluateJavascript("""
                         (function(){
                             var form = document.getElementById('formLogin');
-                            if(!form) { console.log('DongmanIME: formLogin未找到'); return; }
-                            form.addEventListener('mousedown', function(e) {
-                                console.log('DongmanIME mousedown target=' + e.target.tagName + ' id=' + e.target.id);
-                                if(e.target.tagName !== 'INPUT' && 
-                                   e.target.tagName !== 'BUTTON' &&
-                                   e.target.tagName !== 'A' &&
-                                   !e.target.closest('button') &&
-                                   !e.target.closest('a') &&
-                                   !e.target.closest('label')) {
-                                    e.preventDefault();
-                                    console.log('DongmanIME: preventDefault执行');
-                                }
-                            }, true);
-                            console.log('DongmanIME: mousedown监听已注入');
-                            
-                            var content = document.getElementById('content');
-                            if(content) content.style.display = 'none';
-                            var remainHeight = document.documentElement.clientHeight - form.offsetTop;
-                            form.style.minHeight = remainHeight + 'px';
-                            form.style.boxSizing = 'border-box';
-                            form.style.paddingTop = '16px';
+                            if(form) {
+                                form.style.minHeight = '100vh';
+                                form.style.boxSizing = 'border-box';
+                                form.style.paddingTop = '16px';
+                            }
                         })();
                     """.trimIndent(), null)
 
-                    // 延迟缓存表单坐标，底部使用 window.innerHeight * dpr
+                    // 延迟缓存表单坐标（原有逻辑）
                     view?.postDelayed({
                         view.evaluateJavascript("""
                             (function(){
@@ -470,15 +497,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 var form = document.getElementById('formLogin');
                                 if(!form) return '';
                                 var r = form.getBoundingClientRect();
-                                var scrollY = window.scrollY;
-                                var formLeft = 0;
-                                var formTop = (r.top + scrollY) * dpr;
-                                var formRight = r.right * dpr;
-                                var screenBottom = window.innerHeight * dpr;
-                                return '0,' + formTop + ',' + formRight + ',' + screenBottom;
+                                return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|dpr='+dpr+'|scrollY='+window.scrollY;
                             })()
                         """.trimIndent()) { value ->
-                            val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                            Log.d("DongmanIME", "formRects JS原始返回: $value webView.scrollY=${view.scrollY}")
+                            val raw = value?.trim('"') ?: return@evaluateJavascript
+                            val coordPart = raw.substringBefore("|")
+                            val parts = coordPart.split(",")
                             if (parts.size == 4) {
                                 formRects.clear()
                                 formRects.add(InputRect(
@@ -487,10 +512,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                     parts[2].toFloat(),
                                     parts[3].toFloat()
                                 ))
-                                Log.d("DongmanIME", "缓存表单坐标(innerHeight): $formRects")
+                                Log.d("DongmanIME", "缓存表单坐标: $formRects (来自: $raw)")
+                                // 更新自定义 WebView 中的表单区域数据
+                                updateFormRects(formRects.toList())
                             }
                         }
-                    }, 800)
+                    }, 500)
+
+                    // ========== 验证码探测：每秒轮询所有疑似元素 ==========
+                    val handler = Handler(Looper.getMainLooper())
+                    val runnable = object : Runnable {
+                        override fun run() {
+                            view?.evaluateJavascript("""
+                                (function(){
+                                    var all = document.querySelectorAll('[class*="verify"],[class*="captcha"],[class*="slider"],[class*="click"],[class*="geetest"]');
+                                    var result = [];
+                                    Array.prototype.forEach.call(all, function(el) {
+                                        var r = el.getBoundingClientRect();
+                                        var style = getComputedStyle(el);
+                                        result.push({
+                                            tag: el.tagName,
+                                            cls: el.className,
+                                            top: r.top,
+                                            bottom: r.bottom,
+                                            left: r.left,
+                                            right: r.right,
+                                            w: r.width,
+                                            h: r.height,
+                                            display: style.display,
+                                            visibility: style.visibility
+                                        });
+                                    });
+                                    return JSON.stringify(result);
+                                })();
+                            """.trimIndent()) { result ->
+                                Log.d("DongmanIME", "【验证码相关元素】$result")
+                            }
+                            handler.postDelayed(this, 1000)
+                        }
+                    }
+                    captchaPollHandler = handler
+                    captchaPollRunnable = runnable
+                    handler.postDelayed(runnable, 1000)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -498,7 +561,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     Log.d("DongmanCookie", "WebView 对话框登录后 CookieManager: $cookieStr")
                     val neoSes = extractCookieValue(cookieStr, "NEO_SES")
                     val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                    if (neoSes.isNotEmpty()) {
+                    if (!loginSuccessHandled && neoSes.isNotEmpty()) {
+                        loginSuccessHandled = true
                         preferences.edit()
                             .putString(KEY_NEO_SES, neoSes)
                             .putString(KEY_NEO_CHK, neoChk)
@@ -549,33 +613,125 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rootView = dialog.window?.decorView ?: return
         val listener = object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
+                val now = System.currentTimeMillis()
+                if (now - lastLayoutTime < 100) return
+                lastLayoutTime = now
+
                 val rect = android.graphics.Rect()
                 rootView.getWindowVisibleDisplayFrame(rect)
-                val keyboardNowVisible = rect.bottom < webView.height - 150
+                var keyboardHeight = rootView.height - rect.bottom
+                if (keyboardHeight < 0) return
+
+                val keyboardNowVisible = keyboardHeight > 150
+
+                Log.d("DongmanIME", "onGlobalLayout t=${System.currentTimeMillis()} rootHeight=${rootView.height} rectBottom=${rect.bottom} keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
 
                 if (keyboardNowVisible == isKeyboardVisible) return
+                Log.d("DongmanIME", "★ 状态切换: $isKeyboardVisible -> $keyboardNowVisible (keyboardHeight=$keyboardHeight)")
                 isKeyboardVisible = keyboardNowVisible
+                // 更新自定义 WebView 中的键盘状态
+                webView.updateKeyboardVisible(isKeyboardVisible)
 
                 if (keyboardNowVisible) {
-                    webView.evaluateJavascript(
-                        "document.getElementById('formLogin')?.scrollIntoView({behavior:'instant', block:'start'});",
-                        null
-                    )
+                    val visibleBottom = rect.bottom
+                    Log.d("DongmanIME", "键盘弹出 visibleBottom=$visibleBottom webView.scrollY=${webView.scrollY} webView.height=${webView.height}")
+
+                    webView.evaluateJavascript("""
+                        (function(){
+                            var el = document.getElementById('formLogin');
+                            if(!el) return 'NO_ELEMENT';
+                            var dpr = window.devicePixelRatio || 1;
+                            var top = el.offsetTop * dpr;
+                            var bottom = (el.offsetTop + el.offsetHeight) * dpr;
+                            return top + ',' + bottom;
+                        })()
+                    """.trimIndent()) { value ->
+                        Log.d("DongmanIME", "JS回调 value=$value")
+                        val parts = value?.trim('"')?.split(",") ?: return@evaluateJavascript
+                        val top = parts[0].toFloatOrNull() ?: return@evaluateJavascript
+                        val bottom = parts[1].toFloatOrNull() ?: return@evaluateJavascript
+                        val targetScrollY = top.toInt()
+                        Log.d("DongmanIME", "DPR修正后 top=$top bottom=$bottom targetScrollY=$targetScrollY 当前scrollY=${webView.scrollY}")
+                        Handler(Looper.getMainLooper()).post {
+                            webView.scrollTo(0, targetScrollY)
+                            Log.d("DongmanIME", "scrollTo后 webView.scrollY=${webView.scrollY}")
+                            webView.postDelayed({
+                                webView.evaluateJavascript("""
+                                    (function(){
+                                        var dpr = window.devicePixelRatio || 1;
+                                        var form = document.getElementById('formLogin');
+                                        if(!form) return '';
+                                        var r = form.getBoundingClientRect();
+                                        return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
+                                    })()
+                                """.trimIndent()) { v2 ->
+                                    Log.d("DongmanIME", "键盘弹出后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
+                                    val raw2 = v2?.trim('"') ?: return@evaluateJavascript
+                                    val coords = raw2.substringBefore("|").split(",")
+                                    if (coords.size == 4) {
+                                        formRects.clear()
+                                        formRects.add(InputRect(
+                                            coords[0].toFloat(), coords[1].toFloat(),
+                                            coords[2].toFloat(), coords[3].toFloat()
+                                        ))
+                                        Log.d("DongmanIME", "键盘弹出后formRects已更新: $formRects")
+                                        webView.updateFormRects(formRects.toList())
+                                    }
+                                }
+                            }, 200)
+                        }
+                    }
                 } else {
-                    Log.d("DongmanIME", "键盘收起，不做滚动")
+                    Log.d("DongmanIME", "键盘收起 webView.scrollY=${webView.scrollY}")
+                    Handler(Looper.getMainLooper()).post {
+                        webView.scrollTo(0, 0)
+                        Log.d("DongmanIME", "键盘收起 scrollTo(0,0) 完成")
+                        webView.postDelayed({
+                            webView.evaluateJavascript("""
+                                (function(){
+                                    var dpr = window.devicePixelRatio || 1;
+                                    var form = document.getElementById('formLogin');
+                                    if(!form) return '';
+                                    var r = form.getBoundingClientRect();
+                                    return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|scrollY='+window.scrollY;
+                                })()
+                            """.trimIndent()) { v2 ->
+                                Log.d("DongmanIME", "键盘收起后重新缓存formRects JS返回: $v2 webView.scrollY=${webView.scrollY}")
+                                val raw2 = v2?.trim('"') ?: return@evaluateJavascript
+                                val coords = raw2.substringBefore("|").split(",")
+                                if (coords.size == 4) {
+                                    formRects.clear()
+                                    formRects.add(InputRect(
+                                        coords[0].toFloat(), coords[1].toFloat(),
+                                        coords[2].toFloat(), coords[3].toFloat()
+                                    ))
+                                    Log.d("DongmanIME", "键盘收起后formRects已更新: $formRects")
+                                    webView.updateFormRects(formRects.toList())
+                                }
+                            }
+                        }, 200)
+                    }
                 }
             }
         }
         rootView.viewTreeObserver.addOnGlobalLayoutListener(listener)
 
         dialog.setOnDismissListener {
+            isLoginDialogShowing = false
+            loginSuccessHandled = false
             rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            // 停止轮询
+            captchaPollHandler?.let { handler ->
+                captchaPollRunnable?.let { runnable ->
+                    handler.removeCallbacks(runnable)
+                }
+            }
             webView.destroy()
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 密码登录
+    // 密码登录及其他业务函数（保持不变）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun loginWithPassword(username: String, password: String) {
@@ -603,23 +759,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val loginJson = JSONObject(loginResp.body.string())
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
-                    val setCookie = loginResp.header("Set-Cookie") ?: ""
-                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $setCookie")
-                    val neoSes = extractCookieValue(setCookie, "NEO_SES")
-                    val neoChk = extractCookieValue(setCookie, "NEO_CHK")
+                    val allSetCookies = loginResp.headers.values("Set-Cookie").joinToString("; ")
+                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $allSetCookies")
+                    val neoSes = extractCookieValue(allSetCookies, "NEO_SES")
+                    val neoChk = extractCookieValue(allSetCookies, "NEO_CHK")
                     if (neoSes.isNotEmpty()) {
                         saveLoginCookie(neoSes, neoChk)
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
                         saveCookieToFile(neoSes, neoChk)
                         refreshCookieCache()
-                    }
-                    Handler(Looper.getMainLooper()).post {
-                        loginIndicator.isChecked = true
-                        loginIndicator.summary = buildLoginSummary()
-                        if (::manualCookieSwitch.isInitialized) {
-                            manualCookieSwitch.summary = buildManualSwitchSummary()
+                        Handler(Looper.getMainLooper()).post {
+                            if (!loginSuccessHandled) {
+                                loginSuccessHandled = true
+                                loginIndicator.isChecked = true
+                                loginIndicator.summary = buildLoginSummary()
+                                if (::manualCookieSwitch.isInitialized) {
+                                    manualCookieSwitch.summary = buildManualSwitchSummary()
+                                }
+                                Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            }
                         }
-                        Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Handler(Looper.getMainLooper()).post {
+                            Toast.makeText(appContext, "登录失败：未获取到登录凭证", Toast.LENGTH_LONG).show()
+                        }
                     }
                 } else {
                     val msg = loginJson.optString("loginMessage", "登录失败")
@@ -964,7 +1127,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     // ══════════════════════════════════════════════════════════════════════
-    // 阅读页面 & 自动解锁（原始抛异常行为）
+    // 阅读页面 & 自动解锁
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
