@@ -109,6 +109,36 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
 
     var captchaPollHandler: Handler? = null
     var captchaPollRunnable: Runnable? = null
+    var loginPollHandler: Handler? = null
+    var loginPollRunnable: Runnable? = null
+
+    fun handleLoginSuccess(cookieStr: String): Boolean {
+        val neoSes = extractCookieValue(cookieStr, "NEO_SES")
+        val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
+        if (loginSuccessHandled || neoSes.isEmpty()) return false
+
+        loginSuccessHandled = true
+        preferences.edit()
+            .putString(DongmanManhua.KEY_NEO_SES, neoSes)
+            .putString(DongmanManhua.KEY_NEO_CHK, neoChk)
+            .apply()
+
+        if (useIndependentStorage()) {
+            saveCookieToFile(neoSes, neoChk)
+        } else {
+            cachedCookie = buildCookieString(neoSes, neoChk)
+            lastIndependentState = useIndependentStorage()
+        }
+        saveCookieToFile(neoSes, neoChk)
+        refreshCookieCache()
+
+        Handler(Looper.getMainLooper()).post {
+            syncLoginIndicator()
+            Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
+            dialog?.dismiss()
+        }
+        return true
+    }
 
     val webView = LoginWebView(actCtx, getDialog = { dialog }).apply {
         layoutParams = ViewGroup.LayoutParams(
@@ -202,30 +232,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
                 Log.d("DongmanCookie", "WebView 登录后 CookieManager: $cookieStr")
-                val neoSes = extractCookieValue(cookieStr, "NEO_SES")
-                val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-                if (!loginSuccessHandled && neoSes.isNotEmpty()) {
-                    loginSuccessHandled = true
-                    preferences.edit()
-                        .putString(DongmanManhua.KEY_NEO_SES, neoSes)
-                        .putString(DongmanManhua.KEY_NEO_CHK, neoChk)
-                        .apply()
-                    if (useIndependentStorage()) {
-                        saveCookieToFile(neoSes, neoChk)
-                    } else {
-                        cachedCookie = buildCookieString(neoSes, neoChk)
-                        lastIndependentState = useIndependentStorage()
-                    }
-                    saveCookieToFile(neoSes, neoChk)
-                    refreshCookieCache()
-                    Handler(Looper.getMainLooper()).post {
-                        loginIndicator.isChecked = true
-                        loginIndicator.summary = buildLoginSummary()
-                        try { manualCookieSwitch.summary = buildManualSwitchSummary() } catch (_: UninitializedPropertyAccessException) {}
-                        Toast.makeText(actCtx, "登录成功", Toast.LENGTH_SHORT).show()
-                        dialog?.dismiss()
-                    }
-                }
+                handleLoginSuccess(cookieStr)
             }
         }
         loadUrl("$baseUrl/member/login")
@@ -236,6 +243,18 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         .create()
 
     dialog.show()
+
+    loginPollHandler = Handler(Looper.getMainLooper())
+    loginPollRunnable = object : Runnable {
+        override fun run() {
+            val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
+            Log.d("DongmanCookie", "WebView 登录轮询 CookieManager: $cookieStr")
+            if (!handleLoginSuccess(cookieStr)) {
+                loginPollHandler?.postDelayed(this, 800)
+            }
+        }
+    }
+    loginPollHandler?.postDelayed(loginPollRunnable!!, 800)
 
     dialog.window?.apply {
         clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
@@ -347,7 +366,8 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         isLoginDialogShowing = false
         loginSuccessHandled = false
         rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
-        captchaPollHandler?.removeCallbacks(captchaPollRunnable ?: return@setOnDismissListener)
+        captchaPollRunnable?.let { captchaPollHandler?.removeCallbacks(it) }
+        loginPollRunnable?.let { loginPollHandler?.removeCallbacks(it) }
         webView.destroy()
     }
 }
