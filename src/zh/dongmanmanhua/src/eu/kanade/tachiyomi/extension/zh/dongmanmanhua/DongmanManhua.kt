@@ -45,7 +45,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
-// 表单坐标数据类，提升为顶层类以避免可见性问题
+// 表单坐标数据类
 data class InputRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
@@ -257,7 +257,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        // 登录状态指示灯（仅显示，不可点击）
+        // 登录状态指示灯
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
@@ -267,7 +267,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator = this
         }.also(screen::addPreference)
 
-        // WebView 登录触发器（拨动开关弹出对话框，自动弹回）
+        // WebView 登录触发器
         SwitchPreferenceCompat(ctx).apply {
             key = "webview_login_trigger"
             title = "WebView 登录"
@@ -377,7 +377,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 自定义 WebView，重写 dispatchTouchEvent 捕获 ACTION_DOWN
+    // 自定义 WebView（保留原有 dispatchTouchEvent 逻辑）
     // ══════════════════════════════════════════════════════════════════════
 
     inner class LoginWebView(context: Context) : WebView(context) {
@@ -393,10 +393,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "dispatchTouchEvent action=${event.action} x=${event.x} y=${event.y}")
+            return super.dispatchTouchEvent(event)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
             if (event.action == MotionEvent.ACTION_DOWN) {
                 val x = event.x
                 val y = event.y
-                Log.d("DongmanIME", "dispatchTouchEvent DOWN x=$x y=$y isKeyboardVisible=$extIsKeyboardVisible formRects=$extFormRects")
                 if (extIsKeyboardVisible && extFormRects.isNotEmpty()) {
                     val inForm = extFormRects.any { rect ->
                         x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
@@ -409,20 +414,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 } else {
                     Log.d("DongmanIME", "键盘未弹出或formRects为空，放行所有点击")
                 }
-            } else {
-                Log.d("DongmanIME", "dispatchTouchEvent action=${event.action}")
             }
-            return super.dispatchTouchEvent(event)
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            Log.d("DongmanIME", "onTouchEvent action=${event.action}")
             return super.onTouchEvent(event)
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // WebView 登录对话框（使用自定义 LoginWebView）
+    // WebView 登录对话框（修正验证码位置）
     // ══════════════════════════════════════════════════════════════════════
 
     private fun showWebViewLoginDialog() {
@@ -505,7 +503,42 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         }
                     }, 500)
 
-                    // ========== 验证码探测：每秒轮询所有疑似元素 ==========
+                    // ========== 验证码探测与位置修正（核心修复） ==========
+                    // 注入一个持续运行的 MutationObserver，自动修正验证码浮层位置
+                    view?.evaluateJavascript("""
+                        (function() {
+                            // 修正验证码弹窗的位置，确保其完全在 WebView 可视范围内
+                            function fixCaptchaPosition() {
+                                // 匹配咚漫常用的验证码容器类名
+                                var captchaContainer = document.querySelector('.verifybox, [class*="verify"][class*="box"], .geetest_panel, .captcha_popup, #captcha');
+                                if (captchaContainer) {
+                                    var rect = captchaContainer.getBoundingClientRect();
+                                    var changed = false;
+                                    if (rect.left < 0) {
+                                        captchaContainer.style.left = '0px';
+                                        changed = true;
+                                    }
+                                    if (rect.right > window.innerWidth) {
+                                        captchaContainer.style.right = '0px';
+                                        captchaContainer.style.left = 'auto';
+                                        changed = true;
+                                    }
+                                    if (changed) {
+                                        console.log('验证码弹窗位置已修正，原 left=' + rect.left);
+                                    }
+                                }
+                            }
+                            // 立即执行一次
+                            fixCaptchaPosition();
+                            // 监听 DOM 变化，动态捕获新出现的验证码浮层
+                            var observer = new MutationObserver(function(mutations) {
+                                fixCaptchaPosition();
+                            });
+                            observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+                        })();
+                    """.trimIndent(), null)
+
+                    // 原有轮询（仅打印日志，保留用于调试）
                     val handler = Handler(Looper.getMainLooper())
                     val runnable = object : Runnable {
                         override fun run() {
@@ -615,7 +648,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (keyboardNowVisible == isKeyboardVisible) return
                 Log.d("DongmanIME", "★ 状态切换: $isKeyboardVisible -> $keyboardNowVisible (keyboardHeight=$keyboardHeight)")
                 isKeyboardVisible = keyboardNowVisible
-                // 更新自定义 WebView 中的键盘状态
                 webView.updateKeyboardVisible(isKeyboardVisible)
 
                 if (keyboardNowVisible) {
@@ -919,7 +951,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 最新更新（Latest）
+    // 最新更新
     // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headers)
@@ -945,7 +977,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 搜索（支持混合模式）
+    // 搜索
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
@@ -1304,4 +1336,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
