@@ -10,6 +10,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -46,12 +47,9 @@ private fun updateEyeButtonIcon(
     button: ImageButton,
     passwordVisible: Boolean,
 ) {
-    val iconName = if (passwordVisible) "eye_open" else "eye_hide"
-    val iconResId = ctx.resources.getIdentifier(iconName, "drawable", ctx.packageName)
-
-    if (iconResId != 0) {
-        button.setImageResource(iconResId)
-    }
+    button.setImageResource(
+        if (passwordVisible) R.drawable.eye_open else R.drawable.eye_hide,
+    )
 
     button.imageTintList = ColorStateList.valueOf(
         if (isNightMode(ctx)) Color.WHITE else Color.DKGRAY,
@@ -107,7 +105,6 @@ private fun showDualInputDialog(
 
     val eyeButton = ImageButton(ctx).apply {
         setBackgroundColor(Color.TRANSPARENT)
-        layoutParams = LinearLayout.LayoutParams(dp40, dp40)
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp8, dp8, dp8, dp8)
 
@@ -128,14 +125,20 @@ private fun showDualInputDialog(
         }
     }
 
-    val passwordRow = LinearLayout(ctx).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
+    val passwordRow = FrameLayout(ctx).apply {
         addView(
-            editPassword,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+            editPassword.apply {
+                setPadding(paddingLeft, paddingTop, dp40, paddingBottom)
+            },
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
         )
-        addView(eyeButton)
+        addView(
+            eyeButton,
+            FrameLayout.LayoutParams(dp40, dp40, Gravity.END or Gravity.CENTER_VERTICAL),
+        )
     }
 
     container.addView(labelUsername)
