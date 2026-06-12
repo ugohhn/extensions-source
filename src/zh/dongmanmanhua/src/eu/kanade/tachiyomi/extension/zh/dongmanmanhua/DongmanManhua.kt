@@ -152,7 +152,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!valid) {
                 clearManualBackup()
                 refreshCookieCache()
-                syncLoginIndicator()
+                loginIndicator.summary = buildLoginSummary()
+                if (::manualCookieSwitch.isInitialized) {
+                    manualCookieSwitch.summary = buildManualSwitchSummary()
+                }
             }
             valid
         } catch (_: Exception) {
@@ -201,18 +204,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
-    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
-
-    internal fun syncLoginIndicator() {
-        if (::loginIndicator.isInitialized) {
-            loginIndicator.isChecked = isLoginKnown()
-            loginIndicator.summary = buildLoginSummary()
-        }
-        if (::manualCookieSwitch.isInitialized) {
-            manualCookieSwitch.summary = buildManualSwitchSummary()
-        }
-    }
-
     internal lateinit var loginIndicator: SwitchPreferenceCompat
     internal lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
@@ -239,7 +230,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                syncLoginIndicator()
+                loginIndicator.summary = buildLoginSummary()
                 true
             }
         }.also(screen::addPreference)
@@ -251,21 +242,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                syncLoginIndicator()
+                loginIndicator.summary = buildLoginSummary()
                 summary = buildManualSwitchSummary()
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        refreshCookieCache()
-
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
-            isChecked = isLoginKnown()
             setEnabled(false)
             loginIndicator = this
         }.also(screen::addPreference)
@@ -285,32 +273,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        EditTextPreference(ctx).apply {
-            key = PREF_LOGIN_USERNAME
-            title = "账号（手机号或邮箱）"
-            summary = "用于密码登录，需先填账号再填密码"
-            dialogTitle = "输入账号"
-            setDefaultValue("")
-        }.also(screen::addPreference)
-
-        EditTextPreference(ctx).apply {
-            key = PREF_LOGIN_PASSWORD
-            title = "密码"
-            summary = "输入密码点确定后立即尝试 RSA 登录"
-            dialogTitle = "输入密码"
-            setDefaultValue("")
-            setOnPreferenceChangeListener { _, newValue ->
-                val password = newValue as? String ?: ""
-                if (password.isNotBlank()) {
-                    val username = preferences.getString(PREF_LOGIN_USERNAME, "").orEmpty()
-                    if (username.isBlank()) {
-                        Toast.makeText(ctx, "请先填写账号", Toast.LENGTH_SHORT).show()
-                    } else {
-                        loginWithPassword(username, password)
-                    }
+        DualInputPreference(ctx).apply {
+            key = PREF_LOGIN_DUAL
+            title = "账号密码登录"
+            summary = "点击输入账号和密码，确定后立即尝试登录"
+            onCredentialsConfirmed = { username, password ->
+                if (username.isBlank()) {
+                    Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
+                } else if (password.isBlank()) {
+                    Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
+                } else {
+                    loginWithPassword(username, password)
                 }
-                preferences.edit().remove(PREF_LOGIN_PASSWORD).apply()
-                false
             }
         }.also(screen::addPreference)
 
@@ -411,7 +385,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             if (!loginSuccessHandled) {
                                 loginSuccessHandled = true
-                                syncLoginIndicator()
+                                loginIndicator.isChecked = true
+                                loginIndicator.summary = buildLoginSummary()
+                                if (::manualCookieSwitch.isInitialized) {
+                                    manualCookieSwitch.summary = buildManualSwitchSummary()
+                                }
                                 Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -451,7 +429,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        syncLoginIndicator()
+        loginIndicator.isChecked = false
+        loginIndicator.summary = buildLoginSummary()
+        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
@@ -463,7 +443,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        syncLoginIndicator()
+        loginIndicator.summary = buildLoginSummary()
+        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
@@ -830,8 +811,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_UA_CUSTOM_FLAG = "__custom__"
         internal const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
         internal const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
-        internal const val PREF_LOGIN_USERNAME = "pref_login_username"
-        internal const val PREF_LOGIN_PASSWORD = "pref_login_password"
+        internal const val PREF_LOGIN_DUAL = "pref_login_dual"
         internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
@@ -844,4 +824,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
