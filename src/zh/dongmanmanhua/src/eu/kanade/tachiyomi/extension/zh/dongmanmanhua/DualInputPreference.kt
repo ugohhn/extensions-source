@@ -100,11 +100,15 @@ private fun showDualInputDialog(
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         maxLines = 1
         setText(savedPassword)
+        setPadding(paddingLeft, paddingTop, dp40, paddingBottom)
         if (savedPassword.isNotEmpty()) setSelection(savedPassword.length)
     }
 
     val eyeButton = ImageButton(ctx).apply {
         setBackgroundColor(Color.TRANSPARENT)
+        layoutParams = FrameLayout.LayoutParams(dp40, dp40).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        }
         scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp8, dp8, dp8, dp8)
 
@@ -120,6 +124,7 @@ private fun showDualInputDialog(
                 InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
             editPassword.setSelection(cursorPos.coerceAtLeast(0))
+            editPassword.setPadding(editPassword.paddingLeft, editPassword.paddingTop, dp40, editPassword.paddingBottom)
 
             updateEyeButtonIcon(ctx, this, passwordVisible)
         }
@@ -127,18 +132,13 @@ private fun showDualInputDialog(
 
     val passwordRow = FrameLayout(ctx).apply {
         addView(
-            editPassword.apply {
-                setPadding(paddingLeft, paddingTop, dp40, paddingBottom)
-            },
+            editPassword,
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ),
         )
-        addView(
-            eyeButton,
-            FrameLayout.LayoutParams(dp40, dp40, Gravity.END or Gravity.CENTER_VERTICAL),
-        )
+        addView(eyeButton)
     }
 
     container.addView(labelUsername)
