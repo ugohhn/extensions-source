@@ -285,7 +285,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        addDualInputPreference(screen) { username, password ->
+        addDualInputPreference(screen, this) { username, password ->
             when {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
