@@ -3,10 +3,14 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 import android.app.AlertDialog
 import android.content.Context
 import android.content.DialogInterface
+import android.text.InputType
+import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ImageButton
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import android.widget.Toast
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -36,6 +40,7 @@ private fun showDualInputDialog(
 ) {
     val dp8 = (8 * ctx.resources.displayMetrics.density).toInt()
     val dp16 = dp8 * 2
+    val dp40 = (40 * ctx.resources.displayMetrics.density).toInt()
 
     val container = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
@@ -46,34 +51,66 @@ private fun showDualInputDialog(
         )
     }
 
-    // 读取上次登录成功后保存的账号密码
     val savedUsername = source.preferences.getString(DongmanManhua.PREF_LOGIN_USERNAME, "").orEmpty()
     val savedPassword = source.preferences.getString(DongmanManhua.PREF_LOGIN_PASSWORD, "").orEmpty()
 
+    // 账号行
     val labelUsername = TextView(ctx).apply { text = "账号（手机号或邮箱）" }
     val editUsername = EditText(ctx).apply {
         hint = "请输入账号"
-        inputType = android.text.InputType.TYPE_CLASS_TEXT or
-            android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
         maxLines = 1
         setText(savedUsername)
     }
+
+    // 密码行标签
     val labelPassword = TextView(ctx).apply {
         text = "密码"
         setPadding(0, dp8, 0, 0)
     }
+
+    // 密码输入框 + 眼睛按钮横排
+    var passwordVisible = false
     val editPassword = EditText(ctx).apply {
         hint = "请输入密码"
-        inputType = android.text.InputType.TYPE_CLASS_TEXT or
-            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         maxLines = 1
         setText(savedPassword)
+        // 光标移到末尾
+        if (savedPassword.isNotEmpty()) setSelection(savedPassword.length)
+    }
+    val eyeButton = ImageButton(ctx).apply {
+        setImageDrawable(ContextCompat.getDrawable(ctx, R.drawable.ic_eye_open))
+        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        layoutParams = LinearLayout.LayoutParams(dp40, dp40)
+        setOnClickListener {
+            passwordVisible = !passwordVisible
+            val cursorPos = editPassword.selectionEnd
+            editPassword.inputType = if (passwordVisible) {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            } else {
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            editPassword.setSelection(cursorPos.coerceAtLeast(0))
+            setImageDrawable(
+                ContextCompat.getDrawable(
+                    ctx,
+                    if (passwordVisible) R.drawable.ic_eye_closed else R.drawable.ic_eye_open,
+                ),
+            )
+        }
+    }
+    val passwordRow = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        addView(editPassword, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(eyeButton)
     }
 
     container.addView(labelUsername)
     container.addView(editUsername)
     container.addView(labelPassword)
-    container.addView(editPassword)
+    container.addView(passwordRow)
 
     AlertDialog.Builder(ctx)
         .setTitle("账号密码登录")
@@ -85,14 +122,11 @@ private fun showDualInputDialog(
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
                 else -> {
-                    // 已登录且账号密码与上次一致，跳过重复登录
                     val alreadyLoggedIn = source.cachedCookie?.isNotEmpty() == true
                     if (alreadyLoggedIn && username == savedUsername && password == savedPassword) {
                         Toast.makeText(ctx, "已登录，无需重复操作", Toast.LENGTH_SHORT).show()
                         return@setPositiveButton
                     }
-
-                    // 登录成功后由 loginWithPassword 回调负责保存账号密码
                     onConfirmed(username, password)
                 }
             }
