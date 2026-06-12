@@ -6,8 +6,8 @@ import android.content.DialogInterface
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
-import android.util.Log
 import android.text.InputType
+import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
@@ -20,7 +20,8 @@ import android.widget.Toast
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 
-private const val EXTENSION_PACKAGE = "eu.kanade.tachiyomi.extension.zh.dongmanmanhua"
+private const val EXT_PACKAGE = "eu.kanade.tachiyomi.extension.zh.dongmanmanhua"
+private const val EYE_DEBUG_TAG = "DongmanEye"
 
 internal fun addDualInputPreference(
     screen: PreferenceScreen,
@@ -53,47 +54,67 @@ private fun updateEyeButtonIcon(
     val primaryName = if (passwordVisible) "eye_open" else "eye_hide"
     val fallbackName = if (passwordVisible) "ic_eye_open" else "ic_eye_closed"
 
-    val primaryExtId = ctx.resources.getIdentifier(primaryName, "drawable", EXTENSION_PACKAGE)
-    val fallbackExtId = ctx.resources.getIdentifier(fallbackName, "drawable", EXTENSION_PACKAGE)
-    val primaryCtxId = ctx.resources.getIdentifier(primaryName, "drawable", ctx.packageName)
-    val fallbackCtxId = ctx.resources.getIdentifier(fallbackName, "drawable", ctx.packageName)
+    val hostPkg = ctx.packageName
+    val appPkg = ctx.applicationContext.packageName
 
-    val resId = listOf(primaryExtId, fallbackExtId, primaryCtxId, fallbackCtxId).firstOrNull { it != 0 } ?: 0
+    val hostPrimaryId = ctx.resources.getIdentifier(primaryName, "drawable", hostPkg)
+    val hostFallbackId = ctx.resources.getIdentifier(fallbackName, "drawable", hostPkg)
+    val hostLauncherId = ctx.resources.getIdentifier("ic_launcher", "mipmap", hostPkg)
 
-    Log.d(
-        "DongmanEye",
-        "visible=$passwordVisible primary=$primaryName fallback=$fallbackName " +
-            "extPackage=$EXTENSION_PACKAGE ctxPackage=${ctx.packageName} " +
-            "primaryExtId=$primaryExtId fallbackExtId=$fallbackExtId " +
-            "primaryCtxId=$primaryCtxId fallbackCtxId=$fallbackCtxId finalResId=$resId",
-    )
-
-    if (resId != 0) {
-        button.setImageResource(resId)
-    } else {
-        button.setImageDrawable(null)
+    val extCtx = try {
+        ctx.createPackageContext(EXT_PACKAGE, Context.CONTEXT_IGNORE_SECURITY)
+    } catch (e: Exception) {
+        Log.e(EYE_DEBUG_TAG, "createPackageContext failed", e)
+        null
     }
+
+    val extPkg = extCtx?.packageName ?: "null"
+    val extPrimaryId = extCtx?.resources?.getIdentifier(primaryName, "drawable", EXT_PACKAGE) ?: 0
+    val extFallbackId = extCtx?.resources?.getIdentifier(fallbackName, "drawable", EXT_PACKAGE) ?: 0
+    val extLauncherId = extCtx?.resources?.getIdentifier("ic_launcher", "mipmap", EXT_PACKAGE) ?: 0
+
+    val chosenId = when {
+        extPrimaryId != 0 -> extPrimaryId
+        extFallbackId != 0 -> extFallbackId
+        hostPrimaryId != 0 -> hostPrimaryId
+        hostFallbackId != 0 -> hostFallbackId
+        else -> 0
+    }
+
+    val chosenCtx = when {
+        extPrimaryId != 0 || extFallbackId != 0 -> extCtx
+        hostPrimaryId != 0 || hostFallbackId != 0 -> ctx
+        else -> null
+    }
+
+    val drawable = if (chosenId != 0 && chosenCtx != null) {
+        try {
+            chosenCtx.getDrawable(chosenId)
+        } catch (e: Exception) {
+            Log.e(EYE_DEBUG_TAG, "getDrawable failed chosenId=$chosenId", e)
+            null
+        }
+    } else {
+        null
+    }
+
+    button.setImageDrawable(drawable)
 
     button.imageTintList = ColorStateList.valueOf(
         if (isNightMode(ctx)) Color.WHITE else Color.DKGRAY,
     )
 
-    Log.d("DongmanEye", "afterSet drawable=${button.drawable} alpha=${button.alpha} visibility=${button.visibility}")
+    val msg = "hostPkg=$hostPkg appPkg=$appPkg extPkg=$extPkg host=$hostPrimaryId/$hostFallbackId launcher=$hostLauncherId ext=$extPrimaryId/$extFallbackId launcher=$extLauncherId chosen=$chosenId drawable=${drawable != null}"
+    Log.d(EYE_DEBUG_TAG, msg)
+    Toast.makeText(ctx, "DongmanEye $msg", Toast.LENGTH_LONG).show()
 
     button.post {
-        Log.d(
-            "DongmanEye",
-            "buttonSize width=${button.width} height=${button.height} " +
-                "padding=${button.paddingLeft},${button.paddingTop},${button.paddingRight},${button.paddingBottom} drawable=${button.drawable}",
-        )
+        val sizeMsg = "button ${button.width}x${button.height} visible=$passwordVisible drawable=${button.drawable != null}"
+        Log.d(EYE_DEBUG_TAG, sizeMsg)
+        Toast.makeText(ctx, "DongmanEye $sizeMsg", Toast.LENGTH_SHORT).show()
     }
-
-    Toast.makeText(
-        ctx,
-        "DongmanEye resId=$resId drawable=${button.drawable != null}",
-        Toast.LENGTH_SHORT,
-    ).show()
 }
+
 
 private fun showDualInputDialog(
     ctx: Context,
