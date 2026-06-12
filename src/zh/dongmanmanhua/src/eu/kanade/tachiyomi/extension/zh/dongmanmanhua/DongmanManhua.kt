@@ -815,6 +815,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_INDEPENDENT_STORAGE = "pref_independent_storage"
         internal const val PREF_MANUAL_COOKIE_SWITCH = "pref_manual_cookie_switch"
         internal const val PREF_LOGIN_DUAL = "pref_login_dual"
+        internal const val PREF_LOGIN_USERNAME = "pref_login_username"
+        internal const val PREF_LOGIN_PASSWORD = "pref_login_password"
         internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
