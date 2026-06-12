@@ -11,6 +11,7 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -107,7 +108,7 @@ private fun showDualInputDialog(
     val eyeButton = ImageButton(ctx).apply {
         setBackgroundColor(Color.TRANSPARENT)
         layoutParams = LinearLayout.LayoutParams(dp40, dp40)
-        scaleType = ImageButton.ScaleType.CENTER_INSIDE
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
         setPadding(dp8, dp8, dp8, dp8)
 
         updateEyeButtonIcon(ctx, this, passwordVisible)
