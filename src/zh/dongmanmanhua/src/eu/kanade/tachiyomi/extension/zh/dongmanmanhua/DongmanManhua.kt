@@ -450,6 +450,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    internal fun syncLoginIndicator() {
+        loginIndicator.isChecked = cachedCookie?.isNotEmpty() == true
+        loginIndicator.summary = buildLoginSummary()
+        try { manualCookieSwitch.summary = buildManualSwitchSummary() } catch (_: UninitializedPropertyAccessException) {}
+    }
+
     internal fun buildLoginSummary(): String {
         val isLoggedIn = cachedCookie?.isNotEmpty() == true
         val status = if (isLoggedIn) "已登录" else "未登录"
