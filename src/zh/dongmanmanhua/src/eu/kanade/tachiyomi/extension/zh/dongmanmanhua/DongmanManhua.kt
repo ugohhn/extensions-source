@@ -387,6 +387,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
                         saveCookieToFile(neoSes, neoChk)
                         refreshCookieCache()
+                        // 登录成功，保存明文账号密码供下次填入输入框
+                        preferences.edit()
+                            .putString(PREF_LOGIN_USERNAME, username)
+                            .putString(PREF_LOGIN_PASSWORD, password)
+                            .apply()
                         Handler(Looper.getMainLooper()).post {
                             if (!loginSuccessHandled) {
                                 loginSuccessHandled = true
