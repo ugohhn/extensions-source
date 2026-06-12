@@ -47,9 +47,16 @@ private fun updateEyeButtonIcon(
     button: ImageButton,
     passwordVisible: Boolean,
 ) {
-    button.setImageResource(
-        if (passwordVisible) R.drawable.eye_open else R.drawable.eye_hide,
-    )
+    val primaryName = if (passwordVisible) "eye_open" else "eye_hide"
+    val fallbackName = if (passwordVisible) "ic_eye_open" else "ic_eye_closed"
+
+    val resId = ctx.resources.getIdentifier(primaryName, "drawable", ctx.packageName)
+        .takeIf { it != 0 }
+        ?: ctx.resources.getIdentifier(fallbackName, "drawable", ctx.packageName)
+
+    if (resId != 0) {
+        button.setImageResource(resId)
+    }
 
     button.imageTintList = ColorStateList.valueOf(
         if (isNightMode(ctx)) Color.WHITE else Color.DKGRAY,
