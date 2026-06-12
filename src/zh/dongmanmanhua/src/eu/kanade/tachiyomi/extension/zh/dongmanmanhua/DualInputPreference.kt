@@ -3,12 +3,15 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 import android.app.AlertDialog
 import android.content.Context
 import android.content.DialogInterface
+import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Color
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
-import android.widget.LinearLayout
 import android.widget.ImageButton
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.preference.PreferenceScreen
@@ -32,6 +35,28 @@ internal fun addDualInputPreference(
     }.also(screen::addPreference)
 }
 
+private fun isNightMode(ctx: Context): Boolean {
+    return (ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+        Configuration.UI_MODE_NIGHT_YES
+}
+
+private fun updateEyeButtonIcon(
+    ctx: Context,
+    button: ImageButton,
+    passwordVisible: Boolean,
+) {
+    val iconName = if (passwordVisible) "eye_open" else "eye_hide"
+    val iconResId = ctx.resources.getIdentifier(iconName, "drawable", ctx.packageName)
+
+    if (iconResId != 0) {
+        button.setImageResource(iconResId)
+    }
+
+    button.imageTintList = ColorStateList.valueOf(
+        if (isNightMode(ctx)) Color.WHITE else Color.DKGRAY,
+    )
+}
+
 private fun showDualInputDialog(
     ctx: Context,
     source: DongmanManhua,
@@ -53,8 +78,10 @@ private fun showDualInputDialog(
     val savedUsername = source.preferences.getString(DongmanManhua.PREF_LOGIN_USERNAME, "").orEmpty()
     val savedPassword = source.preferences.getString(DongmanManhua.PREF_LOGIN_PASSWORD, "").orEmpty()
 
-    // 账号行
-    val labelUsername = TextView(ctx).apply { text = "账号（手机号或邮箱）" }
+    val labelUsername = TextView(ctx).apply {
+        text = "账号（手机号或邮箱）"
+    }
+
     val editUsername = EditText(ctx).apply {
         hint = "请输入账号"
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
@@ -62,28 +89,32 @@ private fun showDualInputDialog(
         setText(savedUsername)
     }
 
-    // 密码行标签
     val labelPassword = TextView(ctx).apply {
         text = "密码"
         setPadding(0, dp8, 0, 0)
     }
 
-    // 密码输入框 + 眼睛按钮横排
     var passwordVisible = false
+
     val editPassword = EditText(ctx).apply {
         hint = "请输入密码"
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         maxLines = 1
         setText(savedPassword)
-        // 光标移到末尾
         if (savedPassword.isNotEmpty()) setSelection(savedPassword.length)
     }
+
     val eyeButton = ImageButton(ctx).apply {
-        setImageDrawable(ctx.getDrawable(android.R.drawable.ic_menu_view))
-        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        setBackgroundColor(Color.TRANSPARENT)
         layoutParams = LinearLayout.LayoutParams(dp40, dp40)
+        scaleType = ImageButton.ScaleType.CENTER_INSIDE
+        setPadding(dp8, dp8, dp8, dp8)
+
+        updateEyeButtonIcon(ctx, this, passwordVisible)
+
         setOnClickListener {
             passwordVisible = !passwordVisible
+
             val cursorPos = editPassword.selectionEnd
             editPassword.inputType = if (passwordVisible) {
                 InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
@@ -91,14 +122,18 @@ private fun showDualInputDialog(
                 InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
             editPassword.setSelection(cursorPos.coerceAtLeast(0))
-            // 用透明度区分显示/隐藏状态（系统只有睁眼图标）
-            alpha = if (passwordVisible) 0.4f else 1.0f
+
+            updateEyeButtonIcon(ctx, this, passwordVisible)
         }
     }
+
     val passwordRow = LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        addView(editPassword, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(
+            editPassword,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
+        )
         addView(eyeButton)
     }
 
@@ -113,6 +148,7 @@ private fun showDualInputDialog(
         .setPositiveButton("确定") { _: DialogInterface, _: Int ->
             val username = editUsername.text.toString().trim()
             val password = editPassword.text.toString()
+
             when {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
