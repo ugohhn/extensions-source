@@ -19,6 +19,8 @@ import android.widget.Toast
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 
+private const val EXTENSION_PACKAGE = "eu.kanade.tachiyomi.extension.zh.dongmanmanhua"
+
 internal fun addDualInputPreference(
     screen: PreferenceScreen,
     source: DongmanManhua,
@@ -50,12 +52,15 @@ private fun updateEyeButtonIcon(
     val primaryName = if (passwordVisible) "eye_open" else "eye_hide"
     val fallbackName = if (passwordVisible) "ic_eye_open" else "ic_eye_closed"
 
-    val resId = ctx.resources.getIdentifier(primaryName, "drawable", ctx.packageName)
+    val resId = ctx.resources.getIdentifier(primaryName, "drawable", EXTENSION_PACKAGE)
         .takeIf { it != 0 }
-        ?: ctx.resources.getIdentifier(fallbackName, "drawable", ctx.packageName)
+        ?: ctx.resources.getIdentifier(fallbackName, "drawable", EXTENSION_PACKAGE)
 
     if (resId != 0) {
         button.setImageResource(resId)
+    } else {
+        // 兜底：资源名或包名没找到时，至少显示系统眼睛图标，避免按钮看不见。
+        button.setImageResource(android.R.drawable.ic_menu_view)
     }
 
     button.imageTintList = ColorStateList.valueOf(
