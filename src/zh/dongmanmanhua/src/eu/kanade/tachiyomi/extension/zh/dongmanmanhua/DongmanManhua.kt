@@ -285,32 +285,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        androidx.preference.Preference(ctx).apply {
-            key = PREF_LOGIN_DUAL
-            title = "账号密码登录"
-            summary = "点击输入账号和密码"
-            setOnPreferenceClickListener {
-                val view = android.view.LayoutInflater.from(ctx)
-                    .inflate(R.layout.preference_dual_input, null)
-                val editUsername = view.findViewById<android.widget.EditText>(R.id.edit_username)
-                val editPassword = view.findViewById<android.widget.EditText>(R.id.edit_password)
-                android.app.AlertDialog.Builder(ctx)
-                    .setTitle("账号密码登录")
-                    .setView(view)
-                    .setPositiveButton("确定") { _, _ ->
-                        val username = editUsername.text.toString().trim()
-                        val password = editPassword.text.toString()
-                        when {
-                            username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
-                            password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
-                            else -> loginWithPassword(username, password)
-                        }
-                    }
-                    .setNegativeButton("取消", null)
-                    .show()
-                true
+        addDualInputPreference(screen) { username, password ->
+            when {
+                username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
+                password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
+                else -> loginWithPassword(username, password)
             }
-        }.also(screen::addPreference)
+        }
 
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_LOGOUT_TRIGGER
