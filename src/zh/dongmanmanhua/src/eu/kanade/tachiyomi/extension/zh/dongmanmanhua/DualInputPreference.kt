@@ -6,6 +6,7 @@ import android.content.DialogInterface
 import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.graphics.Color
+import android.util.Log
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
@@ -52,20 +53,46 @@ private fun updateEyeButtonIcon(
     val primaryName = if (passwordVisible) "eye_open" else "eye_hide"
     val fallbackName = if (passwordVisible) "ic_eye_open" else "ic_eye_closed"
 
-    val resId = ctx.resources.getIdentifier(primaryName, "drawable", EXTENSION_PACKAGE)
-        .takeIf { it != 0 }
-        ?: ctx.resources.getIdentifier(fallbackName, "drawable", EXTENSION_PACKAGE)
+    val primaryExtId = ctx.resources.getIdentifier(primaryName, "drawable", EXTENSION_PACKAGE)
+    val fallbackExtId = ctx.resources.getIdentifier(fallbackName, "drawable", EXTENSION_PACKAGE)
+    val primaryCtxId = ctx.resources.getIdentifier(primaryName, "drawable", ctx.packageName)
+    val fallbackCtxId = ctx.resources.getIdentifier(fallbackName, "drawable", ctx.packageName)
+
+    val resId = listOf(primaryExtId, fallbackExtId, primaryCtxId, fallbackCtxId).firstOrNull { it != 0 } ?: 0
+
+    Log.d(
+        "DongmanEye",
+        "visible=$passwordVisible primary=$primaryName fallback=$fallbackName " +
+            "extPackage=$EXTENSION_PACKAGE ctxPackage=${ctx.packageName} " +
+            "primaryExtId=$primaryExtId fallbackExtId=$fallbackExtId " +
+            "primaryCtxId=$primaryCtxId fallbackCtxId=$fallbackCtxId finalResId=$resId",
+    )
 
     if (resId != 0) {
         button.setImageResource(resId)
     } else {
-        // 兜底：资源名或包名没找到时，至少显示系统眼睛图标，避免按钮看不见。
-        button.setImageResource(android.R.drawable.ic_menu_view)
+        button.setImageDrawable(null)
     }
 
     button.imageTintList = ColorStateList.valueOf(
         if (isNightMode(ctx)) Color.WHITE else Color.DKGRAY,
     )
+
+    Log.d("DongmanEye", "afterSet drawable=${button.drawable} alpha=${button.alpha} visibility=${button.visibility}")
+
+    button.post {
+        Log.d(
+            "DongmanEye",
+            "buttonSize width=${button.width} height=${button.height} " +
+                "padding=${button.paddingLeft},${button.paddingTop},${button.paddingRight},${button.paddingBottom} drawable=${button.drawable}",
+        )
+    }
+
+    Toast.makeText(
+        ctx,
+        "DongmanEye resId=$resId drawable=${button.drawable != null}",
+        Toast.LENGTH_SHORT,
+    ).show()
 }
 
 private fun showDualInputDialog(
