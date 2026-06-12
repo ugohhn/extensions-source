@@ -152,10 +152,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!valid) {
                 clearManualBackup()
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
-                if (::manualCookieSwitch.isInitialized) {
-                    manualCookieSwitch.summary = buildManualSwitchSummary()
-                }
+                syncLoginIndicator()
             }
             valid
         } catch (_: Exception) {
@@ -204,6 +201,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "Cookie 缓存已刷新: ${cachedCookie ?: "(无)"}")
     }
 
+    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+
+    internal fun syncLoginIndicator() {
+        if (::loginIndicator.isInitialized) {
+            loginIndicator.isChecked = isLoginKnown()
+            loginIndicator.summary = buildLoginSummary()
+        }
+        if (::manualCookieSwitch.isInitialized) {
+            manualCookieSwitch.summary = buildManualSwitchSummary()
+        }
+    }
+
     internal lateinit var loginIndicator: SwitchPreferenceCompat
     internal lateinit var manualCookieSwitch: SwitchPreferenceCompat
 
@@ -230,7 +239,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 true
             }
         }.also(screen::addPreference)
@@ -242,18 +251,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 refreshCookieCache()
-                loginIndicator.summary = buildLoginSummary()
+                syncLoginIndicator()
                 summary = buildManualSwitchSummary()
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
+        refreshCookieCache()
+
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
+            isChecked = isLoginKnown()
             setEnabled(false)
             loginIndicator = this
         }.also(screen::addPreference)
@@ -273,18 +285,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }.also(screen::addPreference)
 
-        DualInputPreference(ctx).apply {
+        androidx.preference.Preference(ctx).apply {
             key = PREF_LOGIN_DUAL
             title = "账号密码登录"
-            summary = "点击输入账号和密码，确定后立即尝试登录"
-            onCredentialsConfirmed = { username, password ->
-                if (username.isBlank()) {
-                    Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
-                } else if (password.isBlank()) {
-                    Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
-                } else {
-                    loginWithPassword(username, password)
-                }
+            summary = "点击输入账号和密码"
+            setOnPreferenceClickListener {
+                val view = android.view.LayoutInflater.from(ctx)
+                    .inflate(R.layout.preference_dual_input, null)
+                val editUsername = view.findViewById<android.widget.EditText>(R.id.edit_username)
+                val editPassword = view.findViewById<android.widget.EditText>(R.id.edit_password)
+                android.app.AlertDialog.Builder(ctx)
+                    .setTitle("账号密码登录")
+                    .setView(view)
+                    .setPositiveButton("确定") { _, _ ->
+                        val username = editUsername.text.toString().trim()
+                        val password = editPassword.text.toString()
+                        when {
+                            username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
+                            password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
+                            else -> loginWithPassword(username, password)
+                        }
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+                true
             }
         }.also(screen::addPreference)
 
@@ -385,11 +409,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         Handler(Looper.getMainLooper()).post {
                             if (!loginSuccessHandled) {
                                 loginSuccessHandled = true
-                                loginIndicator.isChecked = true
-                                loginIndicator.summary = buildLoginSummary()
-                                if (::manualCookieSwitch.isInitialized) {
-                                    manualCookieSwitch.summary = buildManualSwitchSummary()
-                                }
+                                syncLoginIndicator()
                                 Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -429,9 +449,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.isChecked = false
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
         }
@@ -443,17 +461,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
         refreshCookieCache()
-        loginIndicator.summary = buildLoginSummary()
-        if (::manualCookieSwitch.isInitialized) manualCookieSwitch.summary = buildManualSwitchSummary()
+        syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
         }
-    }
-
-    internal fun syncLoginIndicator() {
-        loginIndicator.isChecked = cachedCookie?.isNotEmpty() == true
-        loginIndicator.summary = buildLoginSummary()
-        try { manualCookieSwitch.summary = buildManualSwitchSummary() } catch (_: UninitializedPropertyAccessException) {}
     }
 
     internal fun buildLoginSummary(): String {
@@ -830,4 +841,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
