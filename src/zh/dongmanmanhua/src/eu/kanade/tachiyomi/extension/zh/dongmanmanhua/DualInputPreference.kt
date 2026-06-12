@@ -10,7 +10,6 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ImageButton
 import android.widget.TextView
-import androidx.core.content.ContextCompat
 import android.widget.Toast
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -80,7 +79,7 @@ private fun showDualInputDialog(
         if (savedPassword.isNotEmpty()) setSelection(savedPassword.length)
     }
     val eyeButton = ImageButton(ctx).apply {
-        setImageDrawable(ContextCompat.getDrawable(ctx, R.drawable.ic_eye_open))
+        setImageDrawable(ctx.getDrawable(android.R.drawable.ic_menu_view))
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
         layoutParams = LinearLayout.LayoutParams(dp40, dp40)
         setOnClickListener {
@@ -92,12 +91,8 @@ private fun showDualInputDialog(
                 InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
             editPassword.setSelection(cursorPos.coerceAtLeast(0))
-            setImageDrawable(
-                ContextCompat.getDrawable(
-                    ctx,
-                    if (passwordVisible) R.drawable.ic_eye_closed else R.drawable.ic_eye_open,
-                ),
-            )
+            // 用透明度区分显示/隐藏状态（系统只有睁眼图标）
+            alpha = if (passwordVisible) 0.4f else 1.0f
         }
     }
     val passwordRow = LinearLayout(ctx).apply {
