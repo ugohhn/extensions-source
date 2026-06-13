@@ -93,9 +93,9 @@ class SortFilter : Filter.Sort(
 
 class WeekdayFilter(
     private val names: Array<String>,
-    private val values: Array<String>,
+    private val weekdayValues: Array<String>,
 ) : Filter.Select<String>("更新", names, 0) {
-    fun getSelectedValue(): String = values[state]
+    fun getSelectedValue(): String = weekdayValues[state]
 }
 
 class ThemeFilter : Filter.Select<String>(
