@@ -742,29 +742,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // 保存筛选状态供 latestUpdates 使用
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
         val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
         val sortSelection = sortFilter?.state as? Filter.Sort.Selection
         val sortValue = if (sortSelection != null) getSortFilter()[sortSelection.index].value else "READ_COUNT"
+        val weekdayValue = weekdayFilter?.getSelectedValue().orEmpty()
+
         preferences.edit()
-            .putString(PREF_FILTER_WEEKDAY, weekdayFilter?.getSelectedValue() ?: "")
+            .putString(PREF_FILTER_WEEKDAY, weekdayValue)
             .putString(PREF_FILTER_SORT, sortValue)
             .apply()
 
-        // query 为空时走筛选浏览
+        // query 为空时走筛选浏览。这里必须直接返回对应 Request，不能再回退成搜索页模板。
         if (query.isBlank()) {
             val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
-            val migrateValue = migrateFilter?.let { getMigrateFilter()[it.state].value } ?: ""
+            val migrateValue = migrateFilter?.let { getMigrateFilter().getOrNull(it.state)?.value }.orEmpty()
             if (migrateValue == "recent") {
                 return GET("$baseUrl/home/recentSeeing?size=50", headersBuilder().build())
             }
             if (migrateValue == "purchased") {
                 return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", headersBuilder().build())
             }
+
             val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
-            val themeValue = themeFilter?.let { getThemeFilter()[it.state].value } ?: ""
-            val weekdayValue = weekdayFilter?.getSelectedValue() ?: ""
+            val themeValue = themeFilter?.let { getThemeFilter().getOrNull(it.state)?.value }.orEmpty()
             val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
                 Calendar.MONDAY -> "MONDAY"
                 Calendar.TUESDAY -> "TUESDAY"
@@ -813,24 +814,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             url.contains("/home/recentSeeing") -> parseRecentSeeing(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
-            url.contains("/list") -> {
-                val document = response.asJsoup()
-                val entries = document
-                    .select("li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a")
-                    .map(::mangaFromElement)
-                    .distinctBy { it.url }
-                    .filter { it.title.isNotEmpty() }
-                MangasPage(entries, false)
-            }
+            url.contains("/dailySchedule") || url.endsWith("/new") || url.contains("/new?") -> latestUpdatesParse(response)
+            url.contains("/list") -> parseMangaListHtml(response)
             else -> parseSearchHtml(response)
         }
     }
 
     private fun parseRecentSeeing(response: Response): MangasPage {
-        val json = JSONObject(response.body.string())
+        val body = response.body.string()
+        val json = runCatching { JSONObject(body) }.getOrNull() ?: return MangasPage(emptyList(), false)
         if (json.optInt("code") != 200) return MangasPage(emptyList(), false)
         val data = json.optJSONObject("data") ?: return MangasPage(emptyList(), false)
-        val items = data.optJSONArray("recentlyViewed") ?: data.optJSONArray("list") ?: return MangasPage(emptyList(), false)
+        val items = data.optJSONArray("recentlyViewed") ?: data.optJSONArray("list") ?: data.optJSONArray("titles") ?: return MangasPage(emptyList(), false)
         val entries = mutableListOf<SManga>()
         for (i in 0 until items.length()) {
             val item = items.getJSONObject(i)
@@ -847,10 +842,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun parsePurchasedTitles(response: Response): MangasPage {
-        val json = JSONObject(response.body.string())
+        val body = response.body.string()
+        val json = runCatching { JSONObject(body) }.getOrNull() ?: return MangasPage(emptyList(), false)
         if (json.optInt("code") != 200) return MangasPage(emptyList(), false)
         val data = json.optJSONObject("data") ?: return MangasPage(emptyList(), false)
-        val titles = data.optJSONArray("titles") ?: return MangasPage(emptyList(), false)
+        val titles = data.optJSONArray("titles") ?: data.optJSONArray("list") ?: return MangasPage(emptyList(), false)
         val entries = mutableListOf<SManga>()
         for (i in 0 until titles.length()) {
             val item = titles.getJSONObject(i)
@@ -860,10 +856,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 url = "/episodeList?titleNo=$titleNo"
                 title = item.optString("title", "")
                 val thumb = item.optString("thumbnail", "")
+                    .ifEmpty { item.optString("thumbnailMobile", "") }
+                    .ifEmpty { item.optString("image", "") }
                 thumbnail_url = if (thumb.startsWith("//")) "https:$thumb" else thumb
             })
         }
         return MangasPage(entries.filter { it.title.isNotEmpty() }, false)
+    }
+
+    private fun parseMangaListHtml(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val entries = document
+            .select(
+                "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
+                    "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
+            )
+            .map(::mangaFromElement)
+            .distinctBy { it.url }
+            .filter { it.title.isNotEmpty() }
+        return MangasPage(entries, false)
     }
 
     private fun parseSearchHtml(response: Response): MangasPage {
@@ -1140,4 +1151,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
