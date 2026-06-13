@@ -61,6 +61,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
     private val autoUnlockLocksGuard = Any()
+    private val autoUnlockRecentSuccess = mutableMapOf<String, Long>()
+    private val autoUnlockRecentSuccessGuard = Any()
+    private val autoUnlockRecentSuccessWindowMs = 30_000L
 
     private fun getAutoUnlockLock(key: String): ReentrantLock = synchronized(autoUnlockLocksGuard) {
         autoUnlockLocks.getOrPut(key) { ReentrantLock() }
@@ -68,6 +71,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun autoUnlockLog(message: String) {
         Log.d("DongmanAutoUnlock", message)
+    }
+
+    private fun recentAutoUnlockSuccessAge(key: String): Long? {
+        val now = System.currentTimeMillis()
+        return synchronized(autoUnlockRecentSuccessGuard) {
+            autoUnlockRecentSuccess.entries.removeAll { now - it.value > autoUnlockRecentSuccessWindowMs }
+            val lastSuccess = autoUnlockRecentSuccess[key] ?: return@synchronized null
+            val age = now - lastSuccess
+            if (age in 0 until autoUnlockRecentSuccessWindowMs) age else null
+        }
+    }
+
+    private fun markAutoUnlockSuccess(key: String) {
+        synchronized(autoUnlockRecentSuccessGuard) {
+            autoUnlockRecentSuccess[key] = System.currentTimeMillis()
+        }
+        autoUnlockLog("AUTO_RECENT_SUCCESS_MARK key=$key windowMs=$autoUnlockRecentSuccessWindowMs")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -921,6 +941,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val lock = getAutoUnlockLock(key)
 
         autoUnlockLog("AUTO_UNLOCK_ATTEMPT key=$key thread=$threadName")
+        recentAutoUnlockSuccessAge(key)?.let { age ->
+            autoUnlockLog("AUTO_RECENT_SUCCESS_SKIP key=$key ageMs=$age thread=$threadName")
+            return
+        }
+
         val acquiredImmediately = lock.tryLock()
         if (!acquiredImmediately) {
             autoUnlockLog("AUTO_LOCK_BLOCKED_SKIP key=$key thread=$threadName")
@@ -929,6 +954,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         autoUnlockLog("AUTO_LOCK_ACQUIRED key=$key thread=$threadName")
 
         try {
+            recentAutoUnlockSuccessAge(key)?.let { age ->
+                autoUnlockLog("AUTO_RECENT_SUCCESS_SKIP_AFTER_LOCK key=$key ageMs=$age thread=$threadName")
+                return
+            }
             autoUnlockLog("AUTO_UNLOCK_START key=$key thread=$threadName")
             val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
             val savedCookie = cookieHeader()
@@ -981,6 +1010,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 autoUnlockLog("AUTO_PAY_FAIL_CODE key=$key code=$payCode message=$payMessage")
                 return
             }
+            markAutoUnlockSuccess(key)
             autoUnlockLog("AUTO_UNLOCK_DONE key=$key")
         } catch (e: Exception) {
             autoUnlockLog("AUTO_UNLOCK_ERROR key=$key error=${e.javaClass.simpleName}:${e.message}")
