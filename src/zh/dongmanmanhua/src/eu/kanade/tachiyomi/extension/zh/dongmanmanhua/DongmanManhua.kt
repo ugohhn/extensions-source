@@ -155,6 +155,32 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
+
+    internal fun logLoginIndicatorDecision(
+        label: String,
+        step: Int,
+        note: String,
+        pendingManual: Boolean? = null,
+        pendingIndependent: Boolean? = null,
+    ) {
+        val cmRaw = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+        val cmLogin = cmRaw.contains("NEO_SES") || cmRaw.contains("NEO_CHK")
+        Log.d(
+            "DongmanLoginIndicator",
+            buildString {
+                append("STEP_${step}_$label")
+                append(" | note=$note")
+                append(" | cmLogin=$cmLogin cm=${shortCookieForDebug(cmRaw)} cmLen=${cmRaw.length}")
+                append(" | prefManual=${getManualCookieEnable()} prefIndependent=${useIndependentStorage()}")
+                if (pendingManual != null) append(" | pendingManual=$pendingManual")
+                if (pendingIndependent != null) append(" | pendingIndependent=$pendingIndependent")
+                append(" | requestCache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource")
+                append(" | loginIndicatorInit=${::loginIndicator.isInitialized}")
+                if (::loginIndicator.isInitialized) append(" oldChecked=${loginIndicator.isChecked}")
+            },
+        )
+    }
+
     internal fun debugRequest(label: String, request: Request): Request {
         val expectedCookie = cachedCookie.orEmpty()
         val headerCookie = request.header("Cookie").orEmpty()
@@ -373,21 +399,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // 登录状态指示灯只表示 WebView / CookieManager 的登录状态。
-    // 不再用 cachedCookie 判断，避免“全局 Cookie 已清，但手动备用 cookie.dat 还在”时误显示为已登录。
+    // 不用 cachedCookie 判断，避免“全局 Cookie 已清，但手动备用 cookie.dat 还在”时误显示为已登录。
     internal fun isLoginKnown(): Boolean {
         val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        return cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")
+        val known = cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")
+        Log.d(
+            "DongmanLoginIndicator",
+            "IS_LOGIN_KNOWN | result=$known | cm=${shortCookieForDebug(cmCookie)} cmLen=${cmCookie.length} | cache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource",
+        )
+        return known
     }
 
-    internal fun syncLoginIndicator() {
+    internal fun syncLoginIndicator(reason: String = "unspecified") {
+        logLoginIndicatorDecision("SYNC_BEFORE", 300, "准备刷新登录指示灯，reason=$reason")
+        val known = isLoginKnown()
         if (::loginIndicator.isInitialized) {
-            loginIndicator.isChecked = isLoginKnown()
-            loginIndicator.summary = buildLoginSummary()
+            loginIndicator.isChecked = known
+            loginIndicator.summary = buildLoginSummary(known)
         }
         if (::manualCookieSwitch.isInitialized) {
             manualCookieSwitch.summary = buildManualSwitchSummary()
         }
-        logCookieStoresDetailed("SYNC_LOGIN_INDICATOR", 300, "登录状态指示灯已按 CookieManager 刷新；备用 Cookie 不参与登录灯判断")
+        logLoginIndicatorDecision("SYNC_AFTER", 301, "登录指示灯刷新完成，reason=$reason")
+        logCookieStoresDetailed("SYNC_LOGIN_INDICATOR", 302, "登录状态指示灯已按 CookieManager 刷新；备用 Cookie 不参与登录灯判断；reason=$reason")
     }
 
     internal lateinit var loginIndicator: SwitchPreferenceCompat
@@ -417,9 +451,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "独立存储 Cookie"
             summary = "开启后使用私有文件保存登录态，不受清除全局Cookie影响"
             setDefaultValue(false)
-            setOnPreferenceChangeListener { _, _ ->
-                refreshCookieCache()
-                syncLoginIndicator()
+            setOnPreferenceChangeListener { _, newValue ->
+                val pending = newValue as Boolean
+                logLoginIndicatorDecision("INDEPENDENT_SWITCH_BEFORE_APPLY", 410, "独立存储开关即将变化；这里 preferences 里还是旧值", pendingIndependent = pending)
+                Handler(Looper.getMainLooper()).post {
+                    logLoginIndicatorDecision("INDEPENDENT_SWITCH_AFTER_APPLY_BEFORE_REFRESH", 411, "独立存储开关写入后，准备 refresh/sync", pendingIndependent = pending)
+                    refreshCookieCache()
+                    syncLoginIndicator("independent_switch_changed_to_$pending")
+                    logLoginIndicatorDecision("INDEPENDENT_SWITCH_AFTER_SYNC", 412, "独立存储开关变化后的刷新已完成", pendingIndependent = pending)
+                }
                 true
             }
         }.also(screen::addPreference)
@@ -429,10 +469,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             title = "启用手动备用Cookie模式"
             summary = buildManualSwitchSummary()
             setDefaultValue(false)
-            setOnPreferenceChangeListener { _, _ ->
-                refreshCookieCache()
-                syncLoginIndicator()
-                summary = buildManualSwitchSummary()
+            setOnPreferenceChangeListener { _, newValue ->
+                val pending = newValue as Boolean
+                logLoginIndicatorDecision("MANUAL_SWITCH_BEFORE_APPLY", 420, "手动备用开关即将变化；这里 preferences 里还是旧值", pendingManual = pending)
+                Handler(Looper.getMainLooper()).post {
+                    logLoginIndicatorDecision("MANUAL_SWITCH_AFTER_APPLY_BEFORE_REFRESH", 421, "手动备用开关写入后，准备 refresh/sync", pendingManual = pending)
+                    refreshCookieCache()
+                    syncLoginIndicator("manual_switch_changed_to_$pending")
+                    summary = buildManualSwitchSummary()
+                    logLoginIndicatorDecision("MANUAL_SWITCH_AFTER_SYNC", 422, "手动备用开关变化后的刷新已完成", pendingManual = pending)
+                }
                 true
             }
             manualCookieSwitch = this
@@ -445,11 +491,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
-            summary = buildLoginSummary()
+            val known = isLoginKnown()
+            logLoginIndicatorDecision("LOGIN_INDICATOR_CREATE_BEFORE_SET", 430, "登录状态 preference 创建时，准备写入初始 checked=$known")
+            summary = buildLoginSummary(known)
             setDefaultValue(false)
-            isChecked = isLoginKnown()
+            isChecked = known
             setEnabled(false)
             loginIndicator = this
+            logLoginIndicatorDecision("LOGIN_INDICATOR_CREATE_AFTER_SET", 431, "登录状态 preference 已创建并赋值")
         }.also(screen::addPreference)
 
         SwitchPreferenceCompat(ctx).apply {
@@ -530,7 +579,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         logCookieStoresDetailed("SETUP_BEFORE_FINAL_REFRESH", 104, "设置页全部 preference 创建完，即将执行结尾 refreshCookieCache()")
         refreshCookieCache()
-        logCookieStoresDetailed("SETUP_AFTER_FINAL_REFRESH", 105, "设置页结尾 refreshCookieCache() 后：这是打开设置页最终状态")
+        logCookieStoresDetailed("SETUP_AFTER_FINAL_REFRESH_BEFORE_SYNC", 105, "设置页结尾 refreshCookieCache() 后，准备同步登录指示灯")
+        syncLoginIndicator("setup_final_refresh")
+        logCookieStoresDetailed("SETUP_AFTER_FINAL_SYNC", 106, "设置页最终 syncLoginIndicator() 后：这是打开设置页最终显示状态")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -682,8 +733,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    internal fun buildLoginSummary(): String {
-        val status = if (isLoginKnown()) "已登录" else "未登录"
+    internal fun buildLoginSummary(knownOverride: Boolean? = null): String {
+        val known = knownOverride ?: isLoginKnown()
+        val status = if (known) "已登录" else "未登录"
         val requestCookie = if (cachedCookie?.isNotEmpty() == true) "可用" else "无"
         val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
