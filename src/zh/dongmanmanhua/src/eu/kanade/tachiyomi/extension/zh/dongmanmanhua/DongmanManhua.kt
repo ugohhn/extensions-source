@@ -764,11 +764,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
             val themeValue = themeFilter?.let { getThemeFilter()[it.state].value } ?: ""
-            return if (themeValue.isNotEmpty()) {
-                GET("$baseUrl/$themeValue/list?sortOrder=$sortValue", headersBuilder().build())
-            } else {
-                latestUpdatesRequest(0)
+            val weekdayValue = weekdayFilter?.getSelectedValue() ?: ""
+            val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
+                Calendar.MONDAY -> "MONDAY"
+                Calendar.TUESDAY -> "TUESDAY"
+                Calendar.WEDNESDAY -> "WEDNESDAY"
+                Calendar.THURSDAY -> "THURSDAY"
+                Calendar.FRIDAY -> "FRIDAY"
+                Calendar.SATURDAY -> "SATURDAY"
+                Calendar.SUNDAY -> "SUNDAY"
+                else -> "MONDAY"
             }
+            val url = when {
+                weekdayValue == "NEW" -> "$baseUrl/new"
+                themeValue.isNotEmpty() -> "$baseUrl/$themeValue/list?sortOrder=$sortValue"
+                weekdayValue == "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sortValue"
+                weekdayValue.isNotEmpty() -> "$baseUrl/dailySchedule?weekday=$weekdayValue&sortOrder=$sortValue"
+                else -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sortValue"
+            }
+            return GET(url, headersBuilder().build())
         }
 
         // 有 query 时走关键词搜索（原有逻辑）
