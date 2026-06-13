@@ -36,7 +36,7 @@ internal class LoginWebView(
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             val insets = decorView.rootWindowInsets
             insets?.isVisible(android.view.WindowInsets.Type.ime()) == true &&
-                    (insets.getInsets(android.view.WindowInsets.Type.ime()).bottom > 150)
+                (insets.getInsets(android.view.WindowInsets.Type.ime()).bottom > 150)
         } else {
             val rect = android.graphics.Rect()
             decorView.getWindowVisibleDisplayFrame(rect)
@@ -73,7 +73,8 @@ internal class LoginWebView(
                 swallowingCurrentSequence = false
             }
             MotionEvent.ACTION_MOVE,
-            MotionEvent.ACTION_UP -> {
+            MotionEvent.ACTION_UP,
+            -> {
                 if (swallowingCurrentSequence) return true
             }
             MotionEvent.ACTION_CANCEL -> {
@@ -99,12 +100,15 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
         return
     }
+
     refreshCookieCache()
-    if (cachedCookie?.contains("NEO_SES=") == true) {
-        syncLoginIndicator()
+    syncLoginIndicator()
+    if (isLoginKnown()) {
         Toast.makeText(appContext, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
+        Log.d("DongmanCookie", "WEBVIEW_LOGIN_SKIP_ALREADY_LOGGED_IN ${cookieStateForDebug()}")
         return
     }
+
     isLoginDialogShowing = true
     loginSuccessHandled = false
 
@@ -147,6 +151,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         )
 
         saveLoginCookie(neoSes, neoChk)
+        refreshCookieCache()
 
         Handler(Looper.getMainLooper()).post {
             syncLoginIndicator()
@@ -159,7 +164,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
     val webView = LoginWebView(actCtx, getDialog = { dialog }).apply {
         layoutParams = ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT
+            ViewGroup.LayoutParams.MATCH_PARENT,
         )
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
@@ -173,7 +178,8 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
             // ── 页面可见后：调整表单样式 + 初始缓存 formRects + 启动验证码轮询 ──
             override fun onPageCommitVisible(view: WebView?, url: String?) {
                 // 调整表单样式
-                view?.evaluateJavascript("""
+                view?.evaluateJavascript(
+                    """
                     (function(){
                         var form = document.getElementById('formLogin');
                         if(form) {
@@ -182,11 +188,14 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                             form.style.paddingTop = '16px';
                         }
                     })();
-                """.trimIndent(), null)
+                    """.trimIndent(),
+                    null,
+                )
 
                 // 延迟 500ms 缓存初始 formRects（等待页面渲染完成）
                 view?.postDelayed({
-                    view.evaluateJavascript("""
+                    view.evaluateJavascript(
+                        """
                         (function(){
                             var dpr = window.devicePixelRatio || 1;
                             var form = document.getElementById('formLogin');
@@ -194,22 +203,26 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                             var r = form.getBoundingClientRect();
                             return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr)+'|dpr='+dpr+'|scrollY='+window.scrollY;
                         })()
-                    """.trimIndent()) { value ->
+                        """.trimIndent(),
+                    ) { value ->
                         Log.d("DongmanIME", "初始 formRects JS 返回: $value")
                         val raw = value?.trim('"') ?: return@evaluateJavascript
                         val coords = raw.substringBefore("|").split(",")
                         if (coords.size == 4) {
                             formRects.clear()
-                            formRects.add(InputRect(
-                                coords[0].toFloat(), coords[1].toFloat(),
-                                coords[2].toFloat(), coords[3].toFloat()
-                            ))
+                            formRects.add(
+                                InputRect(
+                                    coords[0].toFloat(),
+                                    coords[1].toFloat(),
+                                    coords[2].toFloat(),
+                                    coords[3].toFloat(),
+                                ),
+                            )
                             Log.d("DongmanIME", "初始 formRects 已缓存: $formRects")
                             (view as LoginWebView).updateFormRects(formRects.toList())
                         }
                     }
                 }, 500)
-
             }
 
             // ── 页面加载完成：检测登录结果 ──
@@ -245,11 +258,11 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
         setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or
-            WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN,
         )
         setLayout(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT
+            ViewGroup.LayoutParams.MATCH_PARENT,
         )
     }
     webView.requestFocus()
@@ -276,21 +289,24 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
 
             if (keyboardNowVisible) {
                 // 键盘弹出：查询 formLogin 的 offsetTop，将其滚动到可见区域顶部
-                webView.evaluateJavascript("""
+                webView.evaluateJavascript(
+                    """
                     (function(){
                         var el = document.getElementById('formLogin');
                         if(!el) return 'NO_ELEMENT';
                         var dpr = window.devicePixelRatio || 1;
                         return String(el.offsetTop * dpr);
                     })()
-                """.trimIndent()) { value ->
+                    """.trimIndent(),
+                ) { value ->
                     val targetScrollY = value?.trim('"')?.toFloatOrNull()?.toInt() ?: return@evaluateJavascript
                     Log.d("DongmanIME", "键盘弹出 scrollTo(0, $targetScrollY)")
                     Handler(Looper.getMainLooper()).post {
                         webView.scrollTo(0, targetScrollY)
                         // 延迟 200ms 等滚动稳定后重新缓存 formRects
                         webView.postDelayed({
-                            webView.evaluateJavascript("""
+                            webView.evaluateJavascript(
+                                """
                                 (function(){
                                     var dpr = window.devicePixelRatio || 1;
                                     var form = document.getElementById('formLogin');
@@ -298,14 +314,19 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                     var r = form.getBoundingClientRect();
                                     return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr);
                                 })()
-                            """.trimIndent()) { v2 ->
+                                """.trimIndent(),
+                            ) { v2 ->
                                 val coords = v2?.trim('"')?.split(",") ?: return@evaluateJavascript
                                 if (coords.size == 4) {
                                     formRects.clear()
-                                    formRects.add(InputRect(
-                                        coords[0].toFloat(), coords[1].toFloat(),
-                                        coords[2].toFloat(), coords[3].toFloat()
-                                    ))
+                                    formRects.add(
+                                        InputRect(
+                                            coords[0].toFloat(),
+                                            coords[1].toFloat(),
+                                            coords[2].toFloat(),
+                                            coords[3].toFloat(),
+                                        ),
+                                    )
                                     Log.d("DongmanIME", "键盘弹出后 formRects 更新: $formRects")
                                     webView.updateFormRects(formRects.toList())
                                 }
@@ -319,7 +340,8 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                     webView.scrollTo(0, 0)
                     Log.d("DongmanIME", "键盘收起 scrollTo(0, 0)")
                     webView.postDelayed({
-                        webView.evaluateJavascript("""
+                        webView.evaluateJavascript(
+                            """
                             (function(){
                                 var dpr = window.devicePixelRatio || 1;
                                 var form = document.getElementById('formLogin');
@@ -327,14 +349,19 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                 var r = form.getBoundingClientRect();
                                 return (r.left*dpr)+','+(r.top*dpr)+','+(r.right*dpr)+','+(r.bottom*dpr);
                             })()
-                        """.trimIndent()) { v2 ->
+                            """.trimIndent(),
+                        ) { v2 ->
                             val coords = v2?.trim('"')?.split(",") ?: return@evaluateJavascript
                             if (coords.size == 4) {
                                 formRects.clear()
-                                formRects.add(InputRect(
-                                    coords[0].toFloat(), coords[1].toFloat(),
-                                    coords[2].toFloat(), coords[3].toFloat()
-                                ))
+                                formRects.add(
+                                    InputRect(
+                                        coords[0].toFloat(),
+                                        coords[1].toFloat(),
+                                        coords[2].toFloat(),
+                                        coords[3].toFloat(),
+                                    ),
+                                )
                                 Log.d("DongmanIME", "键盘收起后 formRects 更新: $formRects")
                                 webView.updateFormRects(formRects.toList())
                             }
