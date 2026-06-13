@@ -39,6 +39,8 @@ import java.util.concurrent.locks.ReentrantLock
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
+    // 10a: based on 09. Only lightens request/cookie logs and removes duplicate cookieHeader() calls. Storage semantics unchanged.
+
     init {
         Handler(Looper.getMainLooper()).post {
             CookieManager.getInstance().setAcceptCookie(true)
@@ -142,7 +144,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             append("header=${shortCookieForDebug(headerCookie)} len=${headerCookie.length}\n")
             append(request.url.encodedPath.take(80))
         }
-        Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
         Log.d("DongmanRequest", msg.replace("\n", " | "))
         return request
     }
@@ -649,13 +650,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (cachedCookie == null || lastIndependentState != independent || lastManualCookieState != manual) {
             refreshCookieCache()
         }
-        val cookie = cachedCookie.orEmpty()
-        Log.d(
-            "DongmanCookie",
-            "cookieHeader: manual=$manual independent=$independent cookie=${cookie.ifEmpty { "(无)" }}",
-        )
-        showCookieDebug("HEADER", force = false)
-        return cookie
+        return cachedCookie.orEmpty()
     }
 
     override fun headersBuilder(): Headers.Builder {
@@ -668,15 +663,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             builder.set("Cookie", cookie)
         }
 
-        Log.d(
-            "DongmanRequest",
-            "HEADER_BUILD manual=${getManualCookieEnable()} " +
-                "ind=${useIndependentStorage()} " +
-                "src=$cachedCookieSource " +
-                "cookie=${shortCookieForDebug(cookie)} " +
-                "len=${cookie.length} " +
-                "set=${cookie.isNotEmpty()}",
-        )
 
         return builder
     }
@@ -834,10 +820,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         return debugRequest("DETAIL", GET(baseUrl + manga.url, reqHeaders))
     }
 
@@ -872,10 +855,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     override fun chapterListRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         return debugRequest("CHAPTER_LIST", GET(baseUrl + manga.url, reqHeaders))
     }
 
@@ -906,10 +886,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull() ?: break
             val nextUrl = nextPage.absUrl("href")
             if (nextUrl.isEmpty()) break
-            val reqHeaders = headersBuilder().apply {
-                val cookie = cookieHeader()
-                if (cookie.isNotEmpty()) set("Cookie", cookie)
-            }.build()
+            val reqHeaders = headersBuilder().build()
             document = client.newCall(debugRequest("CHAPTER_NEXT", GET(nextUrl, reqHeaders))).execute().asJsoup()
         }
         return chapters.reversed()
@@ -920,10 +897,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         val autoPay = preferences.getBoolean(PREF_AUTO_PAY, false)
         if (autoPay) {
             val titleNo = extractUrlParam(chapter.url, "title_no")
@@ -960,11 +934,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             autoUnlockLog("AUTO_UNLOCK_START key=$key thread=$threadName")
             val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-            val savedCookie = cookieHeader()
             val reqHeaders = headersBuilder()
                 .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
                 .set("X-Requested-With", "XMLHttpRequest")
-                .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
                 .build()
             autoUnlockLog("AUTO_HEADER key=$key cookie=${shortCookieForDebug(reqHeaders.get("Cookie"))}")
 
