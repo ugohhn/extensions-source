@@ -115,6 +115,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             append(request.url.encodedPath.take(80))
         }
         Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
+        Log.d("DongmanRequest", msg.replace("\n", " | "))
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
         }
@@ -545,13 +546,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val builder = super.headersBuilder().set("Referer", "$baseUrl/")
         val ua = currentUserAgent()
         if (ua.isNotEmpty()) builder.set("User-Agent", ua)
+
         val cookie = cookieHeader()
         if (cookie.isNotEmpty()) {
-            Log.d("DongmanCookie", "headersBuilder: 注入 Cookie -> $cookie")
             builder.set("Cookie", cookie)
-        } else {
-            Log.d("DongmanCookie", "headersBuilder: 没有 Cookie 可注入")
         }
+
+        Log.d(
+            "DongmanRequest",
+            "HEADER_BUILD manual=${getManualCookieEnable()} " +
+                "ind=${useIndependentStorage()} " +
+                "src=$cachedCookieSource " +
+                "cookie=${shortCookieForDebug(cookie)} " +
+                "len=${cookie.length} " +
+                "set=${cookie.isNotEmpty()}",
+        )
+
         return builder
     }
 
@@ -893,4 +903,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
