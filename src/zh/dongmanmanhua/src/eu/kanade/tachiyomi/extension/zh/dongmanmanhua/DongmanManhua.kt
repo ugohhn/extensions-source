@@ -103,6 +103,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var cachedCookieSource: String = "none"
     private var lastCookieDebugToastTime: Long = 0L
     private var cookieHeaderCallSeq: Long = 0L
+    private var headersBuilderCallSeq: Long = 0L
+    private var lastCookieHeaderAt: Long = 0L
+    private var lastCookieHeaderCaller: String = "none"
 
     internal fun shortCookieForDebug(cookie: String?): String {
         if (cookie.isNullOrBlank()) return "none"
@@ -678,12 +681,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
         Log.d("DongmanClearDebug", "FULL_LOGOUT_BEFORE loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         CookieManager.getInstance().removeAllCookies { success ->
-            Log.d("DongmanClearDebug", "FULL_LOGOUT_CM_CALLBACK success=$success ${cookieStateForDebug()}")
+            Log.d("DongmanClearDebug", "FULL_LOGOUT_CM_CALLBACK success=$success loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         }
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_REMOVE_ALL_COOKIES_CALL loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        if (useIndependentStorage()) deleteCookieFile()
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_REMOVE_SP loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
+        if (useIndependentStorage()) {
+            deleteCookieFile()
+            Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_DELETE_FILE_BY_IND loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
+        }
         clearManualBackup()
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_CLEAR_MANUAL loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         refreshCookieCache()
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_REFRESH loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         syncLoginIndicator()
         Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         Handler(Looper.getMainLooper()).post {
@@ -696,9 +706,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Log.d("DongmanCookie", "clearBackupOnly")
         Log.d("DongmanClearDebug", "CLEAR_BACKUP_BEFORE loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        if (useIndependentStorage()) deleteCookieFile()
+        Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_REMOVE_SP loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
+        if (useIndependentStorage()) {
+            deleteCookieFile()
+            Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_DELETE_FILE_BY_IND loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
+        }
         clearManualBackup()
+        Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_CLEAR_MANUAL loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         refreshCookieCache()
+        Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_REFRESH loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         syncLoginIndicator()
         Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         Handler(Looper.getMainLooper()).post {
@@ -727,28 +743,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun cookieHeader(): String {
-        val seq = synchronized(this) {
+        val caller = callerForDebug()
+        val now = System.currentTimeMillis()
+        val (seq, deltaMs, previousCaller) = synchronized(this) {
             cookieHeaderCallSeq += 1
-            cookieHeaderCallSeq
+            val delta = if (lastCookieHeaderAt == 0L) -1L else now - lastCookieHeaderAt
+            val previous = lastCookieHeaderCaller
+            lastCookieHeaderAt = now
+            lastCookieHeaderCaller = caller
+            Triple(cookieHeaderCallSeq, delta, previous)
         }
         val independent = useIndependentStorage()
         val manual = getManualCookieEnable()
         val needRefresh = cachedCookie == null || lastIndependentState != independent || lastManualCookieState != manual
-        Log.d("DongmanCookieHeader", "HEADER_CALL#$seq caller=${callerForDebug()} needRefresh=$needRefresh before=${cookieStateForDebug()}")
+        Log.d(
+            "DongmanCookieHeader",
+            "HEADER_CALL#$seq caller=$caller prevCaller=$previousCaller deltaMs=$deltaMs thread=${Thread.currentThread().name} " +
+                "needRefresh=$needRefresh before=${cookieStateForDebug()}",
+        )
         if (needRefresh) {
             refreshCookieCache()
+            Log.d("DongmanCookieHeader", "HEADER_AFTER_REFRESH#$seq caller=$caller ${cookieStateForDebug()}")
         }
         val cookie = cachedCookie.orEmpty()
         Log.d(
             "DongmanCookie",
             "cookieHeader: manual=$manual independent=$independent cookie=${shortCookieForDebug(cookie)}",
         )
-        Log.d("DongmanCookieHeader", "HEADER_RETURN#$seq set=${cookie.isNotEmpty()} len=${cookie.length} after=${cookieStateForDebug()}")
+        Log.d(
+            "DongmanCookieHeader",
+            "HEADER_RETURN#$seq caller=$caller set=${cookie.isNotEmpty()} len=${cookie.length} after=${cookieStateForDebug()}",
+        )
         showCookieDebug("HEADER", force = false)
         return cookie
     }
 
     override fun headersBuilder(): Headers.Builder {
+        val seq = synchronized(this) {
+            headersBuilderCallSeq += 1
+            headersBuilderCallSeq
+        }
+        val caller = callerForDebug()
+        Log.d("DongmanCookieHeader", "HEADERS_BUILDER_ENTER#$seq caller=$caller ${cookieStateForDebug()}")
         val builder = super.headersBuilder().set("Referer", "$baseUrl/")
         val ua = currentUserAgent()
         if (ua.isNotEmpty()) builder.set("User-Agent", ua)
@@ -760,13 +796,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         Log.d(
             "DongmanRequest",
-            "HEADER_BUILD manual=${getManualCookieEnable()} " +
+            "HEADER_BUILD#$seq caller=$caller manual=${getManualCookieEnable()} " +
                 "ind=${useIndependentStorage()} " +
                 "src=$cachedCookieSource " +
                 "cookie=${shortCookieForDebug(cookie)} " +
                 "len=${cookie.length} " +
                 "set=${cookie.isNotEmpty()}",
         )
+        Log.d("DongmanCookieHeader", "HEADERS_BUILDER_RETURN#$seq caller=$caller header=${shortCookieForDebug(builder.build().get("Cookie"))} ${cookieStateForDebug()}")
 
         return builder
     }
