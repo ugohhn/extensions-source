@@ -119,9 +119,33 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
     fun handleLoginSuccess(cookieStr: String): Boolean {
         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
-        if (loginSuccessHandled || neoSes.isEmpty()) return false
+
+        Log.d(
+            "DongmanCookie",
+            "LOGIN_CHECK handled=$loginSuccessHandled cookieLen=${cookieStr.length} " +
+                "ses=${neoSes.length} chk=${neoChk.length} raw=${cookieStr.take(300)}",
+        )
+
+        if (loginSuccessHandled) {
+            Log.d("DongmanCookie", "LOGIN_SKIP already_handled")
+            return false
+        }
+
+        if (neoSes.isEmpty()) {
+            Log.d(
+                "DongmanCookie",
+                "LOGIN_SKIP no_NEO_SES chk=${neoChk.length} raw=${cookieStr.take(300)}",
+            )
+            return false
+        }
 
         loginSuccessHandled = true
+
+        Log.d(
+            "DongmanCookie",
+            "LOGIN_SAVE ses=${neoSes.length} chk=${neoChk.length}",
+        )
+
         saveLoginCookie(neoSes, neoChk)
 
         Handler(Looper.getMainLooper()).post {
