@@ -6,28 +6,23 @@ import java.util.Calendar
 
 data class Tag(val name: String, val value: String)
 
-// 入口：这些不是组合筛选，只能三选一。
-private val browseModeFilter = arrayOf(
-    Tag("更新", "update"),
-    Tag("题材", "theme"),
-    Tag("我的漫画", "mine"),
-)
-
-// 只给“更新”入口使用。
+// 只给“更新”使用。
 private val sortFilter = arrayOf(
     Tag("按人气", "READ_COUNT"),
     Tag("按点赞数", "LIKEIT"),
     Tag("按更新时间", "UPDATE"),
 )
 
-// 只给“我的漫画”入口使用。
+// 独立入口：选中后只请求我的漫画，不和更新/题材组合。
 private val migrateFilter = arrayOf(
+    Tag("无", ""),
     Tag("最近观看", "recent"),
     Tag("我的已购", "purchased"),
 )
 
-// 只给“题材”入口使用。题材接口不带 sortOrder，也不读取排序。
+// 独立入口：选中后只请求题材列表，不读取排序。
 private val themeFilter = arrayOf(
+    Tag("全部", ""),
     Tag("恋爱", "LOVE"),
     Tag("少年", "BOY"),
     Tag("古风", "ANCIENTCHINESE"),
@@ -42,7 +37,6 @@ private val themeFilter = arrayOf(
     Tag("完结", "TERMINATION"),
 )
 
-fun getBrowseModeFilter(): Array<Tag> = browseModeFilter
 fun getSortFilter(): Array<Tag> = sortFilter
 fun getMigrateFilter(): Array<Tag> = migrateFilter
 fun getThemeFilter(): Array<Tag> = themeFilter
@@ -62,8 +56,13 @@ private fun getCurrentWeekdayCode(): String {
 
 fun buildDongmanFilterList(): FilterList {
     val allWeekdays = listOf(
-        "MONDAY" to "周一", "TUESDAY" to "周二", "WEDNESDAY" to "周三",
-        "THURSDAY" to "周四", "FRIDAY" to "周五", "SATURDAY" to "周六", "SUNDAY" to "周日",
+        "MONDAY" to "周一",
+        "TUESDAY" to "周二",
+        "WEDNESDAY" to "周三",
+        "THURSDAY" to "周四",
+        "FRIDAY" to "周五",
+        "SATURDAY" to "周六",
+        "SUNDAY" to "周日",
     )
     val currentWeekday = getCurrentWeekdayCode()
     val weekdayNames = mutableListOf("今天")
@@ -80,26 +79,17 @@ fun buildDongmanFilterList(): FilterList {
     weekdayValues.add("NEW")
 
     return FilterList(
-        Filter.Header("先选入口；入口互斥，不会组合筛选；排序只管更新里的周几/完结"),
-        BrowseModeFilter(),
-        Filter.Separator(),
-        Filter.Header("更新入口：默认今天；排序只对周几/完结有效，新作不吃排序"),
+        Filter.Header("更新"),
         WeekdayFilter(weekdayNames.toTypedArray(), weekdayValues.toTypedArray()),
         SortFilter(),
         Filter.Separator(),
-        Filter.Header("题材入口"),
+        Filter.Header("题材：独立请求，不读取排序"),
         ThemeFilter(),
         Filter.Separator(),
-        Filter.Header("我的漫画入口"),
+        Filter.Header("我的漫画：独立请求"),
         MigrateFilter(),
     )
 }
-
-class BrowseModeFilter : Filter.Select<String>(
-    "入口",
-    getBrowseModeFilter().map { it.name }.toTypedArray(),
-    0,
-)
 
 class SortFilter : Filter.Sort(
     "更新排序",
