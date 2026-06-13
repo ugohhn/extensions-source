@@ -35,6 +35,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.concurrent.locks.ReentrantLock
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
@@ -57,6 +58,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var dialogContext: Context? = null
     internal var isLoginDialogShowing = false
     internal var loginSuccessHandled = false
+
+    private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
+    private val autoUnlockLocksGuard = Any()
+
+    private fun getAutoUnlockLock(key: String): ReentrantLock = synchronized(autoUnlockLocksGuard) {
+        autoUnlockLocks.getOrPut(key) { ReentrantLock() }
+    }
+
+    private fun autoUnlockLog(message: String) {
+        Log.d("DongmanAutoUnlock", message)
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // 独立存储（Cookie 文件读写）
@@ -85,18 +97,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val (fileSes, fileChk) = readCookieFromFile()
         val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        val cm = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
         val msg = buildString {
-            append("$label\n")
-            append("manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource\n")
-            append("cache=${shortCookieForDebug(cachedCookie)}\n")
-            append("file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}\n")
-            append("cm=${shortCookieForDebug(cm)}")
+            append("$label ")
+            append("manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource ")
+            append("cache=${shortCookieForDebug(cachedCookie)} ")
+            append("file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}")
         }
-        Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
-        }
+        Log.d("DongmanCookieDebug", msg)
     }
 
     internal fun debugRequest(label: String, request: Request): Request {
@@ -117,9 +124,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
         Log.d("DongmanRequest", msg.replace("\n", " | "))
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
-        }
         return request
     }
 
@@ -181,7 +185,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
-            Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
+            Log.d("DongmanCookie", "Cookie 已写入文件: ses=${neoSes.length},chk=${neoChk.length}")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
             cachedCookieSource = "save-file"
@@ -246,9 +250,45 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var cacheLoginValid: Boolean? = null
 
     private fun probeIsLoginValid(): Boolean {
-        // 调试阶段先禁用失效探针，避免 /member/isLogin 误判后把本地 Cookie 清掉。
-        Log.d("DongmanCookieDebug", "probeIsLoginValid skipped")
-        return true
+        if (!getManualCookieEnable() && !useIndependentStorage()) return true
+        val now = System.currentTimeMillis()
+        if (now - lastProbeTime < 60_000 && cacheLoginValid != null) {
+            return cacheLoginValid!!
+        }
+        return try {
+            val req = Request.Builder()
+                .url("${baseUrl}/member/isLogin")
+                .headers(headersBuilder().build())
+                .build()
+            Log.d("DongmanLoginProbe", "PROBE_START cookie=${shortCookieForDebug(req.header("Cookie"))}")
+            val resp = client.newCall(req).execute()
+            val body = resp.body.string().trim()
+            val code = resp.code
+            resp.close()
+
+            val valid = code == 200 && body.equals("true", ignoreCase = true)
+            val invalid = code == 200 && body.equals("false", ignoreCase = true)
+            lastProbeTime = now
+            cacheLoginValid = if (valid || invalid) valid else true
+            Log.d("DongmanLoginProbe", "PROBE_RESULT code=$code valid=$valid invalid=$invalid body=${body.take(80)}")
+
+            if (invalid) {
+                Log.d("DongmanLoginProbe", "PROBE_INVALID_CLEAR_LOCAL_COOKIE")
+                preferences.edit()
+                    .remove(KEY_NEO_SES)
+                    .remove(KEY_NEO_CHK)
+                    .putBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
+                    .apply()
+                deleteCookieFile()
+                refreshCookieCache()
+                syncLoginIndicator()
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Log.d("DongmanLoginProbe", "PROBE_ERROR keep_cookie ${e.javaClass.simpleName}:${e.message}")
+            true
+        }
     }
 
     internal fun refreshCookieCache() {
@@ -303,7 +343,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         lastManualCookieState = manual
         Log.d(
             "DongmanCookie",
-            "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${cachedCookie ?: "(无)"}",
+            "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${shortCookieForDebug(cachedCookie)}",
         )
         showCookieDebug("REFRESH", force = false)
     }
@@ -876,33 +916,79 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
-        Log.d("DongmanCookie", "=== 自动解锁开始 titleNo=$titleNo, episodeNo=$episodeNo ===")
-        val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        val savedCookie = cookieHeader()
-        val reqHeaders = headersBuilder()
-            .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
-            .build()
-        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.get("Cookie")}")
+        val key = "${titleNo}_${episodeNo}"
+        val threadName = Thread.currentThread().name
+        val lock = getAutoUnlockLock(key)
 
-        val priceResp = client.newCall(debugRequest("AUTO_PRICE", GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders))).execute()
-        val priceJson = org.json.JSONObject(priceResp.body.string())
-        val data = priceJson.optJSONObject("data") ?: return
-        val isFree = data.optBoolean("free", true)
-        if (isFree) return
-        val isLimit = data.optBoolean("isLimit", false)
-        if (isLimit) return
-        val price = data.optInt("price", 0)
-        val coinCount = data.optInt("coinCount", 0)
-        val episodeName = data.optString("episodeName", "本话")
-        if (coinCount < price) {
-            throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
+        autoUnlockLog("AUTO_UNLOCK_ATTEMPT key=$key thread=$threadName")
+        val acquiredImmediately = lock.tryLock()
+        if (!acquiredImmediately) {
+            autoUnlockLog("AUTO_LOCK_BLOCKED_SKIP key=$key thread=$threadName")
+            return
         }
-        val payResp = client.newCall(debugRequest("AUTO_PAY", GET("$baseUrl/episode/unlock/pay?$params", reqHeaders))).execute()
-        val payJson = org.json.JSONObject(payResp.body.string())
-        if (payJson.optInt("code") != 200) return
-        Log.d("DongmanCookie", "自动解锁成功")
+        autoUnlockLog("AUTO_LOCK_ACQUIRED key=$key thread=$threadName")
+
+        try {
+            autoUnlockLog("AUTO_UNLOCK_START key=$key thread=$threadName")
+            val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
+            val savedCookie = cookieHeader()
+            val reqHeaders = headersBuilder()
+                .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
+                .set("X-Requested-With", "XMLHttpRequest")
+                .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
+                .build()
+            autoUnlockLog("AUTO_HEADER key=$key cookie=${shortCookieForDebug(reqHeaders.get("Cookie"))}")
+
+            autoUnlockLog("AUTO_PRICE_START key=$key")
+            val priceResp = client.newCall(debugRequest("AUTO_PRICE", GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders))).execute()
+            val priceBody = priceResp.body.string()
+            val priceJson = org.json.JSONObject(priceBody)
+            val data = priceJson.optJSONObject("data")
+            if (data == null) {
+                autoUnlockLog("AUTO_PRICE_NO_DATA key=$key code=${priceJson.optInt("code")} message=${priceJson.optString("message")}")
+                return
+            }
+
+            val isFree = data.optBoolean("free", true)
+            val isLimit = data.optBoolean("isLimit", false)
+            val price = data.optInt("price", 0)
+            val coinCount = data.optInt("coinCount", 0)
+            val beanCount = data.optInt("beanCount", 0)
+            val episodeName = data.optString("episodeName", "本话")
+            autoUnlockLog("AUTO_PRICE_RESULT key=$key free=$isFree limit=$isLimit price=$price coin=$coinCount bean=$beanCount episode=$episodeName")
+
+            if (isFree) {
+                autoUnlockLog("AUTO_PAY_SKIP_FREE key=$key")
+                return
+            }
+            if (isLimit) {
+                autoUnlockLog("AUTO_PAY_SKIP_LIMIT key=$key")
+                return
+            }
+            if (coinCount < price) {
+                autoUnlockLog("AUTO_PAY_SKIP_BALANCE_LOW key=$key price=$price coin=$coinCount episode=$episodeName")
+                throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
+            }
+
+            autoUnlockLog("AUTO_PAY_START key=$key price=$price coinBefore=$coinCount")
+            val payResp = client.newCall(debugRequest("AUTO_PAY", GET("$baseUrl/episode/unlock/pay?$params", reqHeaders))).execute()
+            val payBody = payResp.body.string()
+            val payJson = org.json.JSONObject(payBody)
+            val payCode = payJson.optInt("code")
+            val payMessage = payJson.optString("message")
+            autoUnlockLog("AUTO_PAY_RESULT key=$key code=$payCode message=$payMessage")
+            if (payCode != 200) {
+                autoUnlockLog("AUTO_PAY_FAIL_CODE key=$key code=$payCode message=$payMessage")
+                return
+            }
+            autoUnlockLog("AUTO_UNLOCK_DONE key=$key")
+        } catch (e: Exception) {
+            autoUnlockLog("AUTO_UNLOCK_ERROR key=$key error=${e.javaClass.simpleName}:${e.message}")
+            throw e
+        } finally {
+            lock.unlock()
+            autoUnlockLog("AUTO_LOCK_RELEASE key=$key thread=$threadName")
+        }
     }
 
     override fun pageListParse(response: Response): List<Page> {
