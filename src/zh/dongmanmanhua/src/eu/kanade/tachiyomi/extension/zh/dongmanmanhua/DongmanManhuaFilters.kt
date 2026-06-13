@@ -86,26 +86,26 @@ fun getFilterList(): FilterList {
 }
 
 class SortFilter : Filter.Sort(
-    name = "排序",
-    values = getSortFilter().map { it.name }.toTypedArray(),
-    default = Filter.Sort.Selection(0, true)
+    "排序",
+    getSortFilter().map { it.name }.toTypedArray(),
+    Selection(0, true),
 )
 
 class WeekdayFilter(
     private val names: Array<String>,
-    private val values: Array<String>
+    private val values: Array<String>,
 ) : Filter.Select<String>("更新", names, 0) {
     fun getSelectedValue(): String = values[state]
 }
 
 class ThemeFilter : Filter.Select<String>(
-    name = "题材",
-    values = getThemeFilter().map { it.name }.toTypedArray(),
-    default = 0
+    "题材",
+    getThemeFilter().map { it.name }.toTypedArray(),
+    0,
 )
 
 class MigrateFilter : Filter.Select<String>(
-    name = "我的漫画",
-    values = getMigrateFilter().map { it.name }.toTypedArray(),
-    default = 0
+    "我的漫画",
+    getMigrateFilter().map { it.name }.toTypedArray(),
+    0,
 )
