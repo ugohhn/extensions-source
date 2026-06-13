@@ -142,45 +142,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
 
 
-    internal fun logCookieDiagnostic(label: String) {
-        val urls = listOf(
-            baseUrl,
-            "https://dongmanmanhua.cn",
-            "https://www.dongmanmanhua.cn",
-            "https://m.dongmanmanhua.cn",
-        )
-        Log.d(
-            "DongmanCookieDiag",
-            "$label STATE loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}",
-        )
-        urls.forEach { url ->
-            val cmCookie = CookieManager.getInstance().getCookie(url).orEmpty()
-            Log.d(
-                "DongmanCookieDiag",
-                "$label CM url=$url cookie=${shortCookieForDebug(cmCookie)} len=${cmCookie.length} " +
-                    "hasSes=${extractCookieValue(cmCookie, "NEO_SES").isNotEmpty()} " +
-                    "hasChk=${extractCookieValue(cmCookie, "NEO_CHK").isNotEmpty()}",
-            )
-        }
-    }
-
-    internal fun logCookieDiagnosticDelayed(label: String) {
-        logCookieDiagnostic("${label}_NOW")
-        Handler(Looper.getMainLooper()).postDelayed({
-            logCookieDiagnostic("${label}_DELAY_500MS")
-        }, 500L)
-        Handler(Looper.getMainLooper()).postDelayed({
-            logCookieDiagnostic("${label}_DELAY_1500MS")
-        }, 1500L)
-    }
-
     private fun callerForDebug(): String {
         val ignored = setOf(
             "getStackTrace",
             "callerForDebug",
             "cookieStateForDebug",
-            "logCookieDiagnostic",
-            "logCookieDiagnosticDelayed",
             "showCookieDebug",
             "syncLoginIndicator",
             "cookieHeader",
@@ -417,8 +383,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun syncLoginIndicator() {
+        refreshCookieCache()
         val caller = callerForDebug()
         val shouldChecked = isLoginKnown()
+        if (!shouldChecked) {
+            loginSuccessHandled = false
+        }
         val oldChecked = if (::loginIndicator.isInitialized) loginIndicator.isChecked else null
         Log.d(
             "DongmanLoginIndicator",
@@ -453,8 +423,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
         dialogContext = ctx
         Log.d("DongmanSetupDebug", "SETUP_ENTER ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
-        logCookieDiagnosticDelayed("SETUP_ENTER")
-
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
             if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
@@ -494,6 +462,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }.also(screen::addPreference)
 
         refreshCookieCache()
+        if (!isLoginKnown()) {
+            loginSuccessHandled = false
+        }
         Log.d("DongmanSetupDebug", "SETUP_AFTER_FIRST_REFRESH ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
 
         SwitchPreferenceCompat(ctx).apply {
@@ -527,6 +498,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
                 else -> {
+                    loginSuccessHandled = false
                     Log.d(
                         "DongmanPasswordLogin",
                         "LOGIN_CONFIRM userLen=${username.length} passLen=${password.length} ${cookieStateForDebug()}",
@@ -554,20 +526,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearBackupOnly()
-                false
-            }
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(ctx).apply {
-            key = PREF_COOKIE_DIAG_TRIGGER
-            title = "打印Cookie诊断日志"
-            summary = "清除 Mihon 全局 Cookie 后点这里，查看 CookieManager / 备份 / 当前请求源"
-            setDefaultValue(false)
-            setOnPreferenceChangeListener { _, _ ->
-                Log.d("DongmanCookieDiag", "DIAG_TRIGGER_CLICK ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
-                logCookieDiagnosticDelayed("DIAG_TRIGGER")
-                refreshCookieCache()
-                syncLoginIndicator()
                 false
             }
         }.also(screen::addPreference)
@@ -603,9 +561,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        refreshCookieCache()
-        Log.d("DongmanSetupDebug", "SETUP_EXIT_AFTER_FINAL_REFRESH ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
-        logCookieDiagnosticDelayed("SETUP_EXIT")
+        syncLoginIndicator()
+        Log.d("DongmanSetupDebug", "SETUP_EXIT_AFTER_FINAL_SYNC ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
+        Handler(Looper.getMainLooper()).postDelayed({
+            syncLoginIndicator()
+        }, 300L)
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -673,14 +633,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             .apply()
                         Handler(Looper.getMainLooper()).post {
                             Log.d("DongmanPasswordLogin", "LOGIN_UI_ENTER beforeHandled=$loginSuccessHandled elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
-                            if (!loginSuccessHandled) {
-                                loginSuccessHandled = true
-                                Log.d("DongmanPasswordLogin", "LOGIN_UI_HANDLE_SUCCESS setHandled=true elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
-                                syncLoginIndicator()
-                                Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
-                            } else {
-                                Log.d("DongmanPasswordLogin", "LOGIN_UI_SKIP_ALREADY_HANDLED elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
-                            }
+                            loginSuccessHandled = true
+                            syncLoginIndicator()
+                            Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
+                            Log.d("DongmanPasswordLogin", "LOGIN_UI_HANDLE_SUCCESS setHandled=true elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
                             Log.d("DongmanPasswordLogin", "LOGIN_FINISH success elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
                         }
                     } else {
@@ -730,6 +686,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         clearManualBackup()
         Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_CLEAR_MANUAL loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         refreshCookieCache()
+        loginSuccessHandled = false
         Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER_REFRESH loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         syncLoginIndicator()
         Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
@@ -751,6 +708,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         clearManualBackup()
         Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_CLEAR_MANUAL loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         refreshCookieCache()
+        if (!isLoginKnown()) {
+            loginSuccessHandled = false
+        }
         Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER_REFRESH loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
         syncLoginIndicator()
         Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}")
@@ -1230,7 +1190,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_LOGIN_PASSWORD = "pref_login_password"
         internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
-        internal const val PREF_COOKIE_DIAG_TRIGGER = "pref_cookie_diag_trigger"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val KEY_NEO_SES = "neo_ses"
