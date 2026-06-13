@@ -57,6 +57,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal val appContext by lazy { Injekt.get<android.app.Application>() }
     internal var dialogContext: Context? = null
     internal var isLoginDialogShowing = false
+    internal var loginSuccessHandled = false
     @Volatile
     private var passwordLoginInProgress = false
 
@@ -71,6 +72,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun finishPasswordLogin() = synchronized(this) {
         passwordLoginInProgress = false
+    }
+
+    private fun isPasswordLoginInProgress(): Boolean = synchronized(this) {
+        passwordLoginInProgress
     }
 
     private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
@@ -514,6 +519,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }.also(screen::addPreference)
 
         addDualInputPreference(screen, this) { username, password ->
+            refreshCookieCache()
+            if (isLoginKnown()) {
+                syncLoginIndicator()
+                Toast.makeText(ctx, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
+                Log.d("DongmanPasswordLogin", "LOGIN_CONFIRM_SKIP_ALREADY_LOGGED_IN ${cookieStateForDebug()}")
+                return@addDualInputPreference
+            }
+            if (isPasswordLoginInProgress()) {
+                Toast.makeText(ctx, "正在登录，请稍候", Toast.LENGTH_SHORT).show()
+                Log.d("DongmanPasswordLogin", "LOGIN_CONFIRM_SKIP_IN_PROGRESS ${cookieStateForDebug()}")
+                return@addDualInputPreference
+            }
             when {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
@@ -592,6 +609,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     internal fun loginWithPassword(username: String, password: String) {
+        refreshCookieCache()
+        if (isLoginKnown()) {
+            Log.d("DongmanPasswordLogin", "LOGIN_SKIP_ALREADY_LOGGED_IN userLen=${username.length} ${cookieStateForDebug()}")
+            Handler(Looper.getMainLooper()).post {
+                syncLoginIndicator()
+                Toast.makeText(appContext, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (!tryStartPasswordLogin()) {
             Log.d("DongmanPasswordLogin", "LOGIN_SKIP_ALREADY_IN_PROGRESS userLen=${username.length} ${cookieStateForDebug()}")
             Handler(Looper.getMainLooper()).post {
