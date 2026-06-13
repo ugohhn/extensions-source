@@ -99,6 +99,14 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
         return
     }
+
+    refreshCookieCache()
+    if (cachedCookie?.contains("NEO_SES=") == true) {
+        syncLoginIndicator()
+        Toast.makeText(appContext, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
+        return
+    }
+
     isLoginDialogShowing = true
     loginSuccessHandled = false
 
