@@ -693,8 +693,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
+        val document = response.asJsoup()
+
         if (weekday == "NEW") {
-            val document = response.asJsoup()
             val entries = document.select(".new_works_items").mapNotNull { item ->
                 SManga.create().apply {
                     setUrlWithoutDomain(item.absUrl("href"))
@@ -704,9 +705,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }.filter { it.title.isNotEmpty() }
             return MangasPage(entries, false)
         }
-        val document = response.asJsoup()
-        val entries = document
-            .select("li[id^=title_li_] > a, ul.daily_card li a")
+
+        // 优先：服务端已按 weekday 参数过滤，直接取全部 li
+        // 兜底：旧版按 div._list_WEEKDAY 分区（某些页面结构）
+        val todayDiv = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
+            Calendar.SUNDAY -> "div._list_SUNDAY"
+            Calendar.MONDAY -> "div._list_MONDAY"
+            Calendar.TUESDAY -> "div._list_TUESDAY"
+            Calendar.WEDNESDAY -> "div._list_WEDNESDAY"
+            Calendar.THURSDAY -> "div._list_THURSDAY"
+            Calendar.FRIDAY -> "div._list_FRIDAY"
+            Calendar.SATURDAY -> "div._list_SATURDAY"
+            else -> "div._list_MONDAY"
+        }
+        val targetDiv = when (weekday) {
+            "" -> todayDiv
+            "COMPLETE" -> "div._list_COMPLETE"
+            else -> "div._list_$weekday"
+        }
+        val entries = (
+            document.select("$targetDiv li > a") +
+                document.select("li[id^=title_li_] > a") +
+                document.select("ul.daily_card li a")
+            )
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
@@ -1105,4 +1126,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-                               }
+}
