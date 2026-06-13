@@ -4,7 +4,6 @@ import android.app.AlertDialog
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -45,30 +44,24 @@ internal class LoginWebView(
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        Log.d("DongmanIME", "dispatchTouchEvent action=${event.action} x=${event.x} y=${event.y}")
         return super.dispatchTouchEvent(event)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        Log.d("DongmanIME", "onTouchEvent action=${event.action} x=${event.x} y=${event.y}")
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 val x = event.x
                 val y = event.y
                 val keyboardVisible = isKeyboardActuallyVisible()
-                Log.d("DongmanIME", "ACTION_DOWN keyboardVisible=$keyboardVisible formRects=$extFormRects")
                 if (keyboardVisible && extFormRects.isNotEmpty()) {
                     val inForm = extFormRects.any { rect ->
                         x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
                     }
-                    Log.d("DongmanIME", "inForm=$inForm rect=${extFormRects.firstOrNull()}")
                     if (!inForm) {
-                        Log.d("DongmanIME", "键盘弹出时点击表单外，吞掉整个序列")
                         swallowingCurrentSequence = true
                         return true
                     }
                 } else {
-                    Log.d("DongmanIME", "键盘未显示或 formRects 为空，放行")
                 }
                 swallowingCurrentSequence = false
             }
@@ -105,7 +98,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
     syncLoginIndicator()
     if (isLoginKnown()) {
         Toast.makeText(appContext, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
-        Log.d("DongmanCookie", "WEBVIEW_LOGIN_SKIP_ALREADY_LOGGED_IN ${cookieStateForDebug()}")
         return
     }
 
@@ -124,31 +116,17 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         val neoSes = extractCookieValue(cookieStr, "NEO_SES")
         val neoChk = extractCookieValue(cookieStr, "NEO_CHK")
 
-        Log.d(
-            "DongmanCookie",
-            "LOGIN_CHECK handled=$loginSuccessHandled cookieLen=${cookieStr.length} " +
-                "ses=${neoSes.length} chk=${neoChk.length} raw=${cookieStr.take(300)}",
-        )
 
         if (loginSuccessHandled) {
-            Log.d("DongmanCookie", "LOGIN_SKIP already_handled")
             return false
         }
 
         if (neoSes.isEmpty()) {
-            Log.d(
-                "DongmanCookie",
-                "LOGIN_SKIP no_NEO_SES chk=${neoChk.length} raw=${cookieStr.take(300)}",
-            )
             return false
         }
 
         loginSuccessHandled = true
 
-        Log.d(
-            "DongmanCookie",
-            "LOGIN_SAVE ses=${neoSes.length} chk=${neoChk.length}",
-        )
 
         saveLoginCookie(neoSes, neoChk)
         refreshCookieCache()
@@ -205,7 +183,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                         })()
                         """.trimIndent(),
                     ) { value ->
-                        Log.d("DongmanIME", "初始 formRects JS 返回: $value")
                         val raw = value?.trim('"') ?: return@evaluateJavascript
                         val coords = raw.substringBefore("|").split(",")
                         if (coords.size == 4) {
@@ -218,7 +195,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                     coords[3].toFloat(),
                                 ),
                             )
-                            Log.d("DongmanIME", "初始 formRects 已缓存: $formRects")
                             (view as LoginWebView).updateFormRects(formRects.toList())
                         }
                     }
@@ -228,7 +204,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
             // ── 页面加载完成：检测登录结果 ──
             override fun onPageFinished(view: WebView?, url: String?) {
                 val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-                Log.d("DongmanCookie", "WebView 登录后 CookieManager: $cookieStr")
                 handleLoginSuccess(cookieStr)
             }
         }
@@ -245,7 +220,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
     loginPollRunnable = object : Runnable {
         override fun run() {
             val cookieStr = CookieManager.getInstance().getCookie(baseUrl) ?: ""
-            Log.d("DongmanCookie", "WebView 登录轮询 CookieManager: $cookieStr")
             if (!handleLoginSuccess(cookieStr)) {
                 loginPollHandler?.postDelayed(this, 800)
             }
@@ -281,10 +255,8 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
             if (keyboardHeight < 0) return
 
             val keyboardNowVisible = keyboardHeight > 150
-            Log.d("DongmanIME", "onGlobalLayout keyboardHeight=$keyboardHeight keyboardNowVisible=$keyboardNowVisible isKeyboardVisible=$isKeyboardVisible")
 
             if (keyboardNowVisible == isKeyboardVisible) return
-            Log.d("DongmanIME", "★ 键盘状态切换: $isKeyboardVisible -> $keyboardNowVisible")
             isKeyboardVisible = keyboardNowVisible
 
             if (keyboardNowVisible) {
@@ -300,7 +272,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                     """.trimIndent(),
                 ) { value ->
                     val targetScrollY = value?.trim('"')?.toFloatOrNull()?.toInt() ?: return@evaluateJavascript
-                    Log.d("DongmanIME", "键盘弹出 scrollTo(0, $targetScrollY)")
                     Handler(Looper.getMainLooper()).post {
                         webView.scrollTo(0, targetScrollY)
                         // 延迟 200ms 等滚动稳定后重新缓存 formRects
@@ -327,7 +298,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                             coords[3].toFloat(),
                                         ),
                                     )
-                                    Log.d("DongmanIME", "键盘弹出后 formRects 更新: $formRects")
                                     webView.updateFormRects(formRects.toList())
                                 }
                             }
@@ -338,7 +308,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                 // 键盘收起：复位到顶部，重新缓存 formRects
                 Handler(Looper.getMainLooper()).post {
                     webView.scrollTo(0, 0)
-                    Log.d("DongmanIME", "键盘收起 scrollTo(0, 0)")
                     webView.postDelayed({
                         webView.evaluateJavascript(
                             """
@@ -362,7 +331,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                                         coords[3].toFloat(),
                                     ),
                                 )
-                                Log.d("DongmanIME", "键盘收起后 formRects 更新: $formRects")
                                 webView.updateFormRects(formRects.toList())
                             }
                         }
