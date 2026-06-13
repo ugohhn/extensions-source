@@ -372,7 +372,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         showCookieDebug("REFRESH", force = false)
     }
 
-    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+    // 登录状态指示灯只表示 WebView / CookieManager 的登录状态。
+    // 不再用 cachedCookie 判断，避免“全局 Cookie 已清，但手动备用 cookie.dat 还在”时误显示为已登录。
+    internal fun isLoginKnown(): Boolean {
+        val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+        return cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")
+    }
 
     internal fun syncLoginIndicator() {
         if (::loginIndicator.isInitialized) {
@@ -382,6 +387,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (::manualCookieSwitch.isInitialized) {
             manualCookieSwitch.summary = buildManualSwitchSummary()
         }
+        logCookieStoresDetailed("SYNC_LOGIN_INDICATOR", 300, "登录状态指示灯已按 CookieManager 刷新；备用 Cookie 不参与登录灯判断")
     }
 
     internal lateinit var loginIndicator: SwitchPreferenceCompat
@@ -677,11 +683,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun buildLoginSummary(): String {
-        val isLoggedIn = cachedCookie?.isNotEmpty() == true
-        val status = if (isLoggedIn) "已登录" else "未登录"
+        val status = if (isLoginKnown()) "已登录" else "未登录"
+        val requestCookie = if (cachedCookie?.isNotEmpty() == true) "可用" else "无"
         val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
-        return "存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
+        return "登录状态：$status（仅看 CookieManager）\n存储方式：$storageMode\n手动模式：$manualMode\n请求Cookie：$requestCookie，来源：$cachedCookieSource"
     }
 
     // ══════════════════════════════════════════════════════════════════════
