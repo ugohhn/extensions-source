@@ -123,6 +123,61 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return request
     }
 
+    internal fun mergeSetCookieFromResponse(response: Response) {
+        val setCookies = response.headers.values("Set-Cookie").joinToString("; ")
+        if (setCookies.isBlank()) return
+
+        val newSes = extractCookieValue(setCookies, "NEO_SES")
+        val newChk = extractCookieValue(setCookies, "NEO_CHK")
+        if (newSes.isBlank() && newChk.isBlank()) return
+
+        val (fileSes, fileChk) = readCookieFromFile()
+        val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+        val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        val cacheSes = extractCookieValue(cachedCookie.orEmpty(), "NEO_SES")
+        val cacheChk = extractCookieValue(cachedCookie.orEmpty(), "NEO_CHK")
+
+        val mergedSes = newSes.ifBlank { cacheSes.ifBlank { fileSes.ifBlank { spSes } } }
+        val mergedChk = newChk.ifBlank { cacheChk.ifBlank { fileChk.ifBlank { spChk } } }
+
+        if (mergedSes.isBlank()) {
+            Log.d(
+                "DongmanCookie",
+                "MERGE_SET_COOKIE skipped: no NEO_SES, new=${shortCookieForDebug(setCookies)}",
+            )
+            return
+        }
+
+        val oldCookie = buildCookieString(
+            cacheSes.ifBlank { fileSes.ifBlank { spSes } },
+            cacheChk.ifBlank { fileChk.ifBlank { spChk } },
+        )
+        val mergedCookie = buildCookieString(mergedSes, mergedChk)
+        if (mergedCookie == oldCookie && cachedCookie == mergedCookie) return
+
+        preferences.edit()
+            .putString(KEY_NEO_SES, mergedSes)
+            .putString(KEY_NEO_CHK, mergedChk)
+            .apply()
+
+        try {
+            getCookieFile().writeText("$mergedSes|$mergedChk")
+        } catch (e: Exception) {
+            Log.e("DongmanCookie", "MERGE_SET_COOKIE 写入文件失败", e)
+        }
+
+        cachedCookie = mergedCookie
+        lastIndependentState = useIndependentStorage()
+        lastManualCookieState = getManualCookieEnable()
+        cachedCookieSource = "merge-set-cookie"
+
+        Log.d(
+            "DongmanCookie",
+            "MERGE_SET_COOKIE new=${shortCookieForDebug(setCookies)} merged=${shortCookieForDebug(mergedCookie)}",
+        )
+        showCookieDebug("MERGE_SET_COOKIE", force = true)
+    }
+
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
@@ -567,8 +622,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // 禁用 OkHttp 自动 CookieJar，避免它用 CookieManager 里的旧 Cookie 覆盖我们手动注入的 Cookie。
+    // 同时手动捕获服务器返回的 NEO_CHK，并合并进独立存储。
     override val client = network.client.newBuilder()
         .cookieJar(CookieJar.NO_COOKIES)
+        .addNetworkInterceptor { chain ->
+            val response = chain.proceed(chain.request())
+            mergeSetCookieFromResponse(response)
+            response
+        }
         .build()
 
     // ══════════════════════════════════════════════════════════════════════
