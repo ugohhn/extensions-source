@@ -99,14 +99,12 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         Toast.makeText(appContext, "页面已关闭，请稍后再试", Toast.LENGTH_SHORT).show()
         return
     }
-
     refreshCookieCache()
     if (cachedCookie?.contains("NEO_SES=") == true) {
         syncLoginIndicator()
         Toast.makeText(appContext, "已登录，无需重复登录", Toast.LENGTH_SHORT).show()
         return
     }
-
     isLoginDialogShowing = true
     loginSuccessHandled = false
 
@@ -115,8 +113,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
     var lastLayoutTime = 0L
     val formRects = mutableListOf<InputRect>()
 
-    var captchaPollHandler: Handler? = null
-    var captchaPollRunnable: Runnable? = null
     var loginPollHandler: Handler? = null
     var loginPollRunnable: Runnable? = null
 
@@ -126,19 +122,7 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         if (loginSuccessHandled || neoSes.isEmpty()) return false
 
         loginSuccessHandled = true
-        preferences.edit()
-            .putString(DongmanManhua.KEY_NEO_SES, neoSes)
-            .putString(DongmanManhua.KEY_NEO_CHK, neoChk)
-            .apply()
-
-        if (useIndependentStorage()) {
-            saveCookieToFile(neoSes, neoChk)
-        } else {
-            cachedCookie = buildCookieString(neoSes, neoChk)
-            lastIndependentState = useIndependentStorage()
-        }
-        saveCookieToFile(neoSes, neoChk)
-        refreshCookieCache()
+        saveLoginCookie(neoSes, neoChk)
 
         Handler(Looper.getMainLooper()).post {
             syncLoginIndicator()
@@ -202,38 +186,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
                     }
                 }, 500)
 
-                // 每秒轮询验证码相关元素（仅用于日志调试）
-                val handler = Handler(Looper.getMainLooper())
-                val runnable = object : Runnable {
-                    override fun run() {
-                        view?.evaluateJavascript("""
-                            (function(){
-                                var all = document.querySelectorAll('[class*="verify"],[class*="captcha"],[class*="slider"],[class*="click"],[class*="geetest"]');
-                                var result = [];
-                                Array.prototype.forEach.call(all, function(el) {
-                                    var r = el.getBoundingClientRect();
-                                    var style = getComputedStyle(el);
-                                    result.push({
-                                        tag: el.tagName,
-                                        cls: el.className,
-                                        top: r.top, bottom: r.bottom,
-                                        left: r.left, right: r.right,
-                                        w: r.width, h: r.height,
-                                        display: style.display,
-                                        visibility: style.visibility
-                                    });
-                                });
-                                return JSON.stringify(result);
-                            })();
-                        """.trimIndent()) { result ->
-                            Log.d("DongmanIME", "【验证码相关元素】$result")
-                        }
-                        handler.postDelayed(this, 1000)
-                    }
-                }
-                captchaPollHandler = handler
-                captchaPollRunnable = runnable
-                handler.postDelayed(runnable, 1000)
             }
 
             // ── 页面加载完成：检测登录结果 ──
@@ -374,7 +326,6 @@ internal fun DongmanManhua.showWebViewLoginDialog() {
         isLoginDialogShowing = false
         loginSuccessHandled = false
         rootView.viewTreeObserver.removeOnGlobalLayoutListener(listener)
-        captchaPollRunnable?.let { captchaPollHandler?.removeCallbacks(it) }
         loginPollRunnable?.let { loginPollHandler?.removeCallbacks(it) }
         webView.destroy()
     }
