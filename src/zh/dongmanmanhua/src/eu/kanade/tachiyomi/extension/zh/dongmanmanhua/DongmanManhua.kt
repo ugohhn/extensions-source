@@ -313,6 +313,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun refreshCookieCache() {
+        logCookieStoresDetailed("REFRESH_ENTER", 200, "进入 refreshCookieCache() 前：用于观察当前 cm/sp/file/manual/cache 原始状态")
+
         val independent = useIndependentStorage()
         val manual = getManualCookieEnable()
         var source = "none"
@@ -366,6 +368,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "DongmanCookie",
             "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${cachedCookie ?: "(无)"}",
         )
+        logCookieStoresDetailed("REFRESH_EXIT", 201, "refreshCookieCache() 结束后：观察 cachedCookie/src 最终变成什么")
         showCookieDebug("REFRESH", force = false)
     }
 
@@ -392,6 +395,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
         dialogContext = ctx
 
+        logCookieStoresDetailed("SETUP_ENTER_BEFORE_NORMALIZE", 100, "进入扩展设置页第一时间：专门检测 Mihon/软件外部清全局 Cookie 后 cm/sp/file 是否还在")
+
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
             if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
@@ -399,6 +404,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         editor.apply()
+        logCookieStoresDetailed("SETUP_AFTER_NORMALIZE_PREFS", 101, "布尔字符串兼容转换后：确认没有误动 NEO_SES/NEO_CHK")
 
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
@@ -426,7 +432,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
+        logCookieStoresDetailed("SETUP_BEFORE_INITIAL_REFRESH", 102, "创建登录状态指示灯前，即将执行第一次 refreshCookieCache()")
         refreshCookieCache()
+        logCookieStoresDetailed("SETUP_AFTER_INITIAL_REFRESH", 103, "第一次 refreshCookieCache() 后：看登录指示灯创建前 cachedCookie/src 是什么")
 
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
@@ -514,7 +522,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
+        logCookieStoresDetailed("SETUP_BEFORE_FINAL_REFRESH", 104, "设置页全部 preference 创建完，即将执行结尾 refreshCookieCache()")
         refreshCookieCache()
+        logCookieStoresDetailed("SETUP_AFTER_FINAL_REFRESH", 105, "设置页结尾 refreshCookieCache() 后：这是打开设置页最终状态")
     }
 
     // ══════════════════════════════════════════════════════════════════════
