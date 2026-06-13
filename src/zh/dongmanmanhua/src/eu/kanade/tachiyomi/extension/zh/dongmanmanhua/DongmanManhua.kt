@@ -60,6 +60,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var dialogContext: Context? = null
     internal var isLoginDialogShowing = false
     internal var loginSuccessHandled = false
+    @Volatile private var passwordLoginRunning = false
 
     private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
     private val autoUnlockLocksGuard = Any()
@@ -337,8 +338,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     source = "ind-sp"
                     buildCookieString(spNeoSes, spNeoChk)
                 } else {
-                    source = "ind-empty"
-                    null
+                    val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+                    if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
+                        source = "ind-cm"
+                        cmCookie
+                    } else {
+                        source = "ind-empty"
+                        null
+                    }
                 }
             }
         } else {
@@ -373,6 +380,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     internal fun syncLoginIndicator() {
         if (::loginIndicator.isInitialized) {
+            loginIndicator.isPersistent = false
             loginIndicator.isChecked = isLoginKnown()
             loginIndicator.summary = buildLoginSummary()
         }
@@ -431,11 +439,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
+            isPersistent = false
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
             isChecked = isLoginKnown()
-            setEnabled(false)
+            isSelectable = false
             loginIndicator = this
         }.also(screen::addPreference)
 
@@ -458,7 +467,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             when {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
-                else -> loginWithPassword(username, password)
+                else -> {
+                    Log.d("DongmanPasswordLogin", "LOGIN_CONFIRM usernameLen=${username.length} passwordLen=${password.length}")
+                    loginWithPassword(username, password)
+                }
             }
         }
 
@@ -523,11 +535,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     internal fun loginWithPassword(username: String, password: String) {
+        if (passwordLoginRunning) {
+            Log.d("DongmanPasswordLogin", "LOGIN_SKIP_RUNNING")
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(appContext, "正在登录，请稍候", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        passwordLoginRunning = true
+
         Thread {
             try {
-                Log.d("DongmanCookie", "=== 开始密码登录 ===")
+                Log.d("DongmanPasswordLogin", "LOGIN_START")
+                val rsaStart = System.currentTimeMillis()
                 val rsaResp = client.newCall(GET("$baseUrl/member/login/rsa/getKeys", headersBuilder().build())).execute()
-                val rsaJson = JSONObject(rsaResp.body.string())
+                val rsaBody = rsaResp.body.string()
+                val rsaCode = rsaResp.code
+                rsaResp.close()
+                Log.d("DongmanPasswordLogin", "LOGIN_RSA_RESULT code=$rsaCode costMs=${System.currentTimeMillis() - rsaStart}")
+                val rsaJson = JSONObject(rsaBody)
                 val keyName = rsaJson.getString("keyName")
                 val nvalue = rsaJson.getString("nvalue")
                 val evalue = rsaJson.getString("evalue")
@@ -543,45 +569,56 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     .add("returnUrl", "$baseUrl/")
                     .add("loginType", "PHONE_NUMBER")
                     .build()
+                val loginStart = System.currentTimeMillis()
                 val loginResp = client.newCall(POST("$baseUrl/member/login/doLoginById", headersBuilder().build(), body)).execute()
-                val loginJson = JSONObject(loginResp.body.string())
+                val loginBody = loginResp.body.string()
+                val loginCode = loginResp.code
+                val allSetCookies = loginResp.headers.values("Set-Cookie").joinToString("; ")
+                loginResp.close()
+                Log.d("DongmanPasswordLogin", "LOGIN_RESPONSE httpCode=$loginCode costMs=${System.currentTimeMillis() - loginStart} body=${loginBody.take(120)}")
+                val loginJson = JSONObject(loginBody)
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
-                    val allSetCookies = loginResp.headers.values("Set-Cookie").joinToString("; ")
-                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $allSetCookies")
                     val neoSes = extractCookieValue(allSetCookies, "NEO_SES")
                     val neoChk = extractCookieValue(allSetCookies, "NEO_CHK")
+                    Log.d("DongmanPasswordLogin", "LOGIN_COOKIE ${shortCookieForDebug(buildCookieString(neoSes, neoChk))}")
                     if (neoSes.isNotEmpty()) {
                         saveLoginCookie(neoSes, neoChk)
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
                         if (neoChk.isNotEmpty()) {
                             CookieManager.getInstance().setCookie(baseUrl, "NEO_CHK=$neoChk; path=/")
                         }
+                        CookieManager.getInstance().flush()
                         // 登录成功，保存明文账号密码供下次填入输入框
                         preferences.edit()
                             .putString(PREF_LOGIN_USERNAME, username)
                             .putString(PREF_LOGIN_PASSWORD, password)
                             .apply()
                         Handler(Looper.getMainLooper()).post {
-                            if (!loginSuccessHandled) {
-                                loginSuccessHandled = true
-                                syncLoginIndicator()
-                                Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
-                            }
+                            syncLoginIndicator()
+                            Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                         }
                     } else {
                         Handler(Looper.getMainLooper()).post {
+                            syncLoginIndicator()
                             Toast.makeText(appContext, "登录失败：未获取到登录凭证", Toast.LENGTH_LONG).show()
                         }
                     }
                 } else {
+                    val status = loginJson.optInt("loginStatus", -1)
                     val msg = loginJson.optString("loginMessage", "登录失败")
+                    Log.d("DongmanPasswordLogin", "LOGIN_FAILED_STATUS status=$status msg=$msg")
                     throw Exception(msg)
                 }
             } catch (e: Exception) {
+                Log.d("DongmanPasswordLogin", "LOGIN_ERROR ${e.javaClass.simpleName}:${e.message}")
                 Handler(Looper.getMainLooper()).post {
+                    syncLoginIndicator()
                     Toast.makeText(appContext, "登录失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
+            } finally {
+                passwordLoginRunning = false
+                Log.d("DongmanPasswordLogin", "LOGIN_FINISH")
             }
         }.start()
     }
