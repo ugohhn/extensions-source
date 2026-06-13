@@ -39,7 +39,7 @@ import java.util.concurrent.locks.ReentrantLock
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
-    // 10a: based on 09. Only lightens request/cookie logs and removes duplicate cookieHeader() calls. Storage semantics unchanged.
+    // 10b: based on 10a. Fixes settings UI sync after clearing manual backup; storage semantics unchanged.
 
     init {
         Handler(Looper.getMainLooper()).post {
@@ -377,6 +377,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             loginIndicator.summary = buildLoginSummary()
         }
         if (::manualCookieSwitch.isInitialized) {
+            manualCookieSwitch.isChecked = getManualCookieEnable()
             manualCookieSwitch.summary = buildManualSwitchSummary()
         }
     }
