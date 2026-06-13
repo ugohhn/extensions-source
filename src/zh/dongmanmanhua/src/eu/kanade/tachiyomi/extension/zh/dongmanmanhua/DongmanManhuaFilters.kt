@@ -54,7 +54,7 @@ private fun getCurrentWeekdayCode(): String {
     }
 }
 
-fun getFilterList(): FilterList {
+fun buildDongmanFilterList(): FilterList {
     val allWeekdays = listOf(
         "MONDAY" to "周一", "TUESDAY" to "周二", "WEDNESDAY" to "周三",
         "THURSDAY" to "周四", "FRIDAY" to "周五", "SATURDAY" to "周六", "SUNDAY" to "周日"
