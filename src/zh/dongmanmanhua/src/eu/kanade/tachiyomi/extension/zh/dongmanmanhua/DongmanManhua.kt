@@ -35,6 +35,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.concurrent.locks.ReentrantLock
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
 
@@ -58,6 +59,37 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var isLoginDialogShowing = false
     internal var loginSuccessHandled = false
 
+    private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
+    private val autoUnlockLocksGuard = Any()
+    private val autoUnlockRecentSuccess = mutableMapOf<String, Long>()
+    private val autoUnlockRecentSuccessGuard = Any()
+    private val autoUnlockRecentSuccessWindowMs = 30_000L
+
+    private fun getAutoUnlockLock(key: String): ReentrantLock = synchronized(autoUnlockLocksGuard) {
+        autoUnlockLocks.getOrPut(key) { ReentrantLock() }
+    }
+
+    private fun autoUnlockLog(message: String) {
+        Log.d("DongmanAutoUnlock", message)
+    }
+
+    private fun recentAutoUnlockSuccessAge(key: String): Long? {
+        val now = System.currentTimeMillis()
+        return synchronized(autoUnlockRecentSuccessGuard) {
+            autoUnlockRecentSuccess.entries.removeAll { now - it.value > autoUnlockRecentSuccessWindowMs }
+            val lastSuccess = autoUnlockRecentSuccess[key] ?: return@synchronized null
+            val age = now - lastSuccess
+            if (age in 0 until autoUnlockRecentSuccessWindowMs) age else null
+        }
+    }
+
+    private fun markAutoUnlockSuccess(key: String) {
+        synchronized(autoUnlockRecentSuccessGuard) {
+            autoUnlockRecentSuccess[key] = System.currentTimeMillis()
+        }
+        autoUnlockLog("AUTO_RECENT_SUCCESS_MARK key=$key windowMs=$autoUnlockRecentSuccessWindowMs")
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 独立存储（Cookie 文件读写）
     // ══════════════════════════════════════════════════════════════════════
@@ -70,6 +102,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var lastManualCookieState: Boolean? = null
     internal var cachedCookieSource: String = "none"
     private var lastCookieDebugToastTime: Long = 0L
+    private var cookieHeaderCallSeq: Long = 0L
 
     internal fun shortCookieForDebug(cookie: String?): String {
         if (cookie.isNullOrBlank()) return "none"
@@ -85,100 +118,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val (fileSes, fileChk) = readCookieFromFile()
         val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        val cm = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
         val msg = buildString {
-            append("$label\n")
-            append("manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource\n")
-            append("cache=${shortCookieForDebug(cachedCookie)}\n")
-            append("file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}\n")
-            append("cm=${shortCookieForDebug(cm)}")
+            append("$label ")
+            append("manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource ")
+            append("cache=${shortCookieForDebug(cachedCookie)} ")
+            append("file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}")
         }
-        Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
-        }
+        Log.d("DongmanCookieDebug", msg)
     }
 
-    internal fun logCookieStores(label: String) {
+    internal fun cookieStateForDebug(): String {
+        val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
         val (fileSes, fileChk) = readCookieFromFile()
         val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
         val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        val cm = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        val loginUser = preferences.getString(PREF_LOGIN_USERNAME, "").orEmpty()
-        val loginPass = preferences.getString(PREF_LOGIN_PASSWORD, "").orEmpty()
-        val uaPreset = preferences.getString(PREF_UA, UA_MOBILE).orEmpty()
-        val customUa = preferences.getString(PREF_UA_CUSTOM, "").orEmpty()
-        Log.d(
-            "DongmanCookieProbe",
-            buildString {
-                append(label)
-                append(" | cm=${shortCookieForDebug(cm)} cmLen=${cm.length}")
-                append(" | spCookie=ses=${spSes.length},chk=${spChk.length}")
-                append(" | fileExists=${getCookieFile().exists()} file=ses=${fileSes.length},chk=${fileChk.length}")
-                append(" | manual=${getManualCookieEnable()} independent=${useIndependentStorage()}")
-                append(" | cache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource")
-                append(" | savedAccount=${loginUser.isNotBlank()} savedPassword=${loginPass.isNotBlank()}")
-                append(" | uaPreset=$uaPreset customUaLen=${customUa.length}")
-            },
-        )
+        return "manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource " +
+            "cm=${shortCookieForDebug(cmCookie)} cache=${shortCookieForDebug(cachedCookie)} " +
+            "file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}"
     }
 
-
-    internal fun logCookieStoresDetailed(label: String, step: Int, note: String) {
-        val file = getCookieFile()
-        val fileRaw = try {
-            if (file.exists()) file.readText() else ""
-        } catch (e: Exception) {
-            "<read-error:${e.javaClass.simpleName}>"
-        }
-        val (fileSes, fileChk) = readCookieFromFile()
-        val spHasSesKey = preferences.contains(KEY_NEO_SES)
-        val spHasChkKey = preferences.contains(KEY_NEO_CHK)
-        val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-        val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-        val cmRaw = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        Log.d(
-            "DongmanCookieProbe",
-            buildString {
-                append("STEP_${step}_$label")
-                append(" | note=$note")
-                append(" | cmExists=${cmRaw.isNotBlank()} cm=${shortCookieForDebug(cmRaw)} cmLen=${cmRaw.length}")
-                append(" | spHasSesKey=$spHasSesKey spHasChkKey=$spHasChkKey spCookie=ses=${spSes.length},chk=${spChk.length}")
-                append(" | fileExists=${file.exists()} fileRawLen=${fileRaw.length} file=ses=${fileSes.length},chk=${fileChk.length}")
-                append(" | manual=${getManualCookieEnable()} independent=${useIndependentStorage()}")
-                append(" | cache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource")
-                append(" | savedAccount=${preferences.getString(PREF_LOGIN_USERNAME, "").orEmpty().isNotBlank()}")
-                append(" | savedPassword=${preferences.getString(PREF_LOGIN_PASSWORD, "").orEmpty().isNotBlank()}")
-                append(" | loginIndicatorInit=${::loginIndicator.isInitialized}")
-                if (::loginIndicator.isInitialized) append(" loginIndicatorChecked=${loginIndicator.isChecked}")
-            },
+    private fun callerForDebug(): String {
+        val ignored = setOf(
+            "getStackTrace",
+            "callerForDebug",
+            "cookieStateForDebug",
+            "showCookieDebug",
+            "syncLoginIndicator",
+            "cookieHeader",
         )
-    }
-
-
-    internal fun logLoginIndicatorDecision(
-        label: String,
-        step: Int,
-        note: String,
-        pendingManual: Boolean? = null,
-        pendingIndependent: Boolean? = null,
-    ) {
-        val cmRaw = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        val cmLogin = cmRaw.contains("NEO_SES") || cmRaw.contains("NEO_CHK")
-        Log.d(
-            "DongmanLoginIndicator",
-            buildString {
-                append("STEP_${step}_$label")
-                append(" | note=$note")
-                append(" | cmLogin=$cmLogin cm=${shortCookieForDebug(cmRaw)} cmLen=${cmRaw.length}")
-                append(" | prefManual=${getManualCookieEnable()} prefIndependent=${useIndependentStorage()}")
-                if (pendingManual != null) append(" | pendingManual=$pendingManual")
-                if (pendingIndependent != null) append(" | pendingIndependent=$pendingIndependent")
-                append(" | requestCache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource")
-                append(" | loginIndicatorInit=${::loginIndicator.isInitialized}")
-                if (::loginIndicator.isInitialized) append(" oldChecked=${loginIndicator.isChecked}")
-            },
-        )
+        return Thread.currentThread().stackTrace
+            .firstOrNull { it.className.contains("DongmanManhua") && it.methodName !in ignored }
+            ?.let { "${it.methodName}:${it.lineNumber}" }
+            ?: "unknown"
     }
 
     internal fun debugRequest(label: String, request: Request): Request {
@@ -199,9 +170,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
         Log.d("DongmanRequest", msg.replace("\n", " | "))
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
-        }
         return request
     }
 
@@ -263,7 +231,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
-            Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
+            Log.d("DongmanCookie", "Cookie 已写入文件: ses=${neoSes.length},chk=${neoChk.length}")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
             cachedCookieSource = "save-file"
@@ -285,13 +253,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     internal fun deleteCookieFile() {
         try {
-            val file = getCookieFile()
-            val existedBefore = file.exists()
-            val deleted = file.delete()
-            Log.d(
-                "DongmanCookieProbe",
-                "DELETE_COOKIE_FILE existedBefore=$existedBefore deleted=$deleted existsAfter=${file.exists()} path=${file.absolutePath}",
-            )
+            getCookieFile().delete()
+            Log.d("DongmanCookie", "Cookie 文件已删除")
         } catch (e: Exception) {
             Log.e("DongmanCookie", "删除文件失败", e)
         }
@@ -333,14 +296,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var cacheLoginValid: Boolean? = null
 
     private fun probeIsLoginValid(): Boolean {
-        // 调试阶段先禁用失效探针，避免 /member/isLogin 误判后把本地 Cookie 清掉。
-        Log.d("DongmanCookieDebug", "probeIsLoginValid skipped")
-        return true
+        if (!getManualCookieEnable() && !useIndependentStorage()) return true
+        val now = System.currentTimeMillis()
+        if (now - lastProbeTime < 60_000 && cacheLoginValid != null) {
+            return cacheLoginValid!!
+        }
+        return try {
+            val req = Request.Builder()
+                .url("${baseUrl}/member/isLogin")
+                .headers(headersBuilder().build())
+                .build()
+            Log.d("DongmanLoginProbe", "PROBE_START cookie=${shortCookieForDebug(req.header("Cookie"))}")
+            val resp = client.newCall(req).execute()
+            val body = resp.body.string().trim()
+            val code = resp.code
+            resp.close()
+
+            val valid = code == 200 && body.equals("true", ignoreCase = true)
+            val invalid = code == 200 && body.equals("false", ignoreCase = true)
+            lastProbeTime = now
+            cacheLoginValid = if (valid || invalid) valid else true
+            Log.d("DongmanLoginProbe", "PROBE_RESULT code=$code valid=$valid invalid=$invalid body=${body.take(80)}")
+
+            if (invalid) {
+                Log.d("DongmanLoginProbe", "PROBE_INVALID_CLEAR_LOCAL_COOKIE")
+                preferences.edit()
+                    .remove(KEY_NEO_SES)
+                    .remove(KEY_NEO_CHK)
+                    .putBoolean(PREF_MANUAL_COOKIE_SWITCH, false)
+                    .apply()
+                deleteCookieFile()
+                refreshCookieCache()
+                syncLoginIndicator()
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Log.d("DongmanLoginProbe", "PROBE_ERROR keep_cookie ${e.javaClass.simpleName}:${e.message}")
+            true
+        }
     }
 
     internal fun refreshCookieCache() {
-        logCookieStoresDetailed("REFRESH_ENTER", 200, "进入 refreshCookieCache() 前：用于观察当前 cm/sp/file/manual/cache 原始状态")
-
         val independent = useIndependentStorage()
         val manual = getManualCookieEnable()
         var source = "none"
@@ -392,36 +389,37 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         lastManualCookieState = manual
         Log.d(
             "DongmanCookie",
-            "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${cachedCookie ?: "(无)"}",
+            "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${shortCookieForDebug(cachedCookie)}",
         )
-        logCookieStoresDetailed("REFRESH_EXIT", 201, "refreshCookieCache() 结束后：观察 cachedCookie/src 最终变成什么")
         showCookieDebug("REFRESH", force = false)
     }
 
-    // 登录状态指示灯只表示 WebView / CookieManager 的登录状态。
-    // 不用 cachedCookie 判断，避免“全局 Cookie 已清，但手动备用 cookie.dat 还在”时误显示为已登录。
-    internal fun isLoginKnown(): Boolean {
-        val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        val known = cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")
+    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+
+    internal fun syncLoginIndicator() {
+        val caller = callerForDebug()
+        val shouldChecked = isLoginKnown()
+        val oldChecked = if (::loginIndicator.isInitialized) loginIndicator.isChecked else null
         Log.d(
             "DongmanLoginIndicator",
-            "IS_LOGIN_KNOWN | result=$known | cm=${shortCookieForDebug(cmCookie)} cmLen=${cmCookie.length} | cache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource",
+            "SYNC_ENTER caller=$caller indicatorInit=${::loginIndicator.isInitialized} " +
+                "old=$oldChecked should=$shouldChecked ${cookieStateForDebug()}",
         )
-        return known
-    }
-
-    internal fun syncLoginIndicator(reason: String = "unspecified") {
-        logLoginIndicatorDecision("SYNC_BEFORE", 300, "准备刷新登录指示灯，reason=$reason")
-        val known = isLoginKnown()
         if (::loginIndicator.isInitialized) {
-            loginIndicator.isChecked = known
-            loginIndicator.summary = buildLoginSummary(known)
+            loginIndicator.isChecked = shouldChecked
+            loginIndicator.summary = buildLoginSummary()
+            Log.d(
+                "DongmanLoginIndicator",
+                "SYNC_AFTER_INDICATOR caller=$caller checked=${loginIndicator.isChecked} summary=${loginIndicator.summary} ${cookieStateForDebug()}",
+            )
         }
         if (::manualCookieSwitch.isInitialized) {
             manualCookieSwitch.summary = buildManualSwitchSummary()
+            Log.d(
+                "DongmanLoginIndicator",
+                "SYNC_AFTER_MANUAL caller=$caller manualSummary=${manualCookieSwitch.summary} ${cookieStateForDebug()}",
+            )
         }
-        logLoginIndicatorDecision("SYNC_AFTER", 301, "登录指示灯刷新完成，reason=$reason")
-        logCookieStoresDetailed("SYNC_LOGIN_INDICATOR", 302, "登录状态指示灯已按 CookieManager 刷新；备用 Cookie 不参与登录灯判断；reason=$reason")
     }
 
     internal lateinit var loginIndicator: SwitchPreferenceCompat
@@ -435,8 +433,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
         dialogContext = ctx
 
-        logCookieStoresDetailed("SETUP_ENTER_BEFORE_NORMALIZE", 100, "进入扩展设置页第一时间：专门检测 Mihon/软件外部清全局 Cookie 后 cm/sp/file 是否还在")
-
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
             if (value is String && (value.equals("true", ignoreCase = true) || value.equals("false", ignoreCase = true))) {
@@ -444,7 +440,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         editor.apply()
-        logCookieStoresDetailed("SETUP_AFTER_NORMALIZE_PREFS", 101, "布尔字符串兼容转换后：确认没有误动 NEO_SES/NEO_CHK")
 
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
@@ -452,14 +447,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             summary = "开启后使用私有文件保存登录态，不受清除全局Cookie影响"
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, newValue ->
-                val pending = newValue as Boolean
-                logLoginIndicatorDecision("INDEPENDENT_SWITCH_BEFORE_APPLY", 410, "独立存储开关即将变化；这里 preferences 里还是旧值", pendingIndependent = pending)
-                Handler(Looper.getMainLooper()).post {
-                    logLoginIndicatorDecision("INDEPENDENT_SWITCH_AFTER_APPLY_BEFORE_REFRESH", 411, "独立存储开关写入后，准备 refresh/sync", pendingIndependent = pending)
-                    refreshCookieCache()
-                    syncLoginIndicator("independent_switch_changed_to_$pending")
-                    logLoginIndicatorDecision("INDEPENDENT_SWITCH_AFTER_SYNC", 412, "独立存储开关变化后的刷新已完成", pendingIndependent = pending)
-                }
+                Log.d("DongmanIndependentSwitch", "CHANGE_BEFORE new=$newValue ${cookieStateForDebug()}")
+                refreshCookieCache()
+                syncLoginIndicator()
+                Log.d("DongmanIndependentSwitch", "CHANGE_AFTER new=$newValue ${cookieStateForDebug()}")
                 true
             }
         }.also(screen::addPreference)
@@ -470,35 +461,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             summary = buildManualSwitchSummary()
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, newValue ->
-                val pending = newValue as Boolean
-                logLoginIndicatorDecision("MANUAL_SWITCH_BEFORE_APPLY", 420, "手动备用开关即将变化；这里 preferences 里还是旧值", pendingManual = pending)
-                Handler(Looper.getMainLooper()).post {
-                    logLoginIndicatorDecision("MANUAL_SWITCH_AFTER_APPLY_BEFORE_REFRESH", 421, "手动备用开关写入后，准备 refresh/sync", pendingManual = pending)
-                    refreshCookieCache()
-                    syncLoginIndicator("manual_switch_changed_to_$pending")
-                    summary = buildManualSwitchSummary()
-                    logLoginIndicatorDecision("MANUAL_SWITCH_AFTER_SYNC", 422, "手动备用开关变化后的刷新已完成", pendingManual = pending)
-                }
+                Log.d("DongmanManualSwitch", "CHANGE_BEFORE new=$newValue ${cookieStateForDebug()}")
+                refreshCookieCache()
+                syncLoginIndicator()
+                summary = buildManualSwitchSummary()
+                Log.d("DongmanManualSwitch", "CHANGE_AFTER new=$newValue summary=$summary ${cookieStateForDebug()}")
                 true
             }
             manualCookieSwitch = this
         }.also(screen::addPreference)
 
-        logCookieStoresDetailed("SETUP_BEFORE_INITIAL_REFRESH", 102, "创建登录状态指示灯前，即将执行第一次 refreshCookieCache()")
         refreshCookieCache()
-        logCookieStoresDetailed("SETUP_AFTER_INITIAL_REFRESH", 103, "第一次 refreshCookieCache() 后：看登录指示灯创建前 cachedCookie/src 是什么")
 
         SwitchPreferenceCompat(ctx).apply {
             key = "login_indicator"
             title = "登录状态"
-            val known = isLoginKnown()
-            logLoginIndicatorDecision("LOGIN_INDICATOR_CREATE_BEFORE_SET", 430, "登录状态 preference 创建时，准备写入初始 checked=$known")
-            summary = buildLoginSummary(known)
+            summary = buildLoginSummary()
             setDefaultValue(false)
-            isChecked = known
+            isChecked = isLoginKnown()
             setEnabled(false)
             loginIndicator = this
-            logLoginIndicatorDecision("LOGIN_INDICATOR_CREATE_AFTER_SET", 431, "登录状态 preference 已创建并赋值")
         }.also(screen::addPreference)
 
         SwitchPreferenceCompat(ctx).apply {
@@ -520,7 +502,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             when {
                 username.isBlank() -> Toast.makeText(ctx, "请填写账号", Toast.LENGTH_SHORT).show()
                 password.isBlank() -> Toast.makeText(ctx, "请填写密码", Toast.LENGTH_SHORT).show()
-                else -> loginWithPassword(username, password)
+                else -> {
+                    Log.d(
+                        "DongmanPasswordLogin",
+                        "LOGIN_CONFIRM userLen=${username.length} passLen=${password.length} ${cookieStateForDebug()}",
+                    )
+                    loginWithPassword(username, password)
+                }
             }
         }
 
@@ -577,11 +565,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue("")
         }.also(screen::addPreference)
 
-        logCookieStoresDetailed("SETUP_BEFORE_FINAL_REFRESH", 104, "设置页全部 preference 创建完，即将执行结尾 refreshCookieCache()")
         refreshCookieCache()
-        logCookieStoresDetailed("SETUP_AFTER_FINAL_REFRESH_BEFORE_SYNC", 105, "设置页结尾 refreshCookieCache() 后，准备同步登录指示灯")
-        syncLoginIndicator("setup_final_refresh")
-        logCookieStoresDetailed("SETUP_AFTER_FINAL_SYNC", 106, "设置页最终 syncLoginIndicator() 后：这是打开设置页最终显示状态")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -590,10 +574,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     internal fun loginWithPassword(username: String, password: String) {
         Thread {
+            val loginStartMs = System.currentTimeMillis()
             try {
+                Log.d("DongmanPasswordLogin", "LOGIN_START userLen=${username.length} ${cookieStateForDebug()}")
                 Log.d("DongmanCookie", "=== 开始密码登录 ===")
+                Log.d("DongmanPasswordLogin", "LOGIN_RSA_START elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
                 val rsaResp = client.newCall(GET("$baseUrl/member/login/rsa/getKeys", headersBuilder().build())).execute()
-                val rsaJson = JSONObject(rsaResp.body.string())
+                val rsaBody = rsaResp.body.string()
+                Log.d("DongmanPasswordLogin", "LOGIN_RSA_RESULT code=${rsaResp.code} elapsed=${System.currentTimeMillis() - loginStartMs} bodyLen=${rsaBody.length}")
+                val rsaJson = JSONObject(rsaBody)
                 val keyName = rsaJson.getString("keyName")
                 val nvalue = rsaJson.getString("nvalue")
                 val evalue = rsaJson.getString("evalue")
@@ -609,14 +598,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     .add("returnUrl", "$baseUrl/")
                     .add("loginType", "PHONE_NUMBER")
                     .build()
+                Log.d("DongmanPasswordLogin", "LOGIN_REQUEST_START elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
                 val loginResp = client.newCall(POST("$baseUrl/member/login/doLoginById", headersBuilder().build(), body)).execute()
-                val loginJson = JSONObject(loginResp.body.string())
+                val loginBody = loginResp.body.string()
+                Log.d("DongmanPasswordLogin", "LOGIN_RESPONSE code=${loginResp.code} elapsed=${System.currentTimeMillis() - loginStartMs} bodyLen=${loginBody.length}")
+                val loginJson = JSONObject(loginBody)
 
                 if (loginJson.optInt("loginStatus", -1) == 0) {
                     val allSetCookies = loginResp.headers.values("Set-Cookie").joinToString("; ")
-                    Log.d("DongmanCookie", "密码登录 Set-Cookie: $allSetCookies")
+                    Log.d("DongmanCookie", "密码登录 Set-Cookie: ${shortCookieForDebug(allSetCookies)}")
                     val neoSes = extractCookieValue(allSetCookies, "NEO_SES")
                     val neoChk = extractCookieValue(allSetCookies, "NEO_CHK")
+                    Log.d("DongmanPasswordLogin", "LOGIN_COOKIE ses=${neoSes.length} chk=${neoChk.length} elapsed=${System.currentTimeMillis() - loginStartMs}")
                     if (neoSes.isNotEmpty()) {
                         saveLoginCookie(neoSes, neoChk)
                         CookieManager.getInstance().setCookie(baseUrl, "NEO_SES=$neoSes; path=/")
@@ -634,6 +627,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 syncLoginIndicator()
                                 Toast.makeText(appContext, "登录成功", Toast.LENGTH_SHORT).show()
                             }
+                            Log.d("DongmanPasswordLogin", "LOGIN_FINISH success elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
                         }
                     } else {
                         Handler(Looper.getMainLooper()).post {
@@ -645,6 +639,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     throw Exception(msg)
                 }
             } catch (e: Exception) {
+                Log.d("DongmanPasswordLogin", "LOGIN_FINISH error=${e.javaClass.simpleName}:${e.message} elapsed=${System.currentTimeMillis() - loginStartMs} ${cookieStateForDebug()}")
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(appContext, "登录失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
@@ -653,7 +648,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun saveLoginCookie(neoSes: String, neoChk: String) {
-        Log.d("DongmanCookie", "saveLoginCookie: neoSes=$neoSes, neoChk=$neoChk")
+        Log.d("DongmanCookie", "saveLoginCookie: neoSesLen=${neoSes.length}, neoChkLen=${neoChk.length}")
         preferences.edit()
             .putString(KEY_NEO_SES, neoSes)
             .putString(KEY_NEO_CHK, neoChk)
@@ -666,80 +661,44 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun fullLogout() {
-        Log.d("DongmanCookie", "fullLogout: 彻底退出登录（详细顺序日志版）")
-        logCookieStoresDetailed("FULL_LOGOUT_BEFORE", 1, "点击彻底退出登录前的完整状态")
-
+        Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_BEFORE ${cookieStateForDebug()}")
         CookieManager.getInstance().removeAllCookies { success ->
-            CookieManager.getInstance().flush()
-            Log.d("DongmanCookieProbe", "STEP_2_FULL_LOGOUT_AFTER_CM_CALLBACK success=$success")
-            logCookieStoresDetailed(
-                "FULL_LOGOUT_AFTER_CM_ONLY_BEFORE_SP_REMOVE",
-                2,
-                "CookieManager 已执行清除回调；这里还没有执行 SP remove 和文件删除，用来确认：只清全局 Cookie 后 SP 是否还在",
-            )
-
-            preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-            logCookieStoresDetailed("FULL_LOGOUT_AFTER_REMOVE_SP_COOKIE", 3, "已经 remove(KEY_NEO_SES/KEY_NEO_CHK)")
-
-            if (useIndependentStorage()) {
-                deleteCookieFile()
-                logCookieStoresDetailed("FULL_LOGOUT_AFTER_DELETE_FILE_INDEPENDENT_ON", 4, "独立存储开启，已经执行 deleteCookieFile()")
-            } else {
-                Log.d("DongmanCookieProbe", "STEP_4_FULL_LOGOUT_SKIP_DELETE_FILE_INDEPENDENT_OFF")
-                logCookieStoresDetailed("FULL_LOGOUT_SKIP_DELETE_FILE_INDEPENDENT_OFF", 4, "独立存储关闭，所以跳过 deleteCookieFile()")
-            }
-
-            clearManualBackup()
-            logCookieStoresDetailed("FULL_LOGOUT_AFTER_CLEAR_MANUAL", 5, "已经 clearManualBackup()：会再次删文件，并关闭手动备用开关")
-
-            refreshCookieCache()
-            logCookieStoresDetailed("FULL_LOGOUT_AFTER_REFRESH", 6, "已经 refreshCookieCache()")
-            syncLoginIndicator()
-            logCookieStoresDetailed("FULL_LOGOUT_AFTER_SYNC_INDICATOR", 7, "已经 syncLoginIndicator()")
-
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
-                showCookieDebug("FULL_LOGOUT", force = true)
-            }
+            Log.d("DongmanClearDebug", "FULL_LOGOUT_CM_CALLBACK success=$success ${cookieStateForDebug()}")
+        }
+        preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
+        if (useIndependentStorage()) deleteCookieFile()
+        clearManualBackup()
+        refreshCookieCache()
+        syncLoginIndicator()
+        Log.d("DongmanClearDebug", "FULL_LOGOUT_AFTER ${cookieStateForDebug()}")
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
+            showCookieDebug("FULL_LOGOUT", force = true)
         }
     }
 
     internal fun clearBackupOnly() {
-        Log.d("DongmanCookie", "clearBackupOnly: 清除独立存储备份（详细顺序日志版）")
-        logCookieStoresDetailed("CLEAR_BACKUP_BEFORE", 1, "点击清除独立存储备份前的完整状态")
-
+        Log.d("DongmanCookie", "clearBackupOnly")
+        Log.d("DongmanClearDebug", "CLEAR_BACKUP_BEFORE ${cookieStateForDebug()}")
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_REMOVE_SP_COOKIE", 2, "已经 remove(KEY_NEO_SES/KEY_NEO_CHK)：确认这个按钮是否清了 SP Cookie")
-
-        if (useIndependentStorage()) {
-            deleteCookieFile()
-            logCookieStoresDetailed("CLEAR_BACKUP_AFTER_DELETE_FILE_INDEPENDENT_ON", 3, "独立存储开启，已经执行 deleteCookieFile()")
-        } else {
-            Log.d("DongmanCookieProbe", "STEP_3_CLEAR_BACKUP_SKIP_DELETE_FILE_INDEPENDENT_OFF")
-            logCookieStoresDetailed("CLEAR_BACKUP_SKIP_DELETE_FILE_INDEPENDENT_OFF", 3, "独立存储关闭，所以跳过 deleteCookieFile()")
-        }
-
+        if (useIndependentStorage()) deleteCookieFile()
         clearManualBackup()
-        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_CLEAR_MANUAL", 4, "已经 clearManualBackup()：会再次删文件，并关闭手动备用开关")
-
         refreshCookieCache()
-        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_REFRESH", 5, "已经 refreshCookieCache()")
         syncLoginIndicator()
-        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_SYNC_INDICATOR", 6, "已经 syncLoginIndicator()")
-
+        Log.d("DongmanClearDebug", "CLEAR_BACKUP_AFTER ${cookieStateForDebug()}")
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
             showCookieDebug("CLEAR_BACKUP", force = true)
         }
     }
 
-    internal fun buildLoginSummary(knownOverride: Boolean? = null): String {
-        val known = knownOverride ?: isLoginKnown()
-        val status = if (known) "已登录" else "未登录"
-        val requestCookie = if (cachedCookie?.isNotEmpty() == true) "可用" else "无"
+    internal fun buildLoginSummary(): String {
+        val isLoggedIn = cachedCookie?.isNotEmpty() == true
+        val status = if (isLoggedIn) "已登录" else "未登录"
         val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
-        return "登录状态：$status（仅看 CookieManager）\n存储方式：$storageMode\n手动模式：$manualMode\n请求Cookie：$requestCookie，来源：$cachedCookieSource"
+        return "存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -754,16 +713,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun cookieHeader(): String {
+        val seq = synchronized(this) {
+            cookieHeaderCallSeq += 1
+            cookieHeaderCallSeq
+        }
         val independent = useIndependentStorage()
         val manual = getManualCookieEnable()
-        if (cachedCookie == null || lastIndependentState != independent || lastManualCookieState != manual) {
+        val needRefresh = cachedCookie == null || lastIndependentState != independent || lastManualCookieState != manual
+        Log.d("DongmanCookieHeader", "HEADER_CALL#$seq caller=${callerForDebug()} needRefresh=$needRefresh before=${cookieStateForDebug()}")
+        if (needRefresh) {
             refreshCookieCache()
         }
         val cookie = cachedCookie.orEmpty()
         Log.d(
             "DongmanCookie",
-            "cookieHeader: manual=$manual independent=$independent cookie=${cookie.ifEmpty { "(无)" }}",
+            "cookieHeader: manual=$manual independent=$independent cookie=${shortCookieForDebug(cookie)}",
         )
+        Log.d("DongmanCookieHeader", "HEADER_RETURN#$seq set=${cookie.isNotEmpty()} len=${cookie.length} after=${cookieStateForDebug()}")
         showCookieDebug("HEADER", force = false)
         return cookie
     }
@@ -1046,33 +1012,89 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
-        Log.d("DongmanCookie", "=== 自动解锁开始 titleNo=$titleNo, episodeNo=$episodeNo ===")
-        val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-        val savedCookie = cookieHeader()
-        val reqHeaders = headersBuilder()
-            .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
-            .build()
-        Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.get("Cookie")}")
+        val key = "${titleNo}_${episodeNo}"
+        val threadName = Thread.currentThread().name
+        val lock = getAutoUnlockLock(key)
 
-        val priceResp = client.newCall(debugRequest("AUTO_PRICE", GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders))).execute()
-        val priceJson = org.json.JSONObject(priceResp.body.string())
-        val data = priceJson.optJSONObject("data") ?: return
-        val isFree = data.optBoolean("free", true)
-        if (isFree) return
-        val isLimit = data.optBoolean("isLimit", false)
-        if (isLimit) return
-        val price = data.optInt("price", 0)
-        val coinCount = data.optInt("coinCount", 0)
-        val episodeName = data.optString("episodeName", "本话")
-        if (coinCount < price) {
-            throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
+        autoUnlockLog("AUTO_UNLOCK_ATTEMPT key=$key thread=$threadName")
+        recentAutoUnlockSuccessAge(key)?.let { age ->
+            autoUnlockLog("AUTO_RECENT_SUCCESS_SKIP key=$key ageMs=$age thread=$threadName")
+            return
         }
-        val payResp = client.newCall(debugRequest("AUTO_PAY", GET("$baseUrl/episode/unlock/pay?$params", reqHeaders))).execute()
-        val payJson = org.json.JSONObject(payResp.body.string())
-        if (payJson.optInt("code") != 200) return
-        Log.d("DongmanCookie", "自动解锁成功")
+
+        val acquiredImmediately = lock.tryLock()
+        if (!acquiredImmediately) {
+            autoUnlockLog("AUTO_LOCK_BLOCKED_SKIP key=$key thread=$threadName")
+            return
+        }
+        autoUnlockLog("AUTO_LOCK_ACQUIRED key=$key thread=$threadName")
+
+        try {
+            recentAutoUnlockSuccessAge(key)?.let { age ->
+                autoUnlockLog("AUTO_RECENT_SUCCESS_SKIP_AFTER_LOCK key=$key ageMs=$age thread=$threadName")
+                return
+            }
+            autoUnlockLog("AUTO_UNLOCK_START key=$key thread=$threadName")
+            val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
+            val savedCookie = cookieHeader()
+            val reqHeaders = headersBuilder()
+                .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
+                .set("X-Requested-With", "XMLHttpRequest")
+                .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
+                .build()
+            autoUnlockLog("AUTO_HEADER key=$key cookie=${shortCookieForDebug(reqHeaders.get("Cookie"))}")
+
+            autoUnlockLog("AUTO_PRICE_START key=$key")
+            val priceResp = client.newCall(debugRequest("AUTO_PRICE", GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders))).execute()
+            val priceBody = priceResp.body.string()
+            val priceJson = org.json.JSONObject(priceBody)
+            val data = priceJson.optJSONObject("data")
+            if (data == null) {
+                autoUnlockLog("AUTO_PRICE_NO_DATA key=$key code=${priceJson.optInt("code")} message=${priceJson.optString("message")}")
+                return
+            }
+
+            val isFree = data.optBoolean("free", true)
+            val isLimit = data.optBoolean("isLimit", false)
+            val price = data.optInt("price", 0)
+            val coinCount = data.optInt("coinCount", 0)
+            val beanCount = data.optInt("beanCount", 0)
+            val episodeName = data.optString("episodeName", "本话")
+            autoUnlockLog("AUTO_PRICE_RESULT key=$key free=$isFree limit=$isLimit price=$price coin=$coinCount bean=$beanCount episode=$episodeName")
+
+            if (isFree) {
+                autoUnlockLog("AUTO_PAY_SKIP_FREE key=$key")
+                return
+            }
+            if (isLimit) {
+                autoUnlockLog("AUTO_PAY_SKIP_LIMIT key=$key")
+                return
+            }
+            if (coinCount < price) {
+                autoUnlockLog("AUTO_PAY_SKIP_BALANCE_LOW key=$key price=$price coin=$coinCount episode=$episodeName")
+                throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
+            }
+
+            autoUnlockLog("AUTO_PAY_START key=$key price=$price coinBefore=$coinCount")
+            val payResp = client.newCall(debugRequest("AUTO_PAY", GET("$baseUrl/episode/unlock/pay?$params", reqHeaders))).execute()
+            val payBody = payResp.body.string()
+            val payJson = org.json.JSONObject(payBody)
+            val payCode = payJson.optInt("code")
+            val payMessage = payJson.optString("message")
+            autoUnlockLog("AUTO_PAY_RESULT key=$key code=$payCode message=$payMessage")
+            if (payCode != 200) {
+                autoUnlockLog("AUTO_PAY_FAIL_CODE key=$key code=$payCode message=$payMessage")
+                return
+            }
+            markAutoUnlockSuccess(key)
+            autoUnlockLog("AUTO_UNLOCK_DONE key=$key")
+        } catch (e: Exception) {
+            autoUnlockLog("AUTO_UNLOCK_ERROR key=$key error=${e.javaClass.simpleName}:${e.message}")
+            throw e
+        } finally {
+            lock.unlock()
+            autoUnlockLog("AUTO_LOCK_RELEASE key=$key thread=$threadName")
+        }
     }
 
     override fun pageListParse(response: Response): List<Page> {
