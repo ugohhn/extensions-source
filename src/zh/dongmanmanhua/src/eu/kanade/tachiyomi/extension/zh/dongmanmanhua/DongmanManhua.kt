@@ -707,10 +707,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val storageMode = "CookieManager/SP"
         val backupMode = if (useIndependentStorage()) "私有文件备份开启" else "私有文件备份关闭"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
-        return "存储方式：$storageMode
-备份状态：$backupMode
-手动模式：$manualMode
-登录状态：$status"
+        return buildString {
+            append("存储方式：$storageMode\n")
+            append("备份状态：$backupMode\n")
+            append("手动模式：$manualMode\n")
+            append("登录状态：$status")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
