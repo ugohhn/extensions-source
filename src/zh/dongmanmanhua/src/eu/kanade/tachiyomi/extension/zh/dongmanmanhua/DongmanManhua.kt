@@ -140,11 +140,47 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}"
     }
 
+
+
+    internal fun logCookieDiagnostic(label: String) {
+        val urls = listOf(
+            baseUrl,
+            "https://dongmanmanhua.cn",
+            "https://www.dongmanmanhua.cn",
+            "https://m.dongmanmanhua.cn",
+        )
+        Log.d(
+            "DongmanCookieDiag",
+            "$label STATE loginSuccessHandled=$loginSuccessHandled ${cookieStateForDebug()}",
+        )
+        urls.forEach { url ->
+            val cmCookie = CookieManager.getInstance().getCookie(url).orEmpty()
+            Log.d(
+                "DongmanCookieDiag",
+                "$label CM url=$url cookie=${shortCookieForDebug(cmCookie)} len=${cmCookie.length} " +
+                    "hasSes=${extractCookieValue(cmCookie, "NEO_SES").isNotEmpty()} " +
+                    "hasChk=${extractCookieValue(cmCookie, "NEO_CHK").isNotEmpty()}",
+            )
+        }
+    }
+
+    internal fun logCookieDiagnosticDelayed(label: String) {
+        logCookieDiagnostic("${label}_NOW")
+        Handler(Looper.getMainLooper()).postDelayed({
+            logCookieDiagnostic("${label}_DELAY_500MS")
+        }, 500L)
+        Handler(Looper.getMainLooper()).postDelayed({
+            logCookieDiagnostic("${label}_DELAY_1500MS")
+        }, 1500L)
+    }
+
     private fun callerForDebug(): String {
         val ignored = setOf(
             "getStackTrace",
             "callerForDebug",
             "cookieStateForDebug",
+            "logCookieDiagnostic",
+            "logCookieDiagnosticDelayed",
             "showCookieDebug",
             "syncLoginIndicator",
             "cookieHeader",
@@ -369,8 +405,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun isLoginKnown(): Boolean {
+        val caller = callerForDebug()
         val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
-        return extractCookieValue(cmCookie, "NEO_SES").isNotEmpty()
+        val result = extractCookieValue(cmCookie, "NEO_SES").isNotEmpty()
+        Log.d(
+            "DongmanLoginKnown",
+            "IS_LOGIN_KNOWN caller=$caller result=$result cm=${shortCookieForDebug(cmCookie)} " +
+                "len=${cmCookie.length} ${cookieStateForDebug()}",
+        )
+        return result
     }
 
     internal fun syncLoginIndicator() {
@@ -410,6 +453,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val ctx = screen.context
         dialogContext = ctx
         Log.d("DongmanSetupDebug", "SETUP_ENTER ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
+        logCookieDiagnosticDelayed("SETUP_ENTER")
 
         val editor = preferences.edit()
         preferences.all.forEach { (key, value) ->
@@ -515,6 +559,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }.also(screen::addPreference)
 
         SwitchPreferenceCompat(ctx).apply {
+            key = PREF_COOKIE_DIAG_TRIGGER
+            title = "打印Cookie诊断日志"
+            summary = "清除 Mihon 全局 Cookie 后点这里，查看 CookieManager / 备份 / 当前请求源"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, _ ->
+                Log.d("DongmanCookieDiag", "DIAG_TRIGGER_CLICK ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
+                logCookieDiagnosticDelayed("DIAG_TRIGGER")
+                refreshCookieCache()
+                syncLoginIndicator()
+                false
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(ctx).apply {
             key = PREF_SEARCH_MODE
             title = "搜索显示小说"
             summary = "开启后搜索结果包含小说（首页HTML接口）\n关闭则只显示漫画（JSON接口，速度更快）"
@@ -547,6 +605,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         refreshCookieCache()
         Log.d("DongmanSetupDebug", "SETUP_EXIT_AFTER_FINAL_REFRESH ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
+        logCookieDiagnosticDelayed("SETUP_EXIT")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1171,6 +1230,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_LOGIN_PASSWORD = "pref_login_password"
         internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
+        internal const val PREF_COOKIE_DIAG_TRIGGER = "pref_cookie_diag_trigger"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val KEY_NEO_SES = "neo_ses"
