@@ -742,30 +742,33 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val modeFilter = filters.firstOrNull { it is BrowseModeFilter } as? BrowseModeFilter
+        val modeValue = modeFilter?.let { getBrowseModeFilter().getOrNull(it.state)?.value }.orEmpty().ifBlank { "update" }
+
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
-        val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
-        val sortSelection = sortFilter?.state as? Filter.Sort.Selection
-        val sortValue = if (sortSelection != null) getSortFilter()[sortSelection.index].value else "READ_COUNT"
         val weekdayValue = weekdayFilter?.getSelectedValue().orEmpty()
+        // 排序只属于“更新”的 dailySchedule 接口。
+        // 题材、新作、最近观看、我的已购都不读取 sortValue，也不拼 sortOrder。
+        val sortValue = if (modeValue == "update") {
+            val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
+            val sortSelection = sortFilter?.state as? Filter.Sort.Selection
+            if (sortSelection != null) getSortFilter().getOrNull(sortSelection.index)?.value ?: "READ_COUNT" else "READ_COUNT"
+        } else {
+            "READ_COUNT"
+        }
 
-        preferences.edit()
-            .putString(PREF_FILTER_WEEKDAY, weekdayValue)
-            .putString(PREF_FILTER_SORT, sortValue)
-            .apply()
+        // latestUpdatesParse() 仍需要知道当前更新分区；只有“更新入口”才写入这个状态。
+        if (modeValue == "update") {
+            preferences.edit()
+                .putString(PREF_FILTER_WEEKDAY, weekdayValue)
+                .putString(PREF_FILTER_SORT, sortValue)
+                .apply()
+        }
 
-        // query 为空时走筛选浏览。这里必须直接返回对应 Request，不能再回退成搜索页模板。
+        // query 为空时走独立入口浏览。入口之间互斥，不做组合筛选：
+        // 更新入口只读“更新/更新排序”；题材入口只读“题材”；我的漫画入口只读“我的漫画”。
+        // 其中“新作”虽然放在更新入口里，但接口是 /new，也不吃排序。
         if (query.isBlank()) {
-            val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
-            val migrateValue = migrateFilter?.let { getMigrateFilter().getOrNull(it.state)?.value }.orEmpty()
-            if (migrateValue == "recent") {
-                return GET("$baseUrl/home/recentSeeing?size=50", headersBuilder().build())
-            }
-            if (migrateValue == "purchased") {
-                return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", headersBuilder().build())
-            }
-
-            val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
-            val themeValue = themeFilter?.let { getThemeFilter().getOrNull(it.state)?.value }.orEmpty()
             val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
                 Calendar.MONDAY -> "MONDAY"
                 Calendar.TUESDAY -> "TUESDAY"
@@ -776,12 +779,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 Calendar.SUNDAY -> "SUNDAY"
                 else -> "MONDAY"
             }
-            val url = when {
-                weekdayValue == "NEW" -> "$baseUrl/new"
-                themeValue.isNotEmpty() -> "$baseUrl/$themeValue/list?sortOrder=$sortValue"
-                weekdayValue == "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sortValue"
-                weekdayValue.isNotEmpty() -> "$baseUrl/dailySchedule?weekday=$weekdayValue&sortOrder=$sortValue"
-                else -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sortValue"
+
+            val url = when (modeValue) {
+                "mine" -> {
+                    val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
+                    when (migrateFilter?.let { getMigrateFilter().getOrNull(it.state)?.value }.orEmpty()) {
+                        "purchased" -> "$baseUrl/episode/unlock/titleList?platform=MWEB"
+                        else -> "$baseUrl/home/recentSeeing?size=50"
+                    }
+                }
+                "theme" -> {
+                    val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
+                    val themeValue = themeFilter?.let { getThemeFilter().getOrNull(it.state)?.value }.orEmpty().ifBlank { "LOVE" }
+                    "$baseUrl/$themeValue/list"
+                }
+                else -> when (weekdayValue) {
+                    "NEW" -> "$baseUrl/new"
+                    "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sortValue"
+                    "" -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sortValue"
+                    else -> "$baseUrl/dailySchedule?weekday=$weekdayValue&sortOrder=$sortValue"
+                }
             }
             return GET(url, headersBuilder().build())
         }
