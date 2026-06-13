@@ -380,7 +380,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     internal fun syncLoginIndicator() {
         if (::loginIndicator.isInitialized) {
-            loginIndicator.isPersistent = false
             loginIndicator.isChecked = isLoginKnown()
             loginIndicator.summary = buildLoginSummary()
         }
@@ -438,13 +437,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         refreshCookieCache()
 
         SwitchPreferenceCompat(ctx).apply {
-            key = "login_indicator"
-            isPersistent = false
             title = "登录状态"
             summary = buildLoginSummary()
             setDefaultValue(false)
             isChecked = isLoginKnown()
-            isSelectable = false
+            setOnPreferenceChangeListener { _, _ ->
+                syncLoginIndicator()
+                false
+            }
             loginIndicator = this
         }.also(screen::addPreference)
 
