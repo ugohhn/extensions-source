@@ -123,6 +123,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
+
+    internal fun logCookieStoresDetailed(label: String, step: Int, note: String) {
+        val file = getCookieFile()
+        val fileRaw = try {
+            if (file.exists()) file.readText() else ""
+        } catch (e: Exception) {
+            "<read-error:${e.javaClass.simpleName}>"
+        }
+        val (fileSes, fileChk) = readCookieFromFile()
+        val spHasSesKey = preferences.contains(KEY_NEO_SES)
+        val spHasChkKey = preferences.contains(KEY_NEO_CHK)
+        val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+        val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        val cmRaw = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+        Log.d(
+            "DongmanCookieProbe",
+            buildString {
+                append("STEP_${step}_$label")
+                append(" | note=$note")
+                append(" | cmExists=${cmRaw.isNotBlank()} cm=${shortCookieForDebug(cmRaw)} cmLen=${cmRaw.length}")
+                append(" | spHasSesKey=$spHasSesKey spHasChkKey=$spHasChkKey spCookie=ses=${spSes.length},chk=${spChk.length}")
+                append(" | fileExists=${file.exists()} fileRawLen=${fileRaw.length} file=ses=${fileSes.length},chk=${fileChk.length}")
+                append(" | manual=${getManualCookieEnable()} independent=${useIndependentStorage()}")
+                append(" | cache=${shortCookieForDebug(cachedCookie)} src=$cachedCookieSource")
+                append(" | savedAccount=${preferences.getString(PREF_LOGIN_USERNAME, "").orEmpty().isNotBlank()}")
+                append(" | savedPassword=${preferences.getString(PREF_LOGIN_PASSWORD, "").orEmpty().isNotBlank()}")
+                append(" | loginIndicatorInit=${::loginIndicator.isInitialized}")
+                if (::loginIndicator.isInitialized) append(" loginIndicatorChecked=${loginIndicator.isChecked}")
+            },
+        )
+    }
+
     internal fun debugRequest(label: String, request: Request): Request {
         val expectedCookie = cachedCookie.orEmpty()
         val headerCookie = request.header("Cookie").orEmpty()
@@ -567,55 +599,67 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun fullLogout() {
-        Log.d("DongmanCookie", "fullLogout: 彻底退出登录")
-        logCookieStores("FULL_LOGOUT_BEFORE")
+        Log.d("DongmanCookie", "fullLogout: 彻底退出登录（详细顺序日志版）")
+        logCookieStoresDetailed("FULL_LOGOUT_BEFORE", 1, "点击彻底退出登录前的完整状态")
 
         CookieManager.getInstance().removeAllCookies { success ->
             CookieManager.getInstance().flush()
-            Log.d("DongmanCookieProbe", "FULL_LOGOUT_AFTER_CM_CALLBACK success=$success")
-            logCookieStores("FULL_LOGOUT_AFTER_CM_CALLBACK")
-        }
+            Log.d("DongmanCookieProbe", "STEP_2_FULL_LOGOUT_AFTER_CM_CALLBACK success=$success")
+            logCookieStoresDetailed(
+                "FULL_LOGOUT_AFTER_CM_ONLY_BEFORE_SP_REMOVE",
+                2,
+                "CookieManager 已执行清除回调；这里还没有执行 SP remove 和文件删除，用来确认：只清全局 Cookie 后 SP 是否还在",
+            )
 
-        preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        logCookieStores("FULL_LOGOUT_AFTER_REMOVE_SP_COOKIE")
+            preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
+            logCookieStoresDetailed("FULL_LOGOUT_AFTER_REMOVE_SP_COOKIE", 3, "已经 remove(KEY_NEO_SES/KEY_NEO_CHK)")
 
-        if (useIndependentStorage()) {
-            deleteCookieFile()
-            logCookieStores("FULL_LOGOUT_AFTER_DELETE_FILE_INDEPENDENT_ON")
-        } else {
-            Log.d("DongmanCookieProbe", "FULL_LOGOUT_SKIP_DELETE_FILE_INDEPENDENT_OFF")
-        }
+            if (useIndependentStorage()) {
+                deleteCookieFile()
+                logCookieStoresDetailed("FULL_LOGOUT_AFTER_DELETE_FILE_INDEPENDENT_ON", 4, "独立存储开启，已经执行 deleteCookieFile()")
+            } else {
+                Log.d("DongmanCookieProbe", "STEP_4_FULL_LOGOUT_SKIP_DELETE_FILE_INDEPENDENT_OFF")
+                logCookieStoresDetailed("FULL_LOGOUT_SKIP_DELETE_FILE_INDEPENDENT_OFF", 4, "独立存储关闭，所以跳过 deleteCookieFile()")
+            }
 
-        clearManualBackup()
-        logCookieStores("FULL_LOGOUT_AFTER_CLEAR_MANUAL")
+            clearManualBackup()
+            logCookieStoresDetailed("FULL_LOGOUT_AFTER_CLEAR_MANUAL", 5, "已经 clearManualBackup()：会再次删文件，并关闭手动备用开关")
 
-        refreshCookieCache()
-        syncLoginIndicator()
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
-            showCookieDebug("FULL_LOGOUT", force = true)
+            refreshCookieCache()
+            logCookieStoresDetailed("FULL_LOGOUT_AFTER_REFRESH", 6, "已经 refreshCookieCache()")
+            syncLoginIndicator()
+            logCookieStoresDetailed("FULL_LOGOUT_AFTER_SYNC_INDICATOR", 7, "已经 syncLoginIndicator()")
+
+            Handler(Looper.getMainLooper()).post {
+                Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
+                showCookieDebug("FULL_LOGOUT", force = true)
+            }
         }
     }
 
     internal fun clearBackupOnly() {
-        Log.d("DongmanCookie", "clearBackupOnly: 清除独立存储备份")
-        logCookieStores("CLEAR_BACKUP_BEFORE")
+        Log.d("DongmanCookie", "clearBackupOnly: 清除独立存储备份（详细顺序日志版）")
+        logCookieStoresDetailed("CLEAR_BACKUP_BEFORE", 1, "点击清除独立存储备份前的完整状态")
 
         preferences.edit().remove(KEY_NEO_SES).remove(KEY_NEO_CHK).apply()
-        logCookieStores("CLEAR_BACKUP_AFTER_REMOVE_SP_COOKIE")
+        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_REMOVE_SP_COOKIE", 2, "已经 remove(KEY_NEO_SES/KEY_NEO_CHK)：确认这个按钮是否清了 SP Cookie")
 
         if (useIndependentStorage()) {
             deleteCookieFile()
-            logCookieStores("CLEAR_BACKUP_AFTER_DELETE_FILE_INDEPENDENT_ON")
+            logCookieStoresDetailed("CLEAR_BACKUP_AFTER_DELETE_FILE_INDEPENDENT_ON", 3, "独立存储开启，已经执行 deleteCookieFile()")
         } else {
-            Log.d("DongmanCookieProbe", "CLEAR_BACKUP_SKIP_DELETE_FILE_INDEPENDENT_OFF")
+            Log.d("DongmanCookieProbe", "STEP_3_CLEAR_BACKUP_SKIP_DELETE_FILE_INDEPENDENT_OFF")
+            logCookieStoresDetailed("CLEAR_BACKUP_SKIP_DELETE_FILE_INDEPENDENT_OFF", 3, "独立存储关闭，所以跳过 deleteCookieFile()")
         }
 
         clearManualBackup()
-        logCookieStores("CLEAR_BACKUP_AFTER_CLEAR_MANUAL")
+        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_CLEAR_MANUAL", 4, "已经 clearManualBackup()：会再次删文件，并关闭手动备用开关")
 
         refreshCookieCache()
+        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_REFRESH", 5, "已经 refreshCookieCache()")
         syncLoginIndicator()
+        logCookieStoresDetailed("CLEAR_BACKUP_AFTER_SYNC_INDICATOR", 6, "已经 syncLoginIndicator()")
+
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
             showCookieDebug("CLEAR_BACKUP", force = true)
