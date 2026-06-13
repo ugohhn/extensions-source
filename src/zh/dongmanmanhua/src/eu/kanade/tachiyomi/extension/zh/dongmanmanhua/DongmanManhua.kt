@@ -98,6 +98,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    internal fun debugRequest(label: String, request: Request): Request {
+        val expectedCookie = cachedCookie.orEmpty()
+        val headerCookie = request.header("Cookie").orEmpty()
+        val status = when {
+            expectedCookie.isNotEmpty() && headerCookie.isEmpty() -> "MISS_HEADER"
+            expectedCookie.isEmpty() && headerCookie.isEmpty() -> "NO_COOKIE"
+            expectedCookie.isNotEmpty() && headerCookie.isNotEmpty() -> "OK_HEADER"
+            else -> "HEADER_ONLY"
+        }
+        val msg = buildString {
+            append("$label $status\n")
+            append("src=$cachedCookieSource\n")
+            append("cache=${shortCookieForDebug(expectedCookie)}\n")
+            append("header=${shortCookieForDebug(headerCookie)} len=${headerCookie.length}\n")
+            append(request.url.encodedPath.take(80))
+        }
+        Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
+        }
+        return request
+    }
+
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
@@ -541,7 +564,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun popularMangaRequest(page: Int): Request {
         probeIsLoginValid()
         showCookieDebug("POPULAR_REQUEST", force = true)
-        return GET("$baseUrl/?pageName=home", headersBuilder().build())
+        return debugRequest("POPULAR", GET("$baseUrl/?pageName=home", headersBuilder().build()))
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -561,7 +584,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun latestUpdatesRequest(page: Int): Request {
         showCookieDebug("LATEST_REQUEST", force = true)
-        return GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headersBuilder().build())
+        return debugRequest("LATEST", GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headersBuilder().build()))
     }
 
     override fun latestUpdatesParse(response: Response): MangasPage {
@@ -600,7 +623,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .set("Referer", "$baseUrl/search")
                 .set("Content-Type", "application/x-www-form-urlencoded")
                 .build()
-            return POST("$baseUrl/search", headers, body)
+            return debugRequest("SEARCH_HTML", POST("$baseUrl/search", headers, body))
         }
         val start = if (isMixedMode()) nextStartMap[query] ?: (1 + (page - 1) * 20) else 1 + (page - 1) * 20
         val body = FormBody.Builder().add("keyword", query).add("searchType", "WEBTOON").add("start", start.toString()).build()
@@ -610,7 +633,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .set("Content-Type", "application/x-www-form-urlencoded")
             .set("X-Requested-With", "XMLHttpRequest")
             .build()
-        return POST("$baseUrl/searchResult", headers, body)
+        return debugRequest("SEARCH_JSON", POST("$baseUrl/searchResult", headers, body))
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -680,7 +703,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        return GET(baseUrl + manga.url, reqHeaders)
+        return debugRequest("DETAIL", GET(baseUrl + manga.url, reqHeaders))
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -718,7 +741,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cookie = cookieHeader()
             if (cookie.isNotEmpty()) set("Cookie", cookie)
         }.build()
-        return GET(baseUrl + manga.url, reqHeaders)
+        return debugRequest("CHAPTER_LIST", GET(baseUrl + manga.url, reqHeaders))
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -752,7 +775,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val cookie = cookieHeader()
                 if (cookie.isNotEmpty()) set("Cookie", cookie)
             }.build()
-            document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
+            document = client.newCall(debugRequest("CHAPTER_NEXT", GET(nextUrl, reqHeaders))).execute().asJsoup()
         }
         return chapters.reversed()
     }
@@ -774,7 +797,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 autoUnlockEpisode(titleNo, episodeNo)
             }
         }
-        return GET(baseUrl + chapter.url, reqHeaders)
+        return debugRequest("PAGE_LIST", GET(baseUrl + chapter.url, reqHeaders))
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
@@ -788,7 +811,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .build()
         Log.d("DongmanCookie", "自动解锁请求头 Cookie: ${reqHeaders.get("Cookie")}")
 
-        val priceResp = client.newCall(GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders)).execute()
+        val priceResp = client.newCall(debugRequest("AUTO_PRICE", GET("$baseUrl/episode/unlock/getEpisodePrice?$params", reqHeaders))).execute()
         val priceJson = org.json.JSONObject(priceResp.body.string())
         val data = priceJson.optJSONObject("data") ?: return
         val isFree = data.optBoolean("free", true)
@@ -801,7 +824,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (coinCount < price) {
             throw Exception("余额不足：$episodeName 需要 $price 币，当前余额 $coinCount 币，请前往咚漫充值")
         }
-        val payResp = client.newCall(GET("$baseUrl/episode/unlock/pay?$params", reqHeaders)).execute()
+        val payResp = client.newCall(debugRequest("AUTO_PAY", GET("$baseUrl/episode/unlock/pay?$params", reqHeaders))).execute()
         val payJson = org.json.JSONObject(payResp.body.string())
         if (payJson.optInt("code") != 200) return
         Log.d("DongmanCookie", "自动解锁成功")
