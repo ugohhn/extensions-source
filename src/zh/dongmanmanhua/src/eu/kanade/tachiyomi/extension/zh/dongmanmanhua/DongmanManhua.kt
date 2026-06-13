@@ -51,7 +51,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override val baseUrl = "https://m.dongmanmanhua.cn"
     override val supportsLatest = true
 
-    override fun getFilterList(): FilterList = getFilterList()
+    override fun getFilterList(): FilterList = buildDongmanFilterList()
 
     internal val cdnBase = "https://cdn.dongmanmanhua.cn"
     internal val preferences by getPreferencesLazy()
