@@ -219,25 +219,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Log.e("DongmanCookie", "MERGE_SET_COOKIE 写入文件失败", e)
         }
 
-        cachedCookie = mergedCookie
-        lastIndependentState = useIndependentStorage()
-        lastManualCookieState = getManualCookieEnable()
-        cachedCookieSource = "merge-set-cookie"
-
         Log.d(
             "DongmanCookie",
-            "MERGE_SET_COOKIE new=${shortCookieForDebug(setCookies)} merged=${shortCookieForDebug(mergedCookie)}",
+            "MERGE_SET_COOKIE backup_only new=${shortCookieForDebug(setCookies)} merged=${shortCookieForDebug(mergedCookie)}",
         )
+        refreshCookieCache()
         showCookieDebug("MERGE_SET_COOKIE", force = true)
     }
 
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
             getCookieFile().writeText("$neoSes|$neoChk")
-            Log.d("DongmanCookie", "Cookie 已写入文件: ses=${neoSes.length},chk=${neoChk.length}")
-            cachedCookie = buildCookieString(neoSes, neoChk)
-            lastIndependentState = useIndependentStorage()
-            cachedCookieSource = "save-file"
+            Log.d("DongmanCookie", "Cookie 已写入文件备份: ses=${neoSes.length},chk=${neoChk.length}")
             showCookieDebug("SAVE_FILE", force = true)
         } catch (e: Exception) {
             Log.e("DongmanCookie", "写入文件失败", e)
@@ -299,7 +292,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var cacheLoginValid: Boolean? = null
 
     private fun probeIsLoginValid(): Boolean {
-        if (!getManualCookieEnable() && !useIndependentStorage()) return true
+        if (!getManualCookieEnable()) return true
         val now = System.currentTimeMillis()
         if (now - lastProbeTime < 60_000 && cacheLoginValid != null) {
             return cacheLoginValid!!
@@ -353,37 +346,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 source = "manual-file-empty"
                 null
             }
-        } else if (independent) {
-            val (fileNeoSes, fileNeoChk) = readCookieFromFile()
-            if (fileNeoSes.isNotEmpty()) {
-                source = "ind-file"
-                buildCookieString(fileNeoSes, fileNeoChk)
-            } else {
-                val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-                val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-                if (spNeoSes.isNotEmpty()) {
-                    source = "ind-sp"
-                    buildCookieString(spNeoSes, spNeoChk)
-                } else {
-                    source = "ind-empty"
-                    null
-                }
-            }
         } else {
+            // 独立存储 / SP 在手动备用关闭时只作为备份，不参与请求头。
             val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
             if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
                 source = "cm"
                 cmCookie
             } else {
-                val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
-                val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-                if (neoSes.isNotEmpty()) {
-                    source = "sp"
-                    buildCookieString(neoSes, neoChk)
-                } else {
-                    source = "empty"
-                    null
-                }
+                source = "cm-empty"
+                null
             }
         }
         cachedCookie = cookie?.ifEmpty { null }
@@ -397,7 +368,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         showCookieDebug("REFRESH", force = false)
     }
 
-    internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
+    internal fun isLoginKnown(): Boolean {
+        val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+        return extractCookieValue(cmCookie, "NEO_SES").isNotEmpty()
+    }
 
     internal fun syncLoginIndicator() {
         val caller = callerForDebug()
@@ -448,7 +422,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_INDEPENDENT_STORAGE
             title = "独立存储 Cookie"
-            summary = "开启后使用私有文件保存登录态，不受清除全局Cookie影响"
+            summary = "开启后保存私有文件备份；只有开启手动备用Cookie模式时才会使用该备份请求"
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, newValue ->
                 Log.d("DongmanIndependentSwitch", "CHANGE_BEFORE new=$newValue ${cookieStateForDebug()}")
@@ -629,6 +603,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         } else {
                             Log.d("DongmanPasswordLogin", "LOGIN_COOKIE_SKIP_SET_CM_CHK emptyChk cm=${shortCookieForDebug(CookieManager.getInstance().getCookie(baseUrl).orEmpty())} ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
                         }
+                        CookieManager.getInstance().flush()
+                        Log.d("DongmanPasswordLogin", "LOGIN_COOKIE_AFTER_CM_FLUSH cm=${shortCookieForDebug(CookieManager.getInstance().getCookie(baseUrl).orEmpty())} ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
+                        refreshCookieCache()
+                        Log.d("DongmanPasswordLogin", "LOGIN_COOKIE_AFTER_REFRESH_WITH_CM cm=${shortCookieForDebug(CookieManager.getInstance().getCookie(baseUrl).orEmpty())} ${cookieStateForDebug()} loginSuccessHandled=$loginSuccessHandled")
                         // 登录成功，保存明文账号密码供下次填入输入框
                         preferences.edit()
                             .putString(PREF_LOGIN_USERNAME, username)
@@ -724,11 +702,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     internal fun buildLoginSummary(): String {
-        val isLoggedIn = cachedCookie?.isNotEmpty() == true
+        val isLoggedIn = isLoginKnown()
         val status = if (isLoggedIn) "已登录" else "未登录"
-        val storageMode = if (useIndependentStorage()) "私有文件（独立）" else "CookieManager/SP"
+        val storageMode = "CookieManager/SP"
+        val backupMode = if (useIndependentStorage()) "私有文件备份开启" else "私有文件备份关闭"
         val manualMode = if (getManualCookieEnable()) "手动备用开启" else "手动备用关闭"
-        return "存储方式：$storageMode\n手动模式：$manualMode\n登录状态：$status"
+        return "存储方式：$storageMode
+备份状态：$backupMode
+手动模式：$manualMode
+登录状态：$status"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -961,10 +943,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         return debugRequest("DETAIL", GET(baseUrl + manga.url, reqHeaders))
     }
 
@@ -999,10 +978,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     override fun chapterListRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         return debugRequest("CHAPTER_LIST", GET(baseUrl + manga.url, reqHeaders))
     }
 
@@ -1033,10 +1009,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull() ?: break
             val nextUrl = nextPage.absUrl("href")
             if (nextUrl.isEmpty()) break
-            val reqHeaders = headersBuilder().apply {
-                val cookie = cookieHeader()
-                if (cookie.isNotEmpty()) set("Cookie", cookie)
-            }.build()
+            val reqHeaders = headersBuilder().build()
             document = client.newCall(debugRequest("CHAPTER_NEXT", GET(nextUrl, reqHeaders))).execute().asJsoup()
         }
         return chapters.reversed()
@@ -1047,10 +1020,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun pageListRequest(chapter: SChapter): Request {
-        val reqHeaders = headersBuilder().apply {
-            val cookie = cookieHeader()
-            if (cookie.isNotEmpty()) set("Cookie", cookie)
-        }.build()
+        val reqHeaders = headersBuilder().build()
         val autoPay = preferences.getBoolean(PREF_AUTO_PAY, false)
         if (autoPay) {
             val titleNo = extractUrlParam(chapter.url, "title_no")
@@ -1087,11 +1057,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             autoUnlockLog("AUTO_UNLOCK_START key=$key thread=$threadName")
             val params = "title_no=$titleNo&episode_no=$episodeNo&platform=MWEB&client=APP_ANDROID"
-            val savedCookie = cookieHeader()
             val reqHeaders = headersBuilder()
                 .set("Referer", "$baseUrl/FANTASY/list?title_no=$titleNo")
                 .set("X-Requested-With", "XMLHttpRequest")
-                .apply { if (savedCookie.isNotEmpty()) set("Cookie", savedCookie) }
                 .build()
             autoUnlockLog("AUTO_HEADER key=$key cookie=${shortCookieForDebug(reqHeaders.get("Cookie"))}")
 
