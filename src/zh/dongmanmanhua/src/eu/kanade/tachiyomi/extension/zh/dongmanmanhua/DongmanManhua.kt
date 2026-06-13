@@ -67,6 +67,36 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     internal var cachedCookie: String? = null
     internal var lastIndependentState: Boolean? = null
     internal var lastManualCookieState: Boolean? = null
+    internal var cachedCookieSource: String = "none"
+    private var lastCookieDebugToastTime: Long = 0L
+
+    internal fun shortCookieForDebug(cookie: String?): String {
+        if (cookie.isNullOrBlank()) return "none"
+        val ses = extractCookieValue(cookie, "NEO_SES")
+        val chk = extractCookieValue(cookie, "NEO_CHK")
+        return "ses=${ses.length},chk=${chk.length}"
+    }
+
+    internal fun showCookieDebug(label: String, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastCookieDebugToastTime < 1500L) return
+        lastCookieDebugToastTime = now
+        val (fileSes, fileChk) = readCookieFromFile()
+        val spSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
+        val spChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
+        val cm = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+        val msg = buildString {
+            append("$label\n")
+            append("manual=${getManualCookieEnable()} ind=${useIndependentStorage()} src=$cachedCookieSource\n")
+            append("cache=${shortCookieForDebug(cachedCookie)}\n")
+            append("file=ses=${fileSes.length},chk=${fileChk.length} sp=ses=${spSes.length},chk=${spChk.length}\n")
+            append("cm=${shortCookieForDebug(cm)}")
+        }
+        Log.d("DongmanCookieDebug", msg.replace("\n", " | "))
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, msg, Toast.LENGTH_LONG).show()
+        }
+    }
 
     internal fun saveCookieToFile(neoSes: String, neoChk: String) {
         try {
@@ -74,6 +104,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             Log.d("DongmanCookie", "Cookie 已写入文件: $neoSes|$neoChk")
             cachedCookie = buildCookieString(neoSes, neoChk)
             lastIndependentState = useIndependentStorage()
+            cachedCookieSource = "save-file"
+            showCookieDebug("SAVE_FILE", force = true)
         } catch (e: Exception) {
             Log.e("DongmanCookie", "写入文件失败", e)
         }
@@ -134,65 +166,66 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var cacheLoginValid: Boolean? = null
 
     private fun probeIsLoginValid(): Boolean {
-        if (!getManualCookieEnable()) return true
-        val now = System.currentTimeMillis()
-        if (now - lastProbeTime < 60_000 && cacheLoginValid != null) {
-            return cacheLoginValid!!
-        }
-        return try {
-            val req = Request.Builder()
-                .url("${baseUrl}/member/isLogin")
-                .headers(headersBuilder().build())
-                .build()
-            val resp = client.newCall(req).execute()
-            val body = resp.body?.string() ?: ""
-            resp.close()
-            val valid = body.contains("true", ignoreCase = true)
-            lastProbeTime = now
-            cacheLoginValid = valid
-            if (!valid) {
-                clearManualBackup()
-                refreshCookieCache()
-                syncLoginIndicator()
-            }
-            valid
-        } catch (_: Exception) {
-            true
-        }
+        // 调试阶段先禁用失效探针，避免 /member/isLogin 误判后把本地 Cookie 清掉。
+        Log.d("DongmanCookieDebug", "probeIsLoginValid skipped")
+        return true
     }
 
     internal fun refreshCookieCache() {
         val independent = useIndependentStorage()
         val manual = getManualCookieEnable()
+        var source = "none"
         val cookie = if (manual) {
             val (neoSes, neoChk) = readCookieFromFile()
-            if (neoSes.isNotEmpty()) buildCookieString(neoSes, neoChk) else null
+            if (neoSes.isNotEmpty()) {
+                source = "manual-file"
+                buildCookieString(neoSes, neoChk)
+            } else {
+                source = "manual-file-empty"
+                null
+            }
         } else if (independent) {
             val (fileNeoSes, fileNeoChk) = readCookieFromFile()
             if (fileNeoSes.isNotEmpty()) {
+                source = "ind-file"
                 buildCookieString(fileNeoSes, fileNeoChk)
             } else {
                 val spNeoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
                 val spNeoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-                if (spNeoSes.isNotEmpty()) buildCookieString(spNeoSes, spNeoChk) else null
+                if (spNeoSes.isNotEmpty()) {
+                    source = "ind-sp"
+                    buildCookieString(spNeoSes, spNeoChk)
+                } else {
+                    source = "ind-empty"
+                    null
+                }
             }
         } else {
             val cmCookie = CookieManager.getInstance().getCookie(baseUrl).orEmpty()
             if (cmCookie.contains("NEO_SES") || cmCookie.contains("NEO_CHK")) {
+                source = "cm"
                 cmCookie
             } else {
                 val neoSes = preferences.getString(KEY_NEO_SES, "").orEmpty()
                 val neoChk = preferences.getString(KEY_NEO_CHK, "").orEmpty()
-                if (neoSes.isNotEmpty()) buildCookieString(neoSes, neoChk) else null
+                if (neoSes.isNotEmpty()) {
+                    source = "sp"
+                    buildCookieString(neoSes, neoChk)
+                } else {
+                    source = "empty"
+                    null
+                }
             }
         }
         cachedCookie = cookie?.ifEmpty { null }
+        cachedCookieSource = source
         lastIndependentState = independent
         lastManualCookieState = manual
         Log.d(
             "DongmanCookie",
-            "Cookie 缓存已刷新: manual=$manual independent=$independent cookie=${cachedCookie ?: "(无)"}",
+            "Cookie 缓存已刷新: manual=$manual independent=$independent source=$source cookie=${cachedCookie ?: "(无)"}",
         )
+        showCookieDebug("REFRESH", force = false)
     }
 
     internal fun isLoginKnown(): Boolean = cachedCookie?.isNotEmpty() == true
@@ -421,6 +454,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         // 始终写入本地文件：独立存储和手动备用模式都依赖这份备份。
         saveCookieToFile(neoSes, neoChk)
         refreshCookieCache()
+        showCookieDebug("SAVE_LOGIN", force = true)
     }
 
     internal fun fullLogout() {
@@ -433,6 +467,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已彻底退出登录", Toast.LENGTH_SHORT).show()
+            showCookieDebug("FULL_LOGOUT", force = true)
         }
     }
 
@@ -445,6 +480,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         syncLoginIndicator()
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(appContext, "已清除独立存储备份", Toast.LENGTH_SHORT).show()
+            showCookieDebug("CLEAR_BACKUP", force = true)
         }
     }
 
@@ -478,6 +514,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "DongmanCookie",
             "cookieHeader: manual=$manual independent=$independent cookie=${cookie.ifEmpty { "(无)" }}",
         )
+        showCookieDebug("HEADER", force = false)
         return cookie
     }
 
@@ -503,6 +540,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun popularMangaRequest(page: Int): Request {
         probeIsLoginValid()
+        showCookieDebug("POPULAR_REQUEST", force = true)
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
 
@@ -521,7 +559,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 最新更新
     // ══════════════════════════════════════════════════════════════════════
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headersBuilder().build())
+    override fun latestUpdatesRequest(page: Int): Request {
+        showCookieDebug("LATEST_REQUEST", force = true)
+        return GET("$baseUrl/dailySchedule?sortOrder=UPDATE&webtoonCompleteType=ONGOING", headersBuilder().build())
+    }
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = response.asJsoup()
@@ -829,4 +870,4 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val UA_DESKTOP =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0"
     }
-}
+                               }
