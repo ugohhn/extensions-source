@@ -23,6 +23,7 @@ import eu.kanade.tachiyomi.util.asJsoup
 import org.jsoup.nodes.Element
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
+import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.Request
@@ -565,7 +566,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return builder
     }
 
-    override val client = network.client
+    // 禁用 OkHttp 自动 CookieJar，避免它用 CookieManager 里的旧 Cookie 覆盖我们手动注入的 Cookie。
+    override val client = network.client.newBuilder()
+        .cookieJar(CookieJar.NO_COOKIES)
+        .build()
 
     // ══════════════════════════════════════════════════════════════════════
     // 首页（触发探针）
