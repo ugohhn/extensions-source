@@ -13,14 +13,7 @@ private val sortFilter = arrayOf(
     Tag("按更新时间", "UPDATE"),
 )
 
-// 独立入口：选中后只请求我的漫画，不和更新/题材组合。
-private val migrateFilter = arrayOf(
-    Tag("无", ""),
-    Tag("最近观看", "recent"),
-    Tag("我的已购", "purchased"),
-)
-
-// 独立入口：选中后只请求题材页；使用网页默认 READ_COUNT，不读取“更新排序”。
+// 独立题材页；默认使用网页自己的 READ_COUNT 参数，不读取“更新排序”。
 private val themeFilter = arrayOf(
     Tag("全部", ""),
     Tag("恋爱", "LOVE"),
@@ -38,7 +31,6 @@ private val themeFilter = arrayOf(
 )
 
 fun getSortFilter(): Array<Tag> = sortFilter
-fun getMigrateFilter(): Array<Tag> = migrateFilter
 fun getThemeFilter(): Array<Tag> = themeFilter
 
 private fun getCurrentWeekdayCode(): String {
@@ -87,7 +79,7 @@ fun buildDongmanFilterList(): FilterList {
         ThemeFilter(),
         Filter.Separator(),
         Filter.Header("我的漫画：独立请求"),
-        MigrateFilter(),
+        PurchasedFilter(),
     )
 }
 
@@ -110,8 +102,4 @@ class ThemeFilter : Filter.Select<String>(
     0,
 )
 
-class MigrateFilter : Filter.Select<String>(
-    "我的漫画",
-    getMigrateFilter().map { it.name }.toTypedArray(),
-    0,
-)
+class PurchasedFilter : Filter.CheckBox("我的已购", false)
