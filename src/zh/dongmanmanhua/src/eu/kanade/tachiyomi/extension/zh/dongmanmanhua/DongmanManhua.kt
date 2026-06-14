@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.zh.dongmanmanhua
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.preference.EditTextPreference
@@ -706,13 +707,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val document = response.asJsoup()
             val entries = document.select(".new_works_items").mapNotNull { item ->
                 val href = item.absUrl("href")
-                cacheNewTitle(titleNoFromUrl(href), true)
+                // “新作页”不等于每一本都带 newTitle。只在元素本身出现 NEW/新图标时缓存。
+                cacheNewTitle(titleNoFromUrl(href), hasNewBadge(item))
                 SManga.create().apply {
                     setUrlWithoutDomain(href)
                     title = item.selectFirst(".works_tit")?.text() ?: return@mapNotNull null
                     thumbnail_url = item.selectFirst(".works_img_area img")?.absUrl("src") ?: ""
                 }
             }.filter { it.title.isNotEmpty() }
+            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size}")
             return MangasPage(entries, false)
         }
 
@@ -725,6 +728,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private val newTitleCache = mutableMapOf<String, Boolean>()
+
+    private fun dlog(message: String) = Log.d(TAG, message)
+    private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
 
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
@@ -742,9 +748,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         // latestUpdatesParse() 需要知道当前更新分区。
         // 这里保存的是“更新”自己的状态；题材/我的漫画不会用它组合请求。
+        val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
+        val themeState = themeFilter?.state ?: 0
+        val themeTag = getThemeFilter().getOrNull(themeState)
+        val themeValue = themeTag?.value.orEmpty()
+
+        val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
+        val migrateState = migrateFilter?.state ?: 0
+        val migrateTag = getMigrateFilter().getOrNull(migrateState)
+        val migrateValue = migrateTag?.value.orEmpty()
+
         preferences.edit()
             .putString(PREF_FILTER_WEEKDAY, weekdayValue)
             .putString(PREF_FILTER_SORT, sortValue)
+            .putString(PREF_FILTER_THEME, themeValue)
             .apply()
 
         // query 为空时走筛选浏览。这里照 ColaManga 的思路：
@@ -752,35 +769,54 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         // 优先级：我的漫画 > 题材 > 更新。
         // 这样不会出现“题材 + 周日 + 我的漫画 + 排序”的组合请求。
         if (query.isBlank()) {
-            val purchasedFilter = filters.firstOrNull { it is PurchasedFilter } as? PurchasedFilter
-            if (purchasedFilter?.state == true) {
-                return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", ajaxHeaders("$baseUrl/purchased/list"))
-            }
-
-            val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
-            val themeValue = themeFilter?.let { getThemeFilter().getOrNull(it.state)?.value }.orEmpty()
-            if (themeValue.isNotEmpty()) {
-                // 题材页使用网页自己的默认排序参数；不读取“更新排序”控件。
-                return GET("$baseUrl/$themeValue/?sortOrder=READ_COUNT", headersBuilder().build())
-            }
-
-            val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
-                Calendar.MONDAY -> "MONDAY"
-                Calendar.TUESDAY -> "TUESDAY"
-                Calendar.WEDNESDAY -> "WEDNESDAY"
-                Calendar.THURSDAY -> "THURSDAY"
-                Calendar.FRIDAY -> "FRIDAY"
-                Calendar.SATURDAY -> "SATURDAY"
-                Calendar.SUNDAY -> "SUNDAY"
-                else -> "MONDAY"
-            }
-            val url = when (weekdayValue) {
+            val todayCode = currentWeekdayCode()
+            val updateUrl = when (weekdayValue) {
                 "NEW" -> "$baseUrl/new"
                 "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sortValue"
                 "" -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sortValue"
                 else -> "$baseUrl/dailySchedule?weekday=$weekdayValue&sortOrder=$sortValue"
             }
-            return GET(url, headersBuilder().build())
+
+            val branch: String
+            val request: Request
+            when {
+                migrateValue == "purchased" -> {
+                    branch = "purchased"
+                    val url = "$baseUrl/episode/unlock/titleList?platform=MWEB"
+                    request = GET(url, ajaxHeaders("$baseUrl/purchased/list"))
+                }
+                migrateValue == "recent" -> {
+                    branch = "recent"
+                    val url = "$baseUrl/home/recentSeeing?size=50"
+                    request = GET(url, ajaxHeaders("$baseUrl/recent/more"))
+                }
+                // 只要“更新”下拉不是默认“今天”，就认为用户正在切换更新分区，覆盖旧题材状态。
+                // 这能避免先选题材后再选“新作/完结/周几”仍停留在题材页。
+                weekdayValue.isNotEmpty() -> {
+                    branch = "update-explicit"
+                    request = GET(updateUrl, headersBuilder().build())
+                }
+                themeValue.isNotEmpty() -> {
+                    branch = "theme"
+                    // 分类页 HTML 一次性预载所有题材分区。为了避免站点把非 LOVE 路径重定向回默认页，
+                    // 这里固定请求网页抓包确认过的分类壳，再在 parse 阶段按 themeValue 取对应 flick-ct。
+                    val url = "$baseUrl/LOVE/?sortOrder=READ_COUNT"
+                    request = GET(url, headersBuilder().build())
+                }
+                else -> {
+                    branch = "update-default"
+                    request = GET(updateUrl, headersBuilder().build())
+                }
+            }
+
+            dlog(
+                "searchMangaRequest filter branch=$branch page=$page " +
+                    "weekdayState=${weekdayFilter?.state ?: 0} weekday=$weekdayValue sort=$sortValue " +
+                    "themeState=$themeState theme=${themeTag?.name.orEmpty()}/$themeValue " +
+                    "migrateState=$migrateState migrate=${migrateTag?.name.orEmpty()}/$migrateValue " +
+                    "url=${request.url}"
+            )
+            return request
         }
 
         // 有 query 时走关键词搜索（原有逻辑）
@@ -807,6 +843,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun searchMangaParse(response: Response): MangasPage {
         val url = response.request.url.toString()
+        dlog("searchMangaParse url=$url contentType=${response.header("Content-Type").orEmpty()}")
         return when {
             url.contains("/home/recentSeeing") || url.contains("/getTodaysWebtoon") -> parseRecentSeeing(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
@@ -871,14 +908,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         cacheNewTitle(titleNoText, newTitle)
         return SManga.create().apply {
             val genreSeo = item.optString("representGenreSeoCode", "")
-                .ifEmpty { item.optString("representGenre", "") }
             val groupName = item.optString("groupName", "")
             url = when {
+                // 只有 SEO 题材码明确存在时才拼网页详情地址。
+                // representGenre 是 ROMANCE/ACTION 这类内部枚举，不等于 URL 里的 LOVE/BOY，不能拿来拼。
                 titleNoText.isNotEmpty() && genreSeo.isNotEmpty() && groupName.isNotEmpty() ->
                     "/$genreSeo/$groupName/list?title_no=$titleNoText"
                 titleNoText.isNotEmpty() -> "/episodeList?titleNo=$titleNoText"
                 else -> ""
             }
+            dlog(
+                "mangaFromJsonTitle titleNo=$titleNoText title=${item.optString("title", "")} " +
+                    "representGenre=${item.optString("representGenre", "")} genreSeo=$genreSeo " +
+                    "groupName=$groupName newTitle=$newTitle url=$url"
+            )
             title = item.optString("title", "")
             thumbnail_url = buildThumbnailUrl(
                 item.optString("thumbnail", "")
@@ -893,16 +936,43 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun parseMangaListHtml(response: Response): MangasPage {
         val document = response.asJsoup()
-        val selector = when {
-            document.select("a.genrePageContentItem").isNotEmpty() -> "a.genrePageContentItem"
-            else -> "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
-                "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
+        val requestedGenre = preferences.getString(PREF_FILTER_THEME, "").orEmpty()
+            .ifEmpty { genreCodeFromUrl(response.request.url.toString()).orEmpty() }
+        val genreItems = document.select("a.genrePageContentItem")
+        val genreIndex = if (requestedGenre.isNotEmpty()) {
+            document.select("#genreList li").firstOrNull { li ->
+                li.attr("data-genre") == requestedGenre || li.attr("data-genre-seo") == requestedGenre
+            }?.selectFirst("a")?.attr("data-index")?.toIntOrNull()
+        } else {
+            null
         }
-        val entries = document
-            .select(selector)
+        val elements = if (genreItems.isNotEmpty()) {
+            val sectionItems = genreIndex
+                ?.let { document.select("div._genreFlick div.flick-ct").getOrNull(it) }
+                ?.select("a.genrePageContentItem")
+                .orEmpty()
+
+            when {
+                sectionItems.isNotEmpty() -> sectionItems
+                requestedGenre.isEmpty() -> genreItems
+                else -> genreItems.filter { item ->
+                    normalizeAbsoluteUrl(item.attr("href")).contains("/$requestedGenre/")
+                }
+            }
+        } else {
+            document.select(
+                "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
+                    "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
+            )
+        }
+        val entries = elements
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
+        dlog(
+            "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
+                "genreIndex=$genreIndex rawGenreItems=${genreItems.size} selectedElements=${elements.size} entries=${entries.size}"
+        )
         return MangasPage(entries, false)
     }
 
@@ -1004,7 +1074,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         val chapters = mutableListOf<SChapter>()
-        val visitedPages = mutableSetOf(response.request.url.toString())
+
         while (true) {
             document.select("div#_episodeList ul li").forEach { li ->
                 val a = li.selectFirst("a.workEpisodeListItem") ?: return@forEach
@@ -1012,7 +1082,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (dataHref.isEmpty()) return@forEach
                 chapters.add(SChapter.create().apply {
                     val cleanUrl = dataHref.substringBefore("&source")
-                    url = normalizeMangaPath(cleanUrl)
+                    url = if (cleanUrl.startsWith("http")) {
+                        cleanUrl.removePrefix("https://m.dongmanmanhua.cn").removePrefix("//m.dongmanmanhua.cn")
+                    } else {
+                        cleanUrl
+                    }
                     val isFree = a.attr("data-free") == "true"
                     val rawName = a.selectFirst("p.sub_title span.ellipsis")?.text()
                         ?: a.selectFirst("p.sub_title")?.text()
@@ -1022,14 +1096,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     chapter_number = li.attr("data-episode-no").toFloatOrNull() ?: -1f
                 })
             }
+
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull() ?: break
             val nextUrl = nextPage.absUrl("href")
-            if (nextUrl.isEmpty() || !visitedPages.add(nextUrl)) break
+            if (nextUrl.isEmpty()) break
+
             val reqHeaders = headersBuilder().build()
-            val nextResponse = client.newCall(GET(nextUrl, reqHeaders)).execute()
-            document = nextResponse.use { it.asJsoup() }
+            document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
         }
-        return chapters.distinctBy { it.url }.reversed()
+
+        val result = chapters.reversed()
+        dlog("chapterListParse url=${response.request.url} chapters=${result.size}")
+        return result
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1141,10 +1219,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         val href = element.absUrl("href").ifEmpty { element.attr("href") }
         val titleNo = titleNoFromUrl(href) ?: element.attr("data-title-no")
-        val hasNewBadge = element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null ||
-            Regex("""\bNEW\b""", RegexOption.IGNORE_CASE).containsMatchIn(element.text())
-        cacheNewTitle(titleNo, hasNewBadge)
-        url = normalizeMangaPath(href)
+        cacheNewTitle(titleNo, hasNewBadge(element))
+        setUrlWithoutDomain(href)
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
@@ -1153,7 +1229,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        url = normalizeMangaPath(element.absUrl("href").ifEmpty { element.attr("href") })
+        setUrlWithoutDomain(element.absUrl("href").ifEmpty { element.attr("href") })
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
     }
@@ -1206,6 +1282,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
 
+    private fun hasNewBadge(element: Element): Boolean {
+        return element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null ||
+            Regex("""\bNEW\b""", RegexOption.IGNORE_CASE).containsMatchIn(element.text())
+    }
+
+    private fun genreCodeFromUrl(url: String): String? {
+        return getThemeFilter()
+            .map { it.value }
+            .firstOrNull { it.isNotEmpty() && (url.contains("/$it/") || url.endsWith("/$it")) }
+    }
+
+
     private fun currentWeekdayCode(): String {
         return when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
             Calendar.MONDAY -> "MONDAY"
@@ -1240,6 +1328,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isNewTitleDetail(url: String, html: String): Boolean {
         val titleNo = titleNoFromUrl(url)
         if (titleNo != null && newTitleCache[titleNo] == true) return true
+
+        // 只认当前作品自己的字段。不要因为页面里加载了“新”图标静态资源就给所有作品打“新”。
         return Regex("""["']?newTitle["']?\s*[:=]\s*true""").containsMatchIn(html)
     }
 
@@ -1252,6 +1342,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     companion object {
+        private const val TAG = "DongmanManhua"
+
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
         internal const val PREF_UA_CUSTOM_FLAG = "__custom__"
@@ -1266,6 +1358,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
         internal const val PREF_FILTER_SORT = "pref_filter_sort"
+        internal const val PREF_FILTER_THEME = "pref_filter_theme"
         internal const val KEY_NEO_SES = "neo_ses"
         internal const val KEY_NEO_CHK = "neo_chk"
 
