@@ -6,14 +6,21 @@ import java.util.Calendar
 
 data class Tag(val name: String, val value: String)
 
-// 只给“更新”使用。
+// 排序方式
 private val sortFilter = arrayOf(
     Tag("按人气", "READ_COUNT"),
     Tag("按点赞数", "LIKEIT"),
-    Tag("按更新时间", "UPDATE"),
+    Tag("按更新时间", "UPDATE")
 )
 
-// 独立题材页；默认使用网页自己的 READ_COUNT 参数，不读取“更新排序”。
+// 我的漫画
+private val migrateFilter = arrayOf(
+    Tag("无", ""),
+    Tag("最近观看", "recent"),
+    Tag("我的已购", "purchased")
+)
+
+// 题材
 private val themeFilter = arrayOf(
     Tag("全部", ""),
     Tag("恋爱", "LOVE"),
@@ -27,10 +34,11 @@ private val themeFilter = arrayOf(
     Tag("悬疑", "SUSPENSE"),
     Tag("励志", "INSPIRATIONAL"),
     Tag("影视化", "FILMADAPTATION"),
-    Tag("完结", "TERMINATION"),
+    Tag("完结", "TERMINATION")
 )
 
 fun getSortFilter(): Array<Tag> = sortFilter
+fun getMigrateFilter(): Array<Tag> = migrateFilter
 fun getThemeFilter(): Array<Tag> = themeFilter
 
 private fun getCurrentWeekdayCode(): String {
@@ -48,13 +56,8 @@ private fun getCurrentWeekdayCode(): String {
 
 fun buildDongmanFilterList(): FilterList {
     val allWeekdays = listOf(
-        "MONDAY" to "周一",
-        "TUESDAY" to "周二",
-        "WEDNESDAY" to "周三",
-        "THURSDAY" to "周四",
-        "FRIDAY" to "周五",
-        "SATURDAY" to "周六",
-        "SUNDAY" to "周日",
+        "MONDAY" to "周一", "TUESDAY" to "周二", "WEDNESDAY" to "周三",
+        "THURSDAY" to "周四", "FRIDAY" to "周五", "SATURDAY" to "周六", "SUNDAY" to "周日"
     )
     val currentWeekday = getCurrentWeekdayCode()
     val weekdayNames = mutableListOf("今天")
@@ -71,20 +74,19 @@ fun buildDongmanFilterList(): FilterList {
     weekdayValues.add("NEW")
 
     return FilterList(
-        Filter.Header("更新"),
+        Filter.Header("咚漫筛选"),
+        Filter.Separator(),
         WeekdayFilter(weekdayNames.toTypedArray(), weekdayValues.toTypedArray()),
         SortFilter(),
-        Filter.Separator(),
-        Filter.Header("题材：独立请求，使用网页默认排序"),
         ThemeFilter(),
         Filter.Separator(),
-        Filter.Header("我的漫画：独立请求"),
-        PurchasedFilter(),
+        Filter.Header("我的漫画"),
+        MigrateFilter()
     )
 }
 
 class SortFilter : Filter.Sort(
-    "更新排序",
+    "排序",
     getSortFilter().map { it.name }.toTypedArray(),
     Selection(0, true),
 )
@@ -102,4 +104,8 @@ class ThemeFilter : Filter.Select<String>(
     0,
 )
 
-class PurchasedFilter : Filter.CheckBox("我的已购", false)
+class MigrateFilter : Filter.Select<String>(
+    "我的漫画",
+    getMigrateFilter().map { it.name }.toTypedArray(),
+    0,
+)
