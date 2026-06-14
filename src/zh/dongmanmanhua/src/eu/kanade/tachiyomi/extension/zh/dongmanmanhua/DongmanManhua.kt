@@ -638,6 +638,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return builder
     }
 
+    private fun ajaxHeaders(referer: String = "$baseUrl/"): Headers {
+        return headersBuilder()
+            .set("Referer", referer)
+            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Accept", "application/json, text/javascript, */*; q=0.01")
+            .build()
+    }
+
     // 禁用 OkHttp 自动 CookieJar，避免它用 CookieManager 里的旧 Cookie 覆盖我们手动注入的 Cookie。
     // 同时手动捕获服务器返回的 NEO_CHK，并合并进独立存储。
     override val client = network.client.newBuilder()
@@ -693,12 +701,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
-        val document = response.asJsoup()
 
-        if (weekday == "NEW") {
+        if (weekday == "NEW" || response.request.url.encodedPath == "/new") {
+            val document = response.asJsoup()
             val entries = document.select(".new_works_items").mapNotNull { item ->
+                val href = item.absUrl("href")
+                cacheNewTitle(titleNoFromUrl(href), true)
                 SManga.create().apply {
-                    setUrlWithoutDomain(item.absUrl("href"))
+                    setUrlWithoutDomain(href)
                     title = item.selectFirst(".works_tit")?.text() ?: return@mapNotNull null
                     thumbnail_url = item.selectFirst(".works_img_area img")?.absUrl("src") ?: ""
                 }
@@ -706,32 +716,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return MangasPage(entries, false)
         }
 
-        // 优先：服务端已按 weekday 参数过滤，直接取全部 li
-        // 兜底：旧版按 div._list_WEEKDAY 分区（某些页面结构）
-        val todayDiv = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
-            Calendar.SUNDAY -> "div._list_SUNDAY"
-            Calendar.MONDAY -> "div._list_MONDAY"
-            Calendar.TUESDAY -> "div._list_TUESDAY"
-            Calendar.WEDNESDAY -> "div._list_WEDNESDAY"
-            Calendar.THURSDAY -> "div._list_THURSDAY"
-            Calendar.FRIDAY -> "div._list_FRIDAY"
-            Calendar.SATURDAY -> "div._list_SATURDAY"
-            else -> "div._list_MONDAY"
-        }
-        val targetDiv = when (weekday) {
-            "" -> todayDiv
-            "COMPLETE" -> "div._list_COMPLETE"
-            else -> "div._list_$weekday"
-        }
-        val entries = (
-            document.select("$targetDiv li > a") +
-                document.select("li[id^=title_li_] > a") +
-                document.select("ul.daily_card li a")
-            )
-            .map(::mangaFromElement)
-            .distinctBy { it.url }
-            .filter { it.title.isNotEmpty() }
-        return MangasPage(entries, false)
+        return parseDailyScheduleHtml(response)
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -739,6 +724,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
+    private val newTitleCache = mutableMapOf<String, Boolean>()
+
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -768,15 +755,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
             val migrateValue = migrateFilter?.let { getMigrateFilter().getOrNull(it.state)?.value }.orEmpty()
             when (migrateValue) {
-                "recent" -> return GET("$baseUrl/home/recentSeeing?size=50", headersBuilder().build())
-                "purchased" -> return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", headersBuilder().build())
+                "recent" -> return GET("$baseUrl/home/recentSeeing?size=50", ajaxHeaders("$baseUrl/recent/more"))
+                "purchased" -> return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", ajaxHeaders("$baseUrl/purchased/list"))
             }
 
             val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
             val themeValue = themeFilter?.let { getThemeFilter().getOrNull(it.state)?.value }.orEmpty()
             if (themeValue.isNotEmpty()) {
-                // 题材接口不吃排序，不拼 sortOrder。
-                return GET("$baseUrl/$themeValue/list", headersBuilder().build())
+                // 题材页使用网页自己的默认排序参数；不读取“更新排序”控件。
+                return GET("$baseUrl/$themeValue/?sortOrder=READ_COUNT", headersBuilder().build())
             }
 
             val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
@@ -823,34 +810,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun searchMangaParse(response: Response): MangasPage {
         val url = response.request.url.toString()
         return when {
-            url.contains("/home/recentSeeing") -> parseRecentSeeing(response)
+            url.contains("/home/recentSeeing") || url.contains("/getTodaysWebtoon") -> parseRecentSeeing(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
             url.contains("/dailySchedule") || url.endsWith("/new") || url.contains("/new?") -> latestUpdatesParse(response)
-            url.contains("/list") -> parseMangaListHtml(response)
+            isGenrePageUrl(url) || url.contains("/list") -> parseMangaListHtml(response)
             else -> parseSearchHtml(response)
         }
     }
 
     private fun parseRecentSeeing(response: Response): MangasPage {
-        val body = response.body.string()
-        val json = runCatching { JSONObject(body) }.getOrNull() ?: return MangasPage(emptyList(), false)
-        if (json.optInt("code") != 200) return MangasPage(emptyList(), false)
-        val data = json.optJSONObject("data") ?: return MangasPage(emptyList(), false)
-        val items = data.optJSONArray("recentlyViewed") ?: data.optJSONArray("list") ?: data.optJSONArray("titles") ?: return MangasPage(emptyList(), false)
+        val body = response.body.string().trim()
         val entries = mutableListOf<SManga>()
+        val items = when {
+            body.startsWith("[") -> runCatching { org.json.JSONArray(body) }.getOrNull()
+            else -> {
+                val json = runCatching { JSONObject(body) }.getOrNull() ?: return MangasPage(emptyList(), false)
+                if (json.optInt("code", 200) != 200) return MangasPage(emptyList(), false)
+                val data = json.optJSONObject("data") ?: json
+                data.optJSONArray("recentlyViewed") ?: data.optJSONArray("list") ?: data.optJSONArray("titles")
+            }
+        } ?: return MangasPage(emptyList(), false)
+
         for (i in 0 until items.length()) {
             val item = items.getJSONObject(i)
-            val titleNo = item.optInt("titleNo", 0)
-            if (titleNo == 0) continue
-            entries.add(SManga.create().apply {
-                url = "/episodeList?titleNo=$titleNo"
-                title = item.optString("title", "")
-                val thumb = item.optString("thumbnail", "")
-                thumbnail_url = if (thumb.startsWith("//")) "https:$thumb" else thumb
-            })
+            val manga = mangaFromJsonTitle(item)
+            if (manga.title.isNotEmpty()) entries.add(manga)
         }
-        return MangasPage(entries.filter { it.title.isNotEmpty() }, false)
+        return MangasPage(entries.distinctBy { it.url }, false)
     }
 
     private fun parsePurchasedTitles(response: Response): MangasPage {
@@ -862,27 +849,51 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val entries = mutableListOf<SManga>()
         for (i in 0 until titles.length()) {
             val item = titles.getJSONObject(i)
-            val titleNo = item.optInt("titleNo", 0)
-            if (titleNo == 0) continue
-            entries.add(SManga.create().apply {
-                url = "/episodeList?titleNo=$titleNo"
-                title = item.optString("title", "")
-                val thumb = item.optString("thumbnail", "")
-                    .ifEmpty { item.optString("thumbnailMobile", "") }
-                    .ifEmpty { item.optString("image", "") }
-                thumbnail_url = if (thumb.startsWith("//")) "https:$thumb" else thumb
-            })
+            val manga = mangaFromJsonTitle(item)
+            if (manga.title.isNotEmpty()) entries.add(manga)
         }
-        return MangasPage(entries.filter { it.title.isNotEmpty() }, false)
+        return MangasPage(entries.distinctBy { it.url }, false)
+    }
+
+    private fun parseDailyScheduleHtml(response: Response): MangasPage {
+        val document = response.asJsoup()
+        val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty().ifEmpty { currentWeekdayCode() }
+        val entries = document
+            .select("a.updatePage_lst_item[data-week=$weekday]")
+            .map(::mangaFromElement)
+            .distinctBy { it.url }
+            .filter { it.title.isNotEmpty() }
+        return MangasPage(entries, false)
+    }
+
+    private fun mangaFromJsonTitle(item: org.json.JSONObject): SManga {
+        val titleNo = item.optInt("titleNo", 0)
+        val titleNoText = if (titleNo > 0) titleNo.toString() else item.optString("titleNo", "")
+        val newTitle = item.optBoolean("newTitle", false)
+        cacheNewTitle(titleNoText, newTitle)
+        return SManga.create().apply {
+            url = if (titleNoText.isNotEmpty()) "/episodeList?titleNo=$titleNoText" else ""
+            title = item.optString("title", "")
+            thumbnail_url = buildThumbnailUrl(
+                item.optString("thumbnail", "")
+                    .ifEmpty { item.optString("thumbnailMobile", "") }
+                    .ifEmpty { item.optString("bgNewMobile", "") }
+                    .ifEmpty { item.optString("bgNewIpad", "") }
+                    .ifEmpty { item.optString("image", "") },
+                cdnBase,
+            )
+        }
     }
 
     private fun parseMangaListHtml(response: Response): MangasPage {
         val document = response.asJsoup()
+        val selector = when {
+            document.select("a.genrePageContentItem").isNotEmpty() -> "a.genrePageContentItem"
+            else -> "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
+                "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
+        }
         val entries = document
-            .select(
-                "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
-                    "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
-            )
+            .select(selector)
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
@@ -960,7 +971,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             artist = author
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val updateTag = extractUpdateTag(document.html())
-            genre = if (updateTag.isNotEmpty()) "$genreBase, $updateTag" else genreBase
+            val newTag = if (isNewTitleDetail(response.request.url.toString(), document.html())) "新" else ""
+            genre = joinNonBlank(genreBase, updateTag, newTag)
             description = detailDiv?.selectFirst("p.summary span.ellipsis")?.text()
                 ?: document.selectFirst("meta[property=og:description]")?.attr("content")
             status = when (extractSerialStatus(document.html())) {
@@ -1123,9 +1135,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href"))
+        val href = element.absUrl("href")
+        val titleNo = titleNoFromUrl(href) ?: element.attr("data-title-no")
+        cacheNewTitle(titleNo, element.selectFirst(".ico_new_cn") != null)
+        setUrlWithoutDomain(href)
         title = element.selectFirst(
-            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, p.chapter-title-02, .chapter-title-01"
+            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
+                "p.chapter-title-02, .chapter-title-01, .tit_content"
         )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
         thumbnail_url = extractThumbnailUrl(element)
     }
@@ -1134,6 +1150,48 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         setUrlWithoutDomain(element.absUrl("href"))
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
+    }
+
+
+    private fun currentWeekdayCode(): String {
+        return when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
+            Calendar.MONDAY -> "MONDAY"
+            Calendar.TUESDAY -> "TUESDAY"
+            Calendar.WEDNESDAY -> "WEDNESDAY"
+            Calendar.THURSDAY -> "THURSDAY"
+            Calendar.FRIDAY -> "FRIDAY"
+            Calendar.SATURDAY -> "SATURDAY"
+            Calendar.SUNDAY -> "SUNDAY"
+            else -> "MONDAY"
+        }
+    }
+
+    private fun isGenrePageUrl(url: String): Boolean {
+        return getThemeFilter().any { tag ->
+            tag.value.isNotEmpty() && (url.contains("/${tag.value}/") || url.endsWith("/${tag.value}"))
+        }
+    }
+
+    private fun titleNoFromUrl(url: String): String? {
+        return Regex("""(?:title_no|titleNo)=([0-9]+)""").find(url)?.groupValues?.getOrNull(1)
+            ?: Regex("""/title/([0-9]+)""").find(url)?.groupValues?.getOrNull(1)
+    }
+
+    private fun cacheNewTitle(titleNo: String?, isNew: Boolean) {
+        if (titleNo.isNullOrBlank()) return
+        if (isNew || !newTitleCache.containsKey(titleNo)) {
+            newTitleCache[titleNo] = isNew
+        }
+    }
+
+    private fun isNewTitleDetail(url: String, html: String): Boolean {
+        val titleNo = titleNoFromUrl(url)
+        if (titleNo != null && newTitleCache[titleNo] == true) return true
+        return Regex("""["']?newTitle["']?\s*[:=]\s*true""").containsMatchIn(html)
+    }
+
+    private fun joinNonBlank(vararg parts: String): String {
+        return parts.map { it.trim().trim(',') }.filter { it.isNotEmpty() }.joinToString(", ")
     }
 
     // ══════════════════════════════════════════════════════════════════════
