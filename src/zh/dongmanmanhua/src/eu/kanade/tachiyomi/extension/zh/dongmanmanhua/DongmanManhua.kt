@@ -752,11 +752,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         // 优先级：我的漫画 > 题材 > 更新。
         // 这样不会出现“题材 + 周日 + 我的漫画 + 排序”的组合请求。
         if (query.isBlank()) {
-            val migrateFilter = filters.firstOrNull { it is MigrateFilter } as? MigrateFilter
-            val migrateValue = migrateFilter?.let { getMigrateFilter().getOrNull(it.state)?.value }.orEmpty()
-            when (migrateValue) {
-                "recent" -> return GET("$baseUrl/home/recentSeeing?size=50", ajaxHeaders("$baseUrl/recent/more"))
-                "purchased" -> return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", ajaxHeaders("$baseUrl/purchased/list"))
+            val purchasedFilter = filters.firstOrNull { it is PurchasedFilter } as? PurchasedFilter
+            if (purchasedFilter?.state == true) {
+                return GET("$baseUrl/episode/unlock/titleList?platform=MWEB", ajaxHeaders("$baseUrl/purchased/list"))
             }
 
             val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
@@ -872,7 +870,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val newTitle = item.optBoolean("newTitle", false)
         cacheNewTitle(titleNoText, newTitle)
         return SManga.create().apply {
-            url = if (titleNoText.isNotEmpty()) "/episodeList?titleNo=$titleNoText" else ""
+            val genreSeo = item.optString("representGenreSeoCode", "")
+                .ifEmpty { item.optString("representGenre", "") }
+            val groupName = item.optString("groupName", "")
+            url = when {
+                titleNoText.isNotEmpty() && genreSeo.isNotEmpty() && groupName.isNotEmpty() ->
+                    "/$genreSeo/$groupName/list?title_no=$titleNoText"
+                titleNoText.isNotEmpty() -> "/episodeList?titleNo=$titleNoText"
+                else -> ""
+            }
             title = item.optString("title", "")
             thumbnail_url = buildThumbnailUrl(
                 item.optString("thumbnail", "")
@@ -998,6 +1004,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun chapterListParse(response: Response): List<SChapter> {
         var document = response.asJsoup()
         val chapters = mutableListOf<SChapter>()
+        val visitedPages = mutableSetOf(response.request.url.toString())
         while (true) {
             document.select("div#_episodeList ul li").forEach { li ->
                 val a = li.selectFirst("a.workEpisodeListItem") ?: return@forEach
@@ -1005,11 +1012,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (dataHref.isEmpty()) return@forEach
                 chapters.add(SChapter.create().apply {
                     val cleanUrl = dataHref.substringBefore("&source")
-                    url = if (cleanUrl.startsWith("http")) {
-                        cleanUrl.removePrefix("https://m.dongmanmanhua.cn").removePrefix("//m.dongmanmanhua.cn")
-                    } else {
-                        cleanUrl
-                    }
+                    url = normalizeMangaPath(cleanUrl)
                     val isFree = a.attr("data-free") == "true"
                     val rawName = a.selectFirst("p.sub_title span.ellipsis")?.text()
                         ?: a.selectFirst("p.sub_title")?.text()
@@ -1021,11 +1024,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull() ?: break
             val nextUrl = nextPage.absUrl("href")
-            if (nextUrl.isEmpty()) break
+            if (nextUrl.isEmpty() || !visitedPages.add(nextUrl)) break
             val reqHeaders = headersBuilder().build()
-            document = client.newCall(GET(nextUrl, reqHeaders)).execute().asJsoup()
+            val nextResponse = client.newCall(GET(nextUrl, reqHeaders)).execute()
+            document = nextResponse.use { it.asJsoup() }
         }
-        return chapters.reversed()
+        return chapters.distinctBy { it.url }.reversed()
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1135,10 +1139,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-        val href = element.absUrl("href")
+        val href = element.absUrl("href").ifEmpty { element.attr("href") }
         val titleNo = titleNoFromUrl(href) ?: element.attr("data-title-no")
-        cacheNewTitle(titleNo, element.selectFirst(".ico_new_cn") != null)
-        setUrlWithoutDomain(href)
+        val hasNewBadge = element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null ||
+            Regex("""\bNEW\b""", RegexOption.IGNORE_CASE).containsMatchIn(element.text())
+        cacheNewTitle(titleNo, hasNewBadge)
+        url = normalizeMangaPath(href)
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
@@ -1147,9 +1153,56 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href"))
+        url = normalizeMangaPath(element.absUrl("href").ifEmpty { element.attr("href") })
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
+    }
+
+
+    private fun normalizeAbsoluteUrl(rawUrl: String): String {
+        val url = rawUrl.trim()
+        return when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$baseUrl$url"
+            url.isNotEmpty() -> "$baseUrl/$url"
+            else -> ""
+        }
+    }
+
+    private fun normalizeMangaPath(rawUrl: String): String {
+        val absoluteUrl = normalizeAbsoluteUrl(rawUrl)
+        return absoluteUrl
+            .removePrefix(baseUrl)
+            .removePrefix("https://m.dongmanmanhua.cn")
+            .removePrefix("http://m.dongmanmanhua.cn")
+            .ifEmpty { rawUrl }
+    }
+
+    private fun buildThumbnailUrl(rawUrl: String, base: String = cdnBase): String {
+        val url = rawUrl.trim()
+        return when {
+            url.isBlank() -> ""
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$base$url"
+            else -> "$base/$url"
+        }
+    }
+
+    private fun extractThumbnailUrl(element: Element): String {
+        val img = element.selectFirst("img")
+        val rawUrl = img?.attr("data-original")
+            ?.ifEmpty { img.attr("data-src") }
+            ?.ifEmpty { img.attr("src") }
+            ?: ""
+        if (rawUrl.isNotBlank()) {
+            return buildThumbnailUrl(rawUrl, cdnBase)
+        }
+
+        val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
+        val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
+        return buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
     }
 
 
