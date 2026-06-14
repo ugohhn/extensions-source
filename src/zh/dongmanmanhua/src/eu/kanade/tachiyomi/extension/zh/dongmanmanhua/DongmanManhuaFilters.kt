@@ -20,7 +20,7 @@ private val migrateFilter = arrayOf(
     Tag("我的已购", "purchased"),
 )
 
-// 独立入口：选中后只请求题材列表，不读取排序。
+// 独立入口：选中后只请求题材页；使用网页默认 READ_COUNT，不读取“更新排序”。
 private val themeFilter = arrayOf(
     Tag("全部", ""),
     Tag("恋爱", "LOVE"),
@@ -83,7 +83,7 @@ fun buildDongmanFilterList(): FilterList {
         WeekdayFilter(weekdayNames.toTypedArray(), weekdayValues.toTypedArray()),
         SortFilter(),
         Filter.Separator(),
-        Filter.Header("题材：独立请求，不读取排序"),
+        Filter.Header("题材：独立请求，使用网页默认排序"),
         ThemeFilter(),
         Filter.Separator(),
         Filter.Header("我的漫画：独立请求"),
