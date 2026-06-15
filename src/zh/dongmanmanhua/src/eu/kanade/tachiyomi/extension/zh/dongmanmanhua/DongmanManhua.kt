@@ -706,15 +706,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (weekday == "NEW" || response.request.url.encodedPath == "/new") {
             val document = response.asJsoup()
             val entries = document.select(".new_works_items").mapNotNull { item ->
-                val href = item.absUrl("href")
-                val titleNo = titleNoFromUrl(href)
+                val rawHref = item.attr("href")
+                val href = item.absUrl("href").ifEmpty { rawHref }
+                val cleanPath = cleanMangaDetailPath(href)
+                val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href)
                 // /new 是“新作”入口，但不能把入口/来源参数直接当成作品 newTitle。
                 // 只认当前卡片自身的 NEW 图标；JSON 接口另走 newTitle 字段。
                 val isNew = hasNewBadge(item)
                 cacheNewTitle(titleNo, isNew)
-                dlog("latestUpdatesParse NEW item titleNo=$titleNo isNewBadge=$isNew href=$href")
+                if (VERBOSE_LIST_LOG) {
+                    dlog("latestUpdatesParse NEW item titleNo=$titleNo isNewBadge=$isNew href=$href cleanPath=$cleanPath")
+                }
                 SManga.create().apply {
-                    setUrlWithoutDomain(href)
+                    url = cleanPath
                     title = item.selectFirst(".works_tit")?.text() ?: return@mapNotNull null
                     thumbnail_url = item.selectFirst(".works_img_area img")?.absUrl("src") ?: ""
                 }
@@ -803,16 +807,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     themeState != 0 -> "theme"
                     else -> "update"
                 }
-                // 我的漫画有变化：选了某项就走 migrate，切回“不使用”就回到更新。
-                myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
-                // 题材有变化：包括切回“全部”，都先走 theme，由 theme 分支处理“全部”。
+                // 当前可见的“我的漫画”选项优先级最高。
+                myMangaValue.isNotEmpty() -> "migrate"
+                // 当前可见的非默认题材优先于更新项残留变化。
+                // 这能修正：界面显示“完结”，但 weekdayState 从“新作”回到默认时抢走 activeGroup。
+                themeState != 0 -> "theme"
+                // 切回“不使用我的漫画”，且没有题材限制时，回到更新入口。
+                myMangaChanged -> "update"
+                // 题材变化到第 0 项“全部”时，也走 theme，由 theme 分支转成不限制题材的更新页。
                 themeChanged -> "theme"
                 // 更新星期或排序变化，只影响更新入口。
                 updateChanged -> "update"
-                // 没有变化时，优先尊重当前筛选面板里可见的非默认入口。
-                // 这能修正“界面显示完结/题材，但 activeGroup 仍停在 update”的状态漂移。
-                myMangaValue.isNotEmpty() -> "migrate"
-                themeState != 0 -> "theme"
                 else -> prevActiveGroup
             }
 
@@ -851,7 +856,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     } else {
                         branch = "theme"
                         // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
-                        val url = "$baseUrl/$themeValue/"
+                        val url = if (page > 1) {
+                            "$baseUrl/$themeValue/?mihonPage=$page"
+                        } else {
+                            "$baseUrl/$themeValue/"
+                        }
                         request = GET(url, headersBuilder().build())
                     }
                 }
@@ -1067,37 +1076,51 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
         }
-        dlog("parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre")
-        elements.take(30).forEachIndexed { index, item ->
+        val page = response.request.url.queryParameter("mihonPage")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val dedupedElements = elements.distinctBy { item ->
             val rawHref = item.attr("href")
-            val absHref = item.absUrl("href")
-            val hrefForPath = absHref.ifEmpty { rawHref }
-            val normalized = normalizeAbsoluteUrl(hrefForPath)
-            val path = normalizeMangaPath(hrefForPath)
-            val titleNo = titleNoFromUrl(absHref) ?: titleNoFromUrl(rawHref) ?: item.attr("data-title-no")
-            val titleText = item.selectFirst(
-                "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
-                    "p.chapter-title-02, .chapter-title-01, .tit_content"
-            )?.text() ?: item.attr("title").ifEmpty { item.selectFirst("img")?.attr("alt").orEmpty() }
-            dlog(
-                "parseMangaListHtml item#$index class=${item.className()} " +
-                    "rawHref=$rawHref absHref=$absHref normalized=$normalized path=$path " +
-                    "titleNo=$titleNo title=$titleText"
-            )
+            val href = item.absUrl("href").ifEmpty { rawHref }
+            cleanMangaDetailPath(href)
         }
-        val entries = elements
+        val shouldClientPaginate = requestedGenre.isNotEmpty() && isGenrePageUrl(requestUrl)
+        val pageElements = if (shouldClientPaginate) {
+            dedupedElements.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
+        } else {
+            dedupedElements
+        }
+        val hasNextPage = shouldClientPaginate && dedupedElements.size > page * GENRE_PAGE_SIZE
+
+        dlog("parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre page=$page")
+        if (VERBOSE_LIST_LOG) {
+            pageElements.take(5).forEachIndexed { index, item ->
+                val rawHref = item.attr("href")
+                val absHref = item.absUrl("href")
+                val hrefForPath = absHref.ifEmpty { rawHref }
+                val normalized = normalizeAbsoluteUrl(hrefForPath)
+                val path = normalizeMangaPath(hrefForPath)
+                val titleNo = titleNoFromUrl(absHref) ?: titleNoFromUrl(rawHref) ?: item.attr("data-title-no")
+                val titleText = item.selectFirst(
+                    "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
+                        "p.chapter-title-02, .chapter-title-01, .tit_content"
+                )?.text() ?: item.attr("title").ifEmpty { item.selectFirst("img")?.attr("alt").orEmpty() }
+                dlog(
+                    "parseMangaListHtml item#$index class=${item.className()} " +
+                        "rawHref=$rawHref absHref=$absHref normalized=$normalized path=$path " +
+                        "titleNo=$titleNo title=$titleText"
+                )
+            }
+        }
+        val entries = pageElements
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
-        entries.take(30).forEachIndexed { index, manga ->
-            dlog("parseMangaListHtml entry#$index title=${manga.title} storedUrl=${manga.url} thumb=${manga.thumbnail_url}")
-        }
         dlog(
             "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
                 "genreIndex=$genreIndex rawGenreItems=${genreItems.size} " +
-                "selectedElements=${elements.size} entries=${entries.size}"
+                "selectedElements=${elements.size} deduped=${dedupedElements.size} " +
+                "page=$page pageSize=$GENRE_PAGE_SIZE entries=${entries.size} hasNextPage=$hasNextPage"
         )
-        return MangasPage(entries, false)
+        return MangasPage(entries, hasNextPage)
     }
 
     private fun parseSearchHtml(response: Response): MangasPage {
@@ -1382,10 +1405,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
         )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
         thumbnail_url = extractThumbnailUrl(element)
-        dlog(
-            "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
-                "titleNo=$titleNo hasNew=$hasNew title=$title"
-        )
+        if (VERBOSE_LIST_LOG) {
+            dlog(
+                "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
+                    "titleNo=$titleNo hasNew=$hasNew title=$title"
+            )
+        }
     }
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
@@ -1395,7 +1420,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         url = cleanPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
-        dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url title=$title")
+        if (VERBOSE_LIST_LOG) {
+            dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url title=$title")
+        }
     }
 
 
@@ -1504,7 +1531,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (isNew) {
             newTitleCache[titleNo] = true
             dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=true")
-        } else {
+        } else if (VERBOSE_LIST_LOG) {
             dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=false ignored")
         }
     }
@@ -1525,9 +1552,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return cached
         }
 
-        val probed = fetchNewTitleFromDailySchedule(titleNo)
-        dlog("isNewTitleDetail titleNo=$titleNo source=dailySchedule-probe value=$probed updateTag=$updateTag")
-        return probed == true
+        dlog("isNewTitleDetail titleNo=$titleNo source=dailySchedule-skip-fresh value=false updateTag=$updateTag")
+        return false
     }
 
     private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
@@ -1577,6 +1603,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     companion object {
         private const val TAG = "DongmanManhua"
+        private const val GENRE_PAGE_SIZE = 50
+        private const val VERBOSE_LIST_LOG = false
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
