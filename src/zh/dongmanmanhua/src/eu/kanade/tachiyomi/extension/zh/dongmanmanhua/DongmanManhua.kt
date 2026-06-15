@@ -732,6 +732,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val nextStartMap = mutableMapOf<String, Int>()
     private val newTitleCache = mutableMapOf<String, Boolean>()
+    private val dailyScheduleNewCache = mutableMapOf<String, Boolean>()
 
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
@@ -743,12 +744,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val weekdayValue = weekdayFilter?.getSelectedValue().orEmpty()
 
         val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
-        val sortSelection = sortFilter?.state as? Filter.Sort.Selection
-        val sortValue = if (sortSelection != null) {
-            getSortFilter().getOrNull(sortSelection.index)?.value ?: "READ_COUNT"
-        } else {
-            "READ_COUNT"
-        }
+        val sortState = sortFilter?.state ?: 0
+        val sortValue = getSortFilter().getOrNull(sortState)?.value ?: "READ_COUNT"
 
         // latestUpdatesParse() 需要知道当前更新分区。
         // 这里保存的是“更新”自己的状态；题材/我的漫画不会用它组合请求。
@@ -774,7 +771,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val prevActiveGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, "").orEmpty()
 
             val weekdayState = weekdayFilter?.state ?: 0
-            val sortState = sortSelection?.index ?: 0
 
             val migrateChanged = migrateState != prevMigrateState
             val themeChanged = themeState != prevThemeState
@@ -783,7 +779,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val activeGroup = when {
                 // “我的漫画”没有“无”选项，默认值不能自动抢入口；只在它本次真的变化时启用。
                 migrateChanged -> "migrate"
-                themeChanged -> if (themeValue.isNotEmpty()) "theme" else "update"
+                themeChanged -> "theme"
                 updateChanged -> "update"
                 prevActiveGroup.isNotEmpty() -> prevActiveGroup
                 themeValue.isNotEmpty() -> "theme"
@@ -830,8 +826,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val url = "$baseUrl/LOVE/?sortOrder=READ_COUNT"
                         request = GET(url, headersBuilder().build())
                     } else {
-                        branch = "update-fallback"
-                        request = GET(updateUrl, headersBuilder().build())
+                        branch = "theme-all"
+                        // “题材=全部”走站点首页；用户已验证首页同时含 /LOVE/、/BOY/ 等多个分类链接。
+                        // 这里不回落到更新，避免“全部”筛选无结果或跳错入口。
+                        val url = "$baseUrl/"
+                        request = GET(url, headersBuilder().build())
                     }
                 }
                 else -> {
@@ -903,6 +902,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
             url.contains("/dailySchedule") || url.endsWith("/new") || url.contains("/new?") -> latestUpdatesParse(response)
+            url == baseUrl || url == "$baseUrl/" || url.startsWith("$baseUrl/?") -> parseMangaListHtml(response)
             isGenrePageUrl(url) || url.contains("/list") -> parseMangaListHtml(response)
             else -> parseSearchHtml(response)
         }
@@ -947,11 +947,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun parseDailyScheduleHtml(response: Response): MangasPage {
         val document = response.asJsoup()
         val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty().ifEmpty { currentWeekdayCode() }
-        val entries = document
-            .select("a.updatePage_lst_item[data-week=$weekday]")
+        val selector = "a.updatePage_lst_item[data-week=$weekday]"
+        val rawElements = document.select(selector)
+        val entries = rawElements
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
+        dlog(
+            "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday " +
+                "selector=$selector raw=${rawElements.size} entries=${entries.size}"
+        )
         return MangasPage(entries, false)
     }
 
@@ -1374,87 +1379,60 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun cacheNewTitle(titleNo: String?, isNew: Boolean) {
         if (titleNo.isNullOrBlank()) return
-        if (isNew || !newTitleCache.containsKey(titleNo)) {
-            newTitleCache[titleNo] = isNew
-            dlog("cacheNewTitle titleNo=$titleNo isNew=$isNew")
+        if (isNew) {
+            newTitleCache[titleNo] = true
+            dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=true")
+        } else {
+            dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=false ignored")
         }
     }
 
     private fun isNewTitleDetail(url: String, updateTag: String): Boolean {
-        val titleNo = titleNoFromUrl(url) ?: return false
-
-        // 先认列表/JSON 已经为“当前 titleNo”确认过的 newTitle / 当前卡片 NEW 图标。
-        if (newTitleCache[titleNo] == true) return true
-
-        // D 方案：详情页自身没有 newTitle 时，按 titleNo 去 /dailySchedule 这个 HTML 总表里找当前卡片。
-        // 抓包确认：2896 反派的温柔在 /dailySchedule 的 li#title_li_2896 下带 ico_new_cn。
-        fetchNewTitleFromDailySchedule(titleNo)?.let { return it }
-
-        // B 方案兜底：只根据详情页解析出的“每周X更新”去查对应 weekday 的 JSON。
-        // 不扫整个详情页 html，不认 source/pageModel，也不因为来自 /new 就全标。
-        val weekday = weekdayCodeFromUpdateTag(updateTag) ?: return false
-        return fetchNewTitleFromWeekday(titleNo, weekday) == true
-    }
-
-    private fun weekdayCodeFromUpdateTag(updateTag: String): String? {
-        return when {
-            updateTag.contains("周一") -> "MONDAY"
-            updateTag.contains("周二") -> "TUESDAY"
-            updateTag.contains("周三") -> "WEDNESDAY"
-            updateTag.contains("周四") -> "THURSDAY"
-            updateTag.contains("周五") -> "FRIDAY"
-            updateTag.contains("周六") -> "SATURDAY"
-            updateTag.contains("周日") -> "SUNDAY"
-            else -> null
+        val titleNo = titleNoFromUrl(url) ?: run {
+            dlog("isNewTitleDetail noTitleNo url=$url")
+            return false
         }
+
+        if (newTitleCache[titleNo] == true) {
+            dlog("isNewTitleDetail titleNo=$titleNo source=cache value=true")
+            return true
+        }
+
+        dailyScheduleNewCache[titleNo]?.let { cached ->
+            dlog("isNewTitleDetail titleNo=$titleNo source=dailySchedule-cache value=$cached")
+            return cached
+        }
+
+        val probed = fetchNewTitleFromDailySchedule(titleNo)
+        dlog("isNewTitleDetail titleNo=$titleNo source=dailySchedule-probe value=$probed updateTag=$updateTag")
+        return probed == true
     }
 
     private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
         return runCatching {
             val url = "$baseUrl/dailySchedule"
+            val startedAt = System.currentTimeMillis()
+            dlog("fetchNewTitleFromDailySchedule start titleNo=$titleNo url=$url")
             val document = client.newCall(GET(url, headersBuilder().build())).execute().asJsoup()
             val element = document.selectFirst("li#title_li_$titleNo, li[data-title-no=$titleNo]")
                 ?: run {
-                    dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo notFound")
+                    val elapsed = System.currentTimeMillis() - startedAt
+                    dailyScheduleNewCache[titleNo] = false
+                    dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false isNew=false elapsed=${elapsed}ms")
                     return@runCatching null
                 }
 
             val isNew = hasNewBadge(element)
-            cacheNewTitle(titleNo, isNew)
-            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo isNew=$isNew")
+            dailyScheduleNewCache[titleNo] = isNew
+            if (isNew) cacheNewTitle(titleNo, true)
+            val elapsed = System.currentTimeMillis() - startedAt
+            dlog(
+                "fetchNewTitleFromDailySchedule titleNo=$titleNo found=true " +
+                    "isNew=$isNew elapsed=${elapsed}ms href=${element.selectFirst("a")?.attr("href").orEmpty()}"
+            )
             isNew
         }.getOrElse { e ->
             wlog("fetchNewTitleFromDailySchedule failed titleNo=$titleNo", e)
-            null
-        }
-    }
-
-    private fun fetchNewTitleFromWeekday(titleNo: String, weekday: String): Boolean? {
-        return runCatching {
-            val url = "$baseUrl/getTodaysWebtoon?weekday=$weekday"
-            val response = client.newCall(GET(url, ajaxHeaders("$baseUrl/dailySchedule"))).execute()
-            val body = response.body.string().trim()
-            val items = if (body.startsWith("[")) {
-                org.json.JSONArray(body)
-            } else {
-                val json = JSONObject(body)
-                val data = json.optJSONObject("data") ?: json
-                data.optJSONArray("titles") ?: data.optJSONArray("list") ?: data.optJSONArray("items")
-            } ?: return@runCatching null
-
-            for (i in 0 until items.length()) {
-                val item = items.getJSONObject(i)
-                if (item.optString("titleNo") == titleNo || item.optInt("titleNo", -1).toString() == titleNo) {
-                    val isNew = item.optBoolean("newTitle", false)
-                    cacheNewTitle(titleNo, isNew)
-                    dlog("fetchNewTitleFromWeekday titleNo=$titleNo weekday=$weekday newTitle=$isNew")
-                    return@runCatching isNew
-                }
-            }
-            dlog("fetchNewTitleFromWeekday titleNo=$titleNo weekday=$weekday notFound")
-            null
-        }.getOrElse { e ->
-            wlog("fetchNewTitleFromWeekday failed titleNo=$titleNo weekday=$weekday", e)
             null
         }
     }
