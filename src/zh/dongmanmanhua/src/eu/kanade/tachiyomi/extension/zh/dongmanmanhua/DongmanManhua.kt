@@ -893,26 +893,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 }
                 "theme" -> {
-                    if (themeValue.isEmpty() || themeValue == "ALL") {
-                        branch = "theme-all-as-update"
-                        // 网站没有确认过稳定的“题材全部”统一接口。
-                        // 选“全部”只表示不限制题材，不再用 /LOVE/ 拼首页/推荐链接冒充全部。
-                        request = GET(updateUrl, headersBuilder().build())
-                    } else {
-                        val cachedGenrePage = getValidGenrePageCache(themeValue)
-                        val useCachedGenrePage = cachedGenrePage != null
-                        branch = if (useCachedGenrePage) "theme-cache" else "theme"
-                        // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
-                        // 有缓存时走本地拦截地址，不再每页重新下载 /TERMINATION/ 这类大 HTML。
-                        val url = if (useCachedGenrePage) {
-                            "$baseUrl$LOCAL_GENRE_CACHE_PATH?genre=$themeValue&mihonPage=$page"
-                        } else if (page > 1) {
-                            "$baseUrl/$themeValue/?mihonPage=$page"
-                        } else {
-                            "$baseUrl/$themeValue/"
-                        }
-                        request = GET(url, headersBuilder().build())
+                    val genreCacheKey = if (themeValue == "ALL") "ALL" else themeValue
+                    val cachedGenrePage = getValidGenrePageCache(genreCacheKey)
+                    val useCachedGenrePage = cachedGenrePage != null
+                    branch = when {
+                        themeValue == "ALL" && useCachedGenrePage -> "theme-all-cache"
+                        themeValue == "ALL" -> "theme-all"
+                        useCachedGenrePage -> "theme-cache"
+                        else -> "theme"
                     }
+                    // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
+                    // “全部”不再回落到更新/新作；使用题材页自身携带的全集合数据，并走题材缓存。
+                    val url = when {
+                        useCachedGenrePage -> "$baseUrl$LOCAL_GENRE_CACHE_PATH?genre=$genreCacheKey&mihonPage=$page"
+                        themeValue == "ALL" -> "$baseUrl/${themeAllCarrierGenre()}/?themeAll=1&mihonPage=$page"
+                        page > 1 -> "$baseUrl/$themeValue/?mihonPage=$page"
+                        else -> "$baseUrl/$themeValue/"
+                    }
+                    request = GET(url, headersBuilder().build())
                 }
                 else -> {
                     val updateKey = updateCacheKey(weekdayValue, sortValue)
@@ -1129,17 +1127,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun parseMangaListHtml(response: Response): MangasPage {
         val document = response.asJsoup()
         val requestUrl = response.request.url.toString()
-        val requestedGenre = preferences.getString(PREF_FILTER_THEME, "").orEmpty()
-            .ifEmpty { genreCodeFromUrl(requestUrl).orEmpty() }
-            .let { if (it == "ALL") "" else it }
+        val prefTheme = preferences.getString(PREF_FILTER_THEME, "").orEmpty()
+        val isThemeAll = prefTheme == "ALL" || response.request.url.queryParameter("themeAll") == "1"
+        val requestedGenre = if (isThemeAll) {
+            "ALL"
+        } else {
+            prefTheme.ifEmpty { genreCodeFromUrl(requestUrl).orEmpty() }
+        }
+        val filterGenre = if (requestedGenre == "ALL") "" else requestedGenre
         val genreItems = document.select("a.genrePageContentItem")
-        val genreIndex = if (requestedGenre.isNotEmpty()) {
+        val genreIndex = if (filterGenre.isNotEmpty()) {
             document.select("#genreList li").firstOrNull { li ->
-                li.attr("data-genre") == requestedGenre || li.attr("data-genre-seo") == requestedGenre
+                li.attr("data-genre") == filterGenre || li.attr("data-genre-seo") == filterGenre
             }?.selectFirst("a")?.attr("data-index")?.toIntOrNull()
         } else {
             null
         }
+
+        if (genreItems.isNotEmpty() && isGenrePageUrl(requestUrl)) {
+            putGenrePageCachesFromDocument(document, includeAll = isThemeAll)
+        }
+
         val elements = if (genreItems.isNotEmpty()) {
             val sectionItems = genreIndex
                 ?.let { document.select("div._genreFlick div.flick-ct").getOrNull(it) }
@@ -1148,9 +1156,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             when {
                 sectionItems.isNotEmpty() -> sectionItems
-                requestedGenre.isEmpty() -> genreItems
+                filterGenre.isEmpty() -> genreItems
                 else -> genreItems.filter { item ->
-                    normalizeAbsoluteUrl(item.attr("href")).contains("/$requestedGenre/")
+                    normalizeAbsoluteUrl(item.attr("href")).contains("/$filterGenre/")
                 }
             }
         } else {
@@ -1158,11 +1166,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "li[id^=title_li_] > a, ul.weekly_lst li a, ul.lst_type2 li a, " +
                     "a[href*=list?title_no], a[href*=episodeList?titleNo], .daily_card li a"
             )
-            if (requestedGenre.isEmpty()) {
+            if (filterGenre.isEmpty()) {
                 fallback
             } else {
                 fallback.filter { item ->
-                    normalizeAbsoluteUrl(item.attr("href")).contains("/$requestedGenre/")
+                    normalizeAbsoluteUrl(item.attr("href")).contains("/$filterGenre/")
                 }
             }
         }
@@ -1173,6 +1181,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             cleanMangaDetailPath(href)
         }
         val shouldClientPaginate = requestedGenre.isNotEmpty() && isGenrePageUrl(requestUrl)
+        val cacheKey = if (requestedGenre == "ALL") "ALL" else filterGenre
 
         dlog("parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre page=$page")
         if (VERBOSE_LIST_LOG) {
@@ -1199,7 +1208,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cachedItems = dedupedElements
                 .map(::cachedMangaItemFromElement)
                 .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
-            putGenrePageCache(requestedGenre, cachedItems)
+                .distinctBy { it.url }
+            putGenrePageCache(cacheKey, cachedItems)
             totalSize = cachedItems.size
             val pageItems = cachedItems.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
             entries = pageItems.map(::mangaFromCachedItem)
@@ -1217,7 +1227,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
                 "genreIndex=$genreIndex rawGenreItems=${genreItems.size} " +
                 "selectedElements=${elements.size} deduped=${dedupedElements.size} " +
-                "cacheWrite=$shouldClientPaginate total=$totalSize " +
+                "cacheWrite=$shouldClientPaginate cacheKey=$cacheKey total=$totalSize " +
                 "page=$page pageSize=$GENRE_PAGE_SIZE entries=${entries.size} hasNextPage=$hasNextPage"
         )
         return MangasPage(entries, hasNextPage)
@@ -1588,8 +1598,55 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (genre.isBlank() || items.isEmpty()) return
         synchronized(genrePageCache) {
             genrePageCache[genre] = GenrePageCache(genre, System.currentTimeMillis(), items)
+            while (genrePageCache.size > GENRE_PAGE_CACHE_MAX_ENTRIES) {
+                val firstKey = genrePageCache.keys.firstOrNull() ?: break
+                genrePageCache.remove(firstKey)
+            }
         }
         dlog("putGenrePageCache genre=$genre total=${items.size}")
+    }
+
+    private fun putGenrePageCachesFromDocument(document: org.jsoup.nodes.Document, includeAll: Boolean) {
+        val sections = document.select("div._genreFlick div.flick-ct")
+        if (sections.isEmpty()) return
+
+        var cachedGenres = 0
+        var cachedItems = 0
+        getThemeFilter().forEach { tag ->
+            val genre = tag.value
+            if (genre.isBlank() || genre == "ALL" || getValidGenrePageCache(genre) != null) return@forEach
+            val index = document.select("#genreList li").firstOrNull { li ->
+                li.attr("data-genre") == genre || li.attr("data-genre-seo") == genre
+            }?.selectFirst("a")?.attr("data-index")?.toIntOrNull() ?: return@forEach
+            val items = sections.getOrNull(index)
+                ?.select("a.genrePageContentItem")
+                .orEmpty()
+                .map(::cachedMangaItemFromElement)
+                .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
+                .distinctBy { it.url }
+            if (items.isNotEmpty()) {
+                putGenrePageCache(genre, items)
+                cachedGenres += 1
+                cachedItems += items.size
+            }
+        }
+
+        if (includeAll && getValidGenrePageCache("ALL") == null) {
+            val allItems = document.select("a.genrePageContentItem")
+                .map(::cachedMangaItemFromElement)
+                .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
+                .distinctBy { it.url }
+            if (allItems.isNotEmpty()) {
+                putGenrePageCache("ALL", allItems)
+                cachedItems += allItems.size
+            }
+        }
+
+        dlog("putGenrePageCachesFromDocument includeAll=$includeAll cachedGenres=$cachedGenres cachedItems=$cachedItems")
+    }
+
+    private fun themeAllCarrierGenre(): String {
+        return getThemeFilter().firstOrNull { it.value.isNotBlank() && it.value != "ALL" }?.value ?: "LOVE"
     }
 
     private fun cachedMangaItemFromElement(element: Element): CachedMangaItem {
@@ -1844,6 +1901,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_SIZE = 50
         private const val UPDATE_PAGE_SIZE = 50
         private const val GENRE_PAGE_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
