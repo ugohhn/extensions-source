@@ -27,8 +27,11 @@ import keiyoushi.utils.tryParse
 import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -651,6 +654,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 同时手动捕获服务器返回的 NEO_CHK，并合并进独立存储。
     override val client = network.client.newBuilder()
         .cookieJar(CookieJar.NO_COOKIES)
+        .addInterceptor { chain ->
+            val request = chain.request()
+            if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH) {
+                Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
+                    .body("".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
+                    .build()
+            } else {
+                chain.proceed(request)
+            }
+        }
         .addNetworkInterceptor { chain ->
             val response = chain.proceed(chain.request())
             mergeSetCookieFromResponse(response)
@@ -714,8 +732,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 // 只认当前卡片自身的 NEW 图标；JSON 接口另走 newTitle 字段。
                 val isNew = hasNewBadge(item)
                 cacheNewTitle(titleNo, isNew)
-                if (VERBOSE_LIST_LOG) {
-                    dlog("latestUpdatesParse NEW item titleNo=$titleNo isNewBadge=$isNew href=$href cleanPath=$cleanPath")
+                if (VERBOSE_LIST_LOG || entriesNewProbeShouldLog()) {
+                    dlog(
+                        "latestUpdatesParse NEW probe titleNo=$titleNo isNewBadge=$isNew " +
+                            "hasIcoNewCn=${item.selectFirst(".ico_new_cn") != null} " +
+                            "hasClassIcoNew=${item.selectFirst("[class*=ico_new]") != null} " +
+                            "hasClassIconNew=${item.selectFirst("[class*=icon_new]") != null} " +
+                            "hasImgIconNew=${item.selectFirst("img[src*=icon_new], img[src*=ico_new]") != null} " +
+                            "class=${item.className()} href=$href cleanPath=$cleanPath"
+                    )
                 }
                 SManga.create().apply {
                     url = cleanPath
@@ -740,6 +765,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var dailyScheduleDocCache: org.jsoup.nodes.Document? = null
     private var dailyScheduleDocCacheTime: Long = 0L
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
+
+    private data class CachedMangaItem(
+        val url: String,
+        val title: String,
+        val thumbnailUrl: String,
+        val titleNo: String?,
+        val hasNew: Boolean,
+    )
+
+    private data class GenrePageCache(
+        val genre: String,
+        val createdAt: Long,
+        val items: List<CachedMangaItem>,
+    )
+
+    private val genrePageCache = mutableMapOf<String, GenrePageCache>()
 
     private data class FilterSnapshot(
         val weekdayState: Int,
@@ -807,17 +848,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     themeState != 0 -> "theme"
                     else -> "update"
                 }
-                // 当前可见的“我的漫画”选项优先级最高。
-                myMangaValue.isNotEmpty() -> "migrate"
-                // 当前可见的非默认题材优先于更新项残留变化。
-                // 这能修正：界面显示“完结”，但 weekdayState 从“新作”回到默认时抢走 activeGroup。
-                themeState != 0 -> "theme"
-                // 切回“不使用我的漫画”，且没有题材限制时，回到更新入口。
-                myMangaChanged -> "update"
-                // 题材变化到第 0 项“全部”时，也走 theme，由 theme 分支转成不限制题材的更新页。
+                // 三组筛选彻底按“本次谁变了谁生效”分开，避免残留 state 互相抢入口。
+                myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
                 themeChanged -> "theme"
-                // 更新星期或排序变化，只影响更新入口。
                 updateChanged -> "update"
+                // 没有任何 changed 时，再沿用上次成功入口。
+                // 仅保留一个保护：旧版本可能把 activeGroup 错存成 update，但界面显示非默认题材且更新项为默认，
+                // 这种情况下按当前可见题材恢复。不能压过上面的 updateChanged。
+                prevActiveGroup == "update" &&
+                    themeState != 0 &&
+                    weekdayValue.isEmpty() &&
+                    myMangaValue.isEmpty() -> "theme"
                 else -> prevActiveGroup
             }
 
@@ -854,9 +895,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         // 选“全部”只表示不限制题材，不再用 /LOVE/ 拼首页/推荐链接冒充全部。
                         request = GET(updateUrl, headersBuilder().build())
                     } else {
-                        branch = "theme"
+                        val cachedGenrePage = getValidGenrePageCache(themeValue)
+                        val useCachedGenrePage = cachedGenrePage != null
+                        branch = if (useCachedGenrePage) "theme-cache" else "theme"
                         // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
-                        val url = if (page > 1) {
+                        // 有缓存时走本地拦截地址，不再每页重新下载 /TERMINATION/ 这类大 HTML。
+                        val url = if (useCachedGenrePage) {
+                            "$baseUrl$LOCAL_GENRE_CACHE_PATH?genre=$themeValue&mihonPage=$page"
+                        } else if (page > 1) {
                             "$baseUrl/$themeValue/?mihonPage=$page"
                         } else {
                             "$baseUrl/$themeValue/"
@@ -932,6 +978,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val url = response.request.url.toString()
         dlog("searchMangaParse url=$url contentType=${response.header("Content-Type").orEmpty()}")
         return when {
+            response.request.url.encodedPath == LOCAL_GENRE_CACHE_PATH -> parseCachedGenrePage(response)
             url.contains("/recent/more") -> parseRecentMangaPage(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
@@ -1083,26 +1130,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             cleanMangaDetailPath(href)
         }
         val shouldClientPaginate = requestedGenre.isNotEmpty() && isGenrePageUrl(requestUrl)
-        val pageElements = if (shouldClientPaginate) {
-            dedupedElements.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
-        } else {
-            dedupedElements
-        }
-        val hasNextPage = shouldClientPaginate && dedupedElements.size > page * GENRE_PAGE_SIZE
 
         dlog("parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre page=$page")
         if (VERBOSE_LIST_LOG) {
-            pageElements.take(5).forEachIndexed { index, item ->
+            dedupedElements.take(5).forEachIndexed { index, item ->
                 val rawHref = item.attr("href")
                 val absHref = item.absUrl("href")
                 val hrefForPath = absHref.ifEmpty { rawHref }
                 val normalized = normalizeAbsoluteUrl(hrefForPath)
                 val path = normalizeMangaPath(hrefForPath)
                 val titleNo = titleNoFromUrl(absHref) ?: titleNoFromUrl(rawHref) ?: item.attr("data-title-no")
-                val titleText = item.selectFirst(
-                    "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
-                        "p.chapter-title-02, .chapter-title-01, .tit_content"
-                )?.text() ?: item.attr("title").ifEmpty { item.selectFirst("img")?.attr("alt").orEmpty() }
+                val titleText = mangaTitleFromElement(item)
                 dlog(
                     "parseMangaListHtml item#$index class=${item.className()} " +
                         "rawHref=$rawHref absHref=$absHref normalized=$normalized path=$path " +
@@ -1110,15 +1148,52 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 )
             }
         }
-        val entries = pageElements
-            .map(::mangaFromElement)
-            .distinctBy { it.url }
-            .filter { it.title.isNotEmpty() }
+
+        val entries: List<SManga>
+        val totalSize: Int
+        val hasNextPage: Boolean
+        if (shouldClientPaginate) {
+            val cachedItems = dedupedElements
+                .map(::cachedMangaItemFromElement)
+                .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
+            putGenrePageCache(requestedGenre, cachedItems)
+            totalSize = cachedItems.size
+            val pageItems = cachedItems.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
+            entries = pageItems.map(::mangaFromCachedItem)
+            hasNextPage = cachedItems.size > page * GENRE_PAGE_SIZE
+        } else {
+            entries = dedupedElements
+                .map(::mangaFromElement)
+                .distinctBy { it.url }
+                .filter { it.title.isNotEmpty() }
+            totalSize = dedupedElements.size
+            hasNextPage = false
+        }
+
         dlog(
             "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
                 "genreIndex=$genreIndex rawGenreItems=${genreItems.size} " +
                 "selectedElements=${elements.size} deduped=${dedupedElements.size} " +
+                "cacheWrite=$shouldClientPaginate total=$totalSize " +
                 "page=$page pageSize=$GENRE_PAGE_SIZE entries=${entries.size} hasNextPage=$hasNextPage"
+        )
+        return MangasPage(entries, hasNextPage)
+    }
+
+    private fun parseCachedGenrePage(response: Response): MangasPage {
+        val genre = response.request.url.queryParameter("genre").orEmpty()
+        val page = response.request.url.queryParameter("mihonPage")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val cache = getValidGenrePageCache(genre)
+        if (cache == null) {
+            dlog("parseCachedGenrePage genre=$genre page=$page cacheHit=false")
+            return MangasPage(emptyList(), false)
+        }
+        val pageItems = cache.items.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
+        val entries = pageItems.map(::mangaFromCachedItem)
+        val hasNextPage = cache.items.size > page * GENRE_PAGE_SIZE
+        dlog(
+            "parseCachedGenrePage genre=$genre page=$page cacheHit=true " +
+                "total=${cache.items.size} entries=${entries.size} hasNextPage=$hasNextPage"
         )
         return MangasPage(entries, hasNextPage)
     }
@@ -1392,6 +1467,65 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 元素解析（依赖 HttpSource 的 setUrlWithoutDomain）
     // ══════════════════════════════════════════════════════════════════════
 
+    private fun getValidGenrePageCache(genre: String): GenrePageCache? {
+        if (genre.isBlank()) return null
+        val now = System.currentTimeMillis()
+        return synchronized(genrePageCache) {
+            val cache = genrePageCache[genre] ?: return@synchronized null
+            if (now - cache.createdAt <= GENRE_PAGE_CACHE_TTL_MS) {
+                cache
+            } else {
+                genrePageCache.remove(genre)
+                null
+            }
+        }
+    }
+
+    private fun putGenrePageCache(genre: String, items: List<CachedMangaItem>) {
+        if (genre.isBlank() || items.isEmpty()) return
+        synchronized(genrePageCache) {
+            genrePageCache[genre] = GenrePageCache(genre, System.currentTimeMillis(), items)
+        }
+        dlog("putGenrePageCache genre=$genre total=${items.size}")
+    }
+
+    private fun cachedMangaItemFromElement(element: Element): CachedMangaItem {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val hasNew = hasNewBadge(element)
+        cacheNewTitle(titleNo, hasNew)
+        return CachedMangaItem(
+            url = cleanPath,
+            title = mangaTitleFromElement(element),
+            thumbnailUrl = extractThumbnailUrl(element),
+            titleNo = titleNo,
+            hasNew = hasNew,
+        )
+    }
+
+    private fun mangaFromCachedItem(item: CachedMangaItem): SManga = SManga.create().apply {
+        url = item.url
+        title = item.title
+        thumbnail_url = item.thumbnailUrl
+    }
+
+    private fun mangaTitleFromElement(element: Element): String {
+        return element.selectFirst(
+            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
+                "p.chapter-title-02, .chapter-title-01, .tit_content"
+        )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
+    }
+
+    private var newProbeLogCount = 0
+
+    private fun entriesNewProbeShouldLog(): Boolean {
+        if (newProbeLogCount >= NEW_PROBE_LOG_LIMIT) return false
+        newProbeLogCount += 1
+        return true
+    }
+
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
@@ -1400,10 +1534,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
         url = cleanPath
-        title = element.selectFirst(
-            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
-                "p.chapter-title-02, .chapter-title-01, .tit_content"
-        )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
+        title = mangaTitleFromElement(element)
         thumbnail_url = extractThumbnailUrl(element)
         if (VERBOSE_LIST_LOG) {
             dlog(
@@ -1491,7 +1622,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun hasNewBadge(element: Element): Boolean {
         // 只认卡片自己的 class / 图标，不因为页面文字包含 NEW 就误判。
-        return element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null
+        return element.selectFirst(
+            ".ico_new_cn, .icon_new, [class*=ico_new], [class*=icon_new], img[src*=icon_new], img[src*=ico_new]"
+        ) != null
     }
 
     private fun genreCodeFromUrl(url: String): String? {
@@ -1604,6 +1737,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     companion object {
         private const val TAG = "DongmanManhua"
         private const val GENRE_PAGE_SIZE = 50
+        private const val GENRE_PAGE_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
+        private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
 
         internal const val PREF_UA = "pref_user_agent"
