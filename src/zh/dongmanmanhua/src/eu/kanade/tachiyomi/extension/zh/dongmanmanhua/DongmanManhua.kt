@@ -745,10 +745,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val activeGroup: String,
     )
 
-    private var _lastFilterSnapshot: FilterSnapshot? = null
+    private var cachedLastFilterSnapshot: FilterSnapshot? = null
 
     private fun loadOrGetLastSnapshot(): FilterSnapshot? {
-        _lastFilterSnapshot?.let { return it }
+        cachedLastFilterSnapshot?.let { return it }
         val activeGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, null) ?: return null
         return FilterSnapshot(
             weekdayState = preferences.getInt(PREF_FILTER_WEEKDAY_STATE, 0),
@@ -756,7 +756,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             themeState = preferences.getInt(PREF_FILTER_THEME_STATE, 0),
             myMangaState = preferences.getInt(PREF_FILTER_MY_MANGA_STATE, 0),
             activeGroup = activeGroup,
-        ).also { _lastFilterSnapshot = it }
+        ).also { cachedLastFilterSnapshot = it }
     }
 
     private fun dlog(message: String) = Log.d(TAG, message)
@@ -855,7 +855,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
 
-            _lastFilterSnapshot = FilterSnapshot(
+            cachedLastFilterSnapshot = FilterSnapshot(
                 weekdayState = weekdayState,
                 sortState = sortState,
                 themeState = themeState,
