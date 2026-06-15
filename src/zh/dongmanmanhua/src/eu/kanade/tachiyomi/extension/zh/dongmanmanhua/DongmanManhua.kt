@@ -811,6 +811,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var cachedLastFilterSnapshot: FilterSnapshot? = null
 
     private fun loadOrGetLastSnapshot(): FilterSnapshot? {
+        if (preferences.getInt(PREF_FILTER_SCHEMA_VERSION, 0) != FILTER_SCHEMA_VERSION) {
+            cachedLastFilterSnapshot = null
+            preferences.edit()
+                .putInt(PREF_FILTER_SCHEMA_VERSION, FILTER_SCHEMA_VERSION)
+                .remove(PREF_FILTER_WEEKDAY)
+                .remove(PREF_FILTER_SORT)
+                .remove(PREF_FILTER_THEME)
+                .remove(PREF_FILTER_ACTIVE_GROUP)
+                .remove(PREF_FILTER_WEEKDAY_STATE)
+                .remove(PREF_FILTER_SORT_STATE)
+                .remove(PREF_FILTER_THEME_STATE)
+                .remove(PREF_FILTER_MY_MANGA_STATE)
+                .apply()
+            dlog("filterSnapshotReset schemaVersion=$FILTER_SCHEMA_VERSION")
+            return null
+        }
+
         cachedLastFilterSnapshot?.let { return it }
         val activeGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, null) ?: return null
         return FilterSnapshot(
@@ -840,6 +857,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val themeState = themeFilter?.state ?: 0
         val themeTag = getThemeFilter().getOrNull(themeState)
         val themeValue = themeTag?.value.orEmpty()
+        val themeActive = themeValue.isNotEmpty()
 
         val myMangaFilter = filters.firstOrNull { it is MyMangaFilter } as? MyMangaFilter
         val myMangaState = myMangaFilter?.state ?: 0
@@ -859,38 +877,43 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val themeChanged = previous != null && themeState != previous.themeState
             val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
+            val updateChangedToExplicit = updateChanged && weekdayValue.isNotEmpty()
+            val updateChangedToDefault = updateChanged && weekdayValue.isEmpty()
             val visibleThemeShouldStay = previous != null &&
                 prevActiveGroup == "theme" &&
-                themeState != 0 &&
+                themeActive &&
                 themeState == previous.themeState &&
                 myMangaValue.isEmpty() &&
                 !themeChanged &&
                 !myMangaChanged &&
-                updateChanged &&
-                weekdayValue.isEmpty()
+                updateChangedToDefault
 
             val activeGroup = when {
-                // 从未保存过筛选快照时，按当前可见的非默认筛选决定入口。
+                // 分页请求必须沿用上一页入口，避免残留 state 在 page>1 时抢路由。
+                previous != null && page > 1 -> prevActiveGroup
+                // 从未保存过筛选快照时，按当前有效筛选决定入口。
+                // themeState=0 是“不使用题材筛选”，不再代表“全部题材”。
                 previous == null -> when {
                     myMangaValue.isNotEmpty() -> "migrate"
-                    themeState != 0 -> "theme"
+                    themeActive -> "theme"
                     else -> "update"
                 }
-                // 我的漫画和题材发生真实变化时，仍然直接按当前变化入口走。
-                myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
-                themeChanged -> "theme"
-                // Mihon 会保留其它筛选控件的旧 state。用户停留在题材入口时，weekday 可能从“新作”回到默认，
-                // 这种“回默认空值”的 updateChanged 不是用户明确要切更新页，不能抢走当前可见题材。
-                // 但 MONDAY/TUESDAY/NEW/COMPLETE 这类非空更新项必须允许抢回 update 入口。
+                // 我的漫画发生变化时优先处理；取消我的漫画后，如果题材仍有效则回到题材，否则回到更新。
+                myMangaChanged -> when {
+                    myMangaValue.isNotEmpty() -> "migrate"
+                    themeActive -> "theme"
+                    else -> "update"
+                }
+                // 题材发生变化时：state=0 只是“不使用题材筛选”，不进入题材分支；state>=1 才进入题材分支。
+                themeChanged -> if (themeActive) "theme" else "update"
+                // 明确更新项（周几/新作/完结）发生变化时，更新入口必须抢回路由。
+                updateChangedToExplicit -> "update"
+                // 只回到“今天/默认空值”的更新变化，通常是 Mihon 残留 state 回跳，不能抢走当前题材。
                 visibleThemeShouldStay -> "theme"
-                // 否则更新项发生变化才进入更新入口。
+                // 没有任何 changed 时，沿用上次成功入口。
+                // 竞争控件的 state 会在下面按 activeGroup 归零保存，避免下次同项点击无法产生变化。
+                prevActiveGroup == "theme" && !themeActive -> "update"
                 updateChanged -> "update"
-                // 没有任何 changed 时，再沿用上次成功入口。
-                // 仅保留一个保护：旧版本可能把 activeGroup 错存成 update，但界面显示非默认题材且更新项为默认。
-                prevActiveGroup == "update" &&
-                    themeState != 0 &&
-                    weekdayValue.isEmpty() &&
-                    myMangaValue.isEmpty() -> "theme"
                 else -> prevActiveGroup
             }
 
@@ -961,29 +984,59 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
 
+            // 保存快照时清掉其它入口的残留 state。
+            // 这不是新增入口，而是让“题材/更新/我的漫画”真正互斥：
+            // 当前在题材时，下次点击同一个更新项也能产生 updateChanged；当前在更新时，下次点击同一个题材也能产生 themeChanged。
+            val savedWeekdayState = if (activeGroup == "update") weekdayState else 0
+            val savedSortState = if (activeGroup == "update") sortState else 0
+            val savedThemeState = if (activeGroup == "theme") themeState else 0
+            val savedMyMangaState = if (activeGroup == "migrate") myMangaState else 0
+            val savedWeekdayValue = if (activeGroup == "update") weekdayValue else ""
+            val savedSortValue = if (activeGroup == "update") sortValue else "READ_COUNT"
+            val savedThemeValue = if (activeGroup == "theme") themeValue else ""
+
+            when (activeGroup) {
+                "theme" -> {
+                    weekdayFilter?.state = 0
+                    sortFilter?.state = 0
+                    myMangaFilter?.state = 0
+                }
+                "update" -> {
+                    themeFilter?.state = 0
+                    myMangaFilter?.state = 0
+                }
+                "migrate" -> {
+                    weekdayFilter?.state = 0
+                    sortFilter?.state = 0
+                    themeFilter?.state = 0
+                }
+            }
+
             cachedLastFilterSnapshot = FilterSnapshot(
-                weekdayState = weekdayState,
-                sortState = sortState,
-                themeState = themeState,
-                myMangaState = myMangaState,
+                weekdayState = savedWeekdayState,
+                sortState = savedSortState,
+                themeState = savedThemeState,
+                myMangaState = savedMyMangaState,
                 activeGroup = activeGroup,
             )
 
             preferences.edit()
-                .putString(PREF_FILTER_WEEKDAY, weekdayValue)
-                .putString(PREF_FILTER_SORT, sortValue)
-                .putString(PREF_FILTER_THEME, if (activeGroup == "theme") themeValue else "")
+                .putString(PREF_FILTER_WEEKDAY, savedWeekdayValue)
+                .putString(PREF_FILTER_SORT, savedSortValue)
+                .putString(PREF_FILTER_THEME, savedThemeValue)
                 .putString(PREF_FILTER_ACTIVE_GROUP, activeGroup)
-                .putInt(PREF_FILTER_WEEKDAY_STATE, weekdayState)
-                .putInt(PREF_FILTER_SORT_STATE, sortState)
-                .putInt(PREF_FILTER_THEME_STATE, themeState)
-                .putInt(PREF_FILTER_MY_MANGA_STATE, myMangaState)
+                .putInt(PREF_FILTER_SCHEMA_VERSION, FILTER_SCHEMA_VERSION)
+                .putInt(PREF_FILTER_WEEKDAY_STATE, savedWeekdayState)
+                .putInt(PREF_FILTER_SORT_STATE, savedSortState)
+                .putInt(PREF_FILTER_THEME_STATE, savedThemeState)
+                .putInt(PREF_FILTER_MY_MANGA_STATE, savedMyMangaState)
                 .apply()
 
             dlog(
                 "searchMangaRequest filter branch=$branch activeGroup=$activeGroup page=$page " +
                     "prevActiveGroup=$prevActiveGroup changed(update=$updateChanged, theme=$themeChanged, myManga=$myMangaChanged) " +
-                    "visibleThemeShouldStay=$visibleThemeShouldStay " +
+                    "visibleThemeShouldStay=$visibleThemeShouldStay themeActive=$themeActive " +
+                    "savedStates(w=$savedWeekdayState,s=$savedSortState,t=$savedThemeState,m=$savedMyMangaState) " +
                     "weekdayState=$weekdayState/${previous?.weekdayState ?: -1} weekday=$weekdayValue sort=$sortValue " +
                     "themeState=$themeState/${previous?.themeState ?: -1} theme=${themeTag?.name.orEmpty()}/$themeValue " +
                     "myMangaState=$myMangaState/${previous?.myMangaState ?: -1} myManga=$myMangaName/$myMangaValue " +
@@ -1683,7 +1736,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (items.isNotEmpty()) result += items
             }
         }
-        return result.distinctBy { it.url }
+        return result
     }
 
     private fun themeAllCarrierGenre(): String {
@@ -1981,6 +2034,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_FILTER_SORT_STATE = "pref_filter_sort_state"
         internal const val PREF_FILTER_THEME_STATE = "pref_filter_theme_state"
         internal const val PREF_FILTER_MY_MANGA_STATE = "pref_filter_my_manga_state"
+        internal const val PREF_FILTER_SCHEMA_VERSION = "pref_filter_schema_version"
+        private const val FILTER_SCHEMA_VERSION = 3
         internal const val KEY_NEO_SES = "neo_ses"
         internal const val KEY_NEO_CHK = "neo_chk"
 
