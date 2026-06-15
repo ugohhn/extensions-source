@@ -1101,7 +1101,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             artist = author
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val updateTag = extractUpdateTag(document.html())
-            val newTag = if (isNewTitleDetail(response.request.url.toString(), document.html())) "新" else ""
+            val newTag = if (isNewTitleDetail(response.request.url.toString(), updateTag)) "新" else ""
             genre = joinNonBlank(genreBase, updateTag, newTag)
             description = detailDiv?.selectFirst("p.summary span.ellipsis")?.text()
                 ?: document.selectFirst("meta[property=og:description]")?.attr("content")
@@ -1380,12 +1380,59 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun isNewTitleDetail(url: String, html: String): Boolean {
-        val titleNo = titleNoFromUrl(url)
+    private fun isNewTitleDetail(url: String, updateTag: String): Boolean {
+        val titleNo = titleNoFromUrl(url) ?: return false
 
-        // 只认列表/JSON 已经为“当前 titleNo”确认过的 newTitle / 当前卡片 NEW 图标。
-        // 不扫描整个详情页 html，也不认 source=mweb...，因为 source/pageModel 只是来源埋点，不能代表作品是新作。
-        return titleNo != null && newTitleCache[titleNo] == true
+        // 先认列表/JSON 已经为“当前 titleNo”确认过的 newTitle / 当前卡片 NEW 图标。
+        if (newTitleCache[titleNo] == true) return true
+
+        // 保守补查：只根据详情页解析出的“每周X更新”去查对应 weekday 的 JSON。
+        // 不扫整个详情页 html，不认 source/pageModel，也不因为来自 /new 就全标。
+        val weekday = weekdayCodeFromUpdateTag(updateTag) ?: return false
+        return fetchNewTitleFromWeekday(titleNo, weekday) == true
+    }
+
+    private fun weekdayCodeFromUpdateTag(updateTag: String): String? {
+        return when {
+            updateTag.contains("周一") -> "MONDAY"
+            updateTag.contains("周二") -> "TUESDAY"
+            updateTag.contains("周三") -> "WEDNESDAY"
+            updateTag.contains("周四") -> "THURSDAY"
+            updateTag.contains("周五") -> "FRIDAY"
+            updateTag.contains("周六") -> "SATURDAY"
+            updateTag.contains("周日") -> "SUNDAY"
+            else -> null
+        }
+    }
+
+    private fun fetchNewTitleFromWeekday(titleNo: String, weekday: String): Boolean? {
+        return runCatching {
+            val url = "$baseUrl/getTodaysWebtoon?weekday=$weekday"
+            val response = client.newCall(GET(url, ajaxHeaders("$baseUrl/dailySchedule"))).execute()
+            val body = response.body.string().trim()
+            val items = if (body.startsWith("[")) {
+                org.json.JSONArray(body)
+            } else {
+                val json = JSONObject(body)
+                val data = json.optJSONObject("data") ?: json
+                data.optJSONArray("titles") ?: data.optJSONArray("list") ?: data.optJSONArray("items")
+            } ?: return@runCatching null
+
+            for (i in 0 until items.length()) {
+                val item = items.getJSONObject(i)
+                if (item.optString("titleNo") == titleNo || item.optInt("titleNo", -1).toString() == titleNo) {
+                    val isNew = item.optBoolean("newTitle", false)
+                    cacheNewTitle(titleNo, isNew)
+                    dlog("fetchNewTitleFromWeekday titleNo=$titleNo weekday=$weekday newTitle=$isNew")
+                    return@runCatching isNew
+                }
+            }
+            dlog("fetchNewTitleFromWeekday titleNo=$titleNo weekday=$weekday notFound")
+            null
+        }.getOrElse { e ->
+            wlog("fetchNewTitleFromWeekday failed titleNo=$titleNo weekday=$weekday", e)
+            null
+        }
     }
 
     private fun joinNonBlank(vararg parts: String): String {
