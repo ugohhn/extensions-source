@@ -16,10 +16,11 @@ private val sortFilter = arrayOf(
 )
 
 // 题材
-// 题材恢复网站式写法：第 0 项就是“全部”。
-// 第一次选择非“全部”题材会走题材；从其他题材切回“全部”由 lastFilterSnapshot 识别。
+// 第 0 项只表示“不使用题材筛选”，不负责切换到题材入口。
+// “全部题材”拆成独立 state=1，避免默认 0 和用户主动选择“全部”混在一起。
 private val themeFilter = arrayOf(
-    Tag("全部", "ALL"),
+    Tag("不使用题材筛选", ""),
+    Tag("全部题材", "ALL"),
     Tag("恋爱", "LOVE"),
     Tag("少年", "BOY"),
     Tag("古风", "ANCIENTCHINESE"),
