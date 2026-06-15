@@ -854,7 +854,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             dlog(
                 "searchMangaRequest filter branch=$branch activeGroup=$activeGroup page=$page " +
-                    "changed(update=$updateChanged, theme=$themeChanged, myManga=$myMangaChanged) " +
+                    "prevActiveGroup=$prevActiveGroup changed(update=$updateChanged, theme=$themeChanged, myManga=$myMangaChanged) " +
                     "weekdayState=$weekdayState/${previous?.weekdayState ?: -1} weekday=$weekdayValue sort=$sortValue " +
                     "themeState=$themeState/${previous?.themeState ?: -1} theme=${themeTag?.name.orEmpty()}/$themeValue " +
                     "myMangaState=$myMangaState/${previous?.myMangaState ?: -1} myManga=$myMangaName/$myMangaValue " +
@@ -1083,10 +1083,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
         }
+        dlog(
+            "parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre " +
+                "allThemeLinkSelector=$allThemeLinkSelector"
+        )
+        elements.take(30).forEachIndexed { index, item ->
+            val rawHref = item.attr("href")
+            val absHref = item.absUrl("href")
+            val hrefForPath = absHref.ifEmpty { rawHref }
+            val normalized = normalizeAbsoluteUrl(hrefForPath)
+            val path = normalizeMangaPath(hrefForPath)
+            val titleNo = titleNoFromUrl(absHref) ?: titleNoFromUrl(rawHref) ?: item.attr("data-title-no")
+            val titleText = item.selectFirst(
+                "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
+                    "p.chapter-title-02, .chapter-title-01, .tit_content"
+            )?.text() ?: item.attr("title").ifEmpty { item.selectFirst("img")?.attr("alt").orEmpty() }
+            dlog(
+                "parseMangaListHtml item#$index class=${item.className()} " +
+                    "rawHref=$rawHref absHref=$absHref normalized=$normalized path=$path " +
+                    "titleNo=$titleNo title=$titleText"
+            )
+        }
         val entries = elements
             .map(::mangaFromElement)
             .distinctBy { it.url }
             .filter { it.title.isNotEmpty() }
+        entries.take(30).forEachIndexed { index, manga ->
+            dlog("parseMangaListHtml entry#$index title=${manga.title} storedUrl=${manga.url} thumb=${manga.thumbnail_url}")
+        }
         dlog(
             "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
                 "genreIndex=$genreIndex rawGenreItems=${genreItems.size} allThemeLinks=${allThemeLinks.size} " +
@@ -1151,7 +1175,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
-        return GET(baseUrl + manga.url, reqHeaders)
+        val finalUrl = baseUrl + manga.url
+        dlog("mangaDetailsRequest title=${manga.title} manga.url=${manga.url} finalUrl=$finalUrl")
+        return GET(finalUrl, reqHeaders)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -1176,6 +1202,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "REST" -> SManga.ON_HIATUS
                 else -> SManga.UNKNOWN
             }
+            dlog(
+                "mangaDetailsParse url=${response.request.url} title=$title " +
+                    "genreBase=$genreBase updateTag=$updateTag newTag=$newTag genre=$genre status=$status"
+            )
         }
     }
 
@@ -1187,7 +1217,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
-        return GET(baseUrl + manga.url, reqHeaders)
+        val finalUrl = baseUrl + manga.url
+        dlog("chapterListRequest title=${manga.title} manga.url=${manga.url} finalUrl=$finalUrl")
+        return GET(finalUrl, reqHeaders)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -1218,6 +1250,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             val nextPage = document.select("div.paginate a[onclick] + a").firstOrNull() ?: break
             val nextUrl = nextPage.absUrl("href")
+            val nextRawHref = nextPage.attr("href")
+            val nextText = nextPage.text()
+            dlog("chapterListParse nextPage rawHref=$nextRawHref absUrl=$nextUrl text=$nextText")
             if (nextUrl.isEmpty()) break
 
             val reqHeaders = headersBuilder().build()
@@ -1243,7 +1278,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 autoUnlockEpisode(titleNo, episodeNo)
             }
         }
-        return GET(baseUrl + chapter.url, reqHeaders)
+        val finalUrl = baseUrl + chapter.url
+        dlog("pageListRequest chapter.name=${chapter.name} chapter.url=${chapter.url} finalUrl=$finalUrl")
+        return GET(finalUrl, reqHeaders)
     }
 
     private fun autoUnlockEpisode(titleNo: String, episodeNo: String) {
@@ -1336,21 +1373,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-        val href = element.absUrl("href").ifEmpty { element.attr("href") }
-        val titleNo = titleNoFromUrl(href) ?: element.attr("data-title-no")
-        cacheNewTitle(titleNo, hasNewBadge(element))
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val titleNo = titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val hasNew = hasNewBadge(element)
+        cacheNewTitle(titleNo, hasNew)
         setUrlWithoutDomain(href)
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
         )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
         thumbnail_url = extractThumbnailUrl(element)
+        dlog(
+            "mangaFromElement rawHref=$rawHref absHref=$href storedUrl=$url " +
+                "titleNo=$titleNo hasNew=$hasNew title=$title"
+        )
     }
 
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
-        setUrlWithoutDomain(element.absUrl("href").ifEmpty { element.attr("href") })
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        setUrlWithoutDomain(href)
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
+        dlog("searchMangaFromElement rawHref=$rawHref absHref=$href storedUrl=$url title=$title")
     }
 
 
