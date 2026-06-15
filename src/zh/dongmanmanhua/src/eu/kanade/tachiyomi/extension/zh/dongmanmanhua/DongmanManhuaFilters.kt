@@ -6,18 +6,13 @@ import java.util.Calendar
 
 data class Tag(val name: String, val value: String)
 
-// 排序只作用于“更新”入口。站点只接收 sortOrder=READ_COUNT / LIKEIT / UPDATE，
+// 排序只作用于“更新”入口。题材/分类、我的漫画不会读取这个值。
+// 站点更新页只接收 sortOrder=READ_COUNT / LIKEIT / UPDATE，
 // 没有升序/降序参数，所以这里用 Select，避免 Filter.Sort 的 ↑/↓ 造成误解。
 private val sortFilter = arrayOf(
     Tag("按人气", "READ_COUNT"),
     Tag("按点赞数", "LIKEIT"),
     Tag("按更新时间", "UPDATE"),
-)
-
-// 我的漫画
-private val migrateFilter = arrayOf(
-    Tag("我的漫画", "recent"),
-    Tag("已购", "purchased"),
 )
 
 // 题材
@@ -38,7 +33,6 @@ private val themeFilter = arrayOf(
 )
 
 fun getSortFilter(): Array<Tag> = sortFilter
-fun getMigrateFilter(): Array<Tag> = migrateFilter
 fun getThemeFilter(): Array<Tag> = themeFilter
 
 private fun getCurrentWeekdayCode(): String {
@@ -86,7 +80,8 @@ fun buildDongmanFilterList(): FilterList {
         ThemeFilter(),
         Filter.Separator(),
         Filter.Header("我的漫画"),
-        MigrateFilter(),
+        RecentMangaFilter(),
+        PurchasedMangaFilter(),
     )
 }
 
@@ -109,8 +104,6 @@ class ThemeFilter : Filter.Select<String>(
     0,
 )
 
-class MigrateFilter : Filter.Select<String>(
-    "我的漫画",
-    getMigrateFilter().map { it.name }.toTypedArray(),
-    0,
-)
+class RecentMangaFilter : Filter.CheckBox("最近观看", false)
+
+class PurchasedMangaFilter : Filter.CheckBox("我的已购", false)
