@@ -670,9 +670,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         .addNetworkInterceptor { chain ->
-            val response = chain.proceed(chain.request())
-            mergeSetCookieFromResponse(response)
-            response
+            val request = chain.request()
+            val startedAt = System.currentTimeMillis()
+            try {
+                val response = chain.proceed(request)
+                mergeSetCookieFromResponse(response)
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (elapsed >= SLOW_NETWORK_LOG_MS && isDetailLikePath(request.url.encodedPath)) {
+                    dlog("networkSlow path=${request.url.encodedPath} url=${request.url} elapsed=${elapsed}ms code=${response.code}")
+                }
+                response
+            } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                if (isDetailLikePath(request.url.encodedPath)) {
+                    wlog("networkFailed path=${request.url.encodedPath} url=${request.url} elapsed=${elapsed}ms", e)
+                }
+                throw e
+            }
         }
         .build()
 
@@ -845,6 +859,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val themeChanged = previous != null && themeState != previous.themeState
             val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
+            val visibleThemeShouldStay = previous != null &&
+                prevActiveGroup == "theme" &&
+                themeState != 0 &&
+                themeState == previous.themeState &&
+                myMangaValue.isEmpty() &&
+                !themeChanged &&
+                !myMangaChanged
+
             val activeGroup = when {
                 // 从未保存过筛选快照时，按当前可见的非默认筛选决定入口。
                 previous == null -> when {
@@ -852,13 +874,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     themeState != 0 -> "theme"
                     else -> "update"
                 }
-                // 三组筛选彻底按“本次谁变了谁生效”分开，避免残留 state 互相抢入口。
+                // 我的漫画和题材发生真实变化时，仍然直接按当前变化入口走。
                 myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
                 themeChanged -> "theme"
+                // Mihon 会保留其它筛选控件的旧 state。用户停留在题材入口时，weekday 可能从“新作”回到默认，
+                // 这种 updateChanged 不是用户明确要切更新页，不能抢走当前可见题材。
+                visibleThemeShouldStay -> "theme"
+                // 否则更新项发生变化才进入更新入口。
                 updateChanged -> "update"
                 // 没有任何 changed 时，再沿用上次成功入口。
-                // 仅保留一个保护：旧版本可能把 activeGroup 错存成 update，但界面显示非默认题材且更新项为默认，
-                // 这种情况下按当前可见题材恢复。不能压过上面的 updateChanged。
+                // 仅保留一个保护：旧版本可能把 activeGroup 错存成 update，但界面显示非默认题材且更新项为默认。
                 prevActiveGroup == "update" &&
                     themeState != 0 &&
                     weekdayValue.isEmpty() &&
@@ -955,6 +980,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             dlog(
                 "searchMangaRequest filter branch=$branch activeGroup=$activeGroup page=$page " +
                     "prevActiveGroup=$prevActiveGroup changed(update=$updateChanged, theme=$themeChanged, myManga=$myMangaChanged) " +
+                    "visibleThemeShouldStay=$visibleThemeShouldStay " +
                     "weekdayState=$weekdayState/${previous?.weekdayState ?: -1} weekday=$weekdayValue sort=$sortValue " +
                     "themeState=$themeState/${previous?.themeState ?: -1} theme=${themeTag?.name.orEmpty()}/$themeValue " +
                     "myMangaState=$myMangaState/${previous?.myMangaState ?: -1} myManga=$myMangaName/$myMangaValue " +
@@ -1333,10 +1359,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
         val cleanPath = cleanMangaDetailPath(manga.url)
-        val finalUrl = baseUrl + cleanPath
+        val requestPath = canonicalDetailRequestPath(manga.url)
+        val finalUrl = baseUrl + requestPath
         dlog(
             "mangaDetailsRequest title=${manga.title} manga.url=${manga.url} " +
-                "cleanPath=$cleanPath finalUrl=$finalUrl"
+                "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
         )
         return GET(finalUrl, reqHeaders)
     }
@@ -1387,10 +1414,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
         val cleanPath = cleanMangaDetailPath(manga.url)
-        val finalUrl = baseUrl + cleanPath
+        val requestPath = canonicalDetailRequestPath(manga.url)
+        val finalUrl = baseUrl + requestPath
         dlog(
             "chapterListRequest title=${manga.title} manga.url=${manga.url} " +
-                "cleanPath=$cleanPath finalUrl=$finalUrl"
+                "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
         )
         return GET(finalUrl, reqHeaders)
     }
@@ -1631,11 +1659,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
 
-        if (includeAll && getValidGenrePageCache("ALL") == null) {
-            val allItems = document.select("a.genrePageContentItem")
-                .map(::cachedMangaItemFromElement)
-                .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
-                .distinctBy { it.url }
+        if (includeAll) {
+            val allItems = genreAllItemsFromSectionCaches()
             if (allItems.isNotEmpty()) {
                 putGenrePageCache("ALL", allItems)
                 cachedItems += allItems.size
@@ -1643,6 +1668,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         dlog("putGenrePageCachesFromDocument includeAll=$includeAll cachedGenres=$cachedGenres cachedItems=$cachedItems")
+    }
+
+    private fun genreAllItemsFromSectionCaches(): List<CachedMangaItem> {
+        val result = mutableListOf<CachedMangaItem>()
+        synchronized(genrePageCache) {
+            getThemeFilter().forEach { tag ->
+                val genre = tag.value
+                if (genre.isBlank() || genre == "ALL") return@forEach
+                val items = genrePageCache[genre]?.items.orEmpty()
+                if (items.isNotEmpty()) result += items
+            }
+        }
+        return result.distinctBy { it.url }
     }
 
     private fun themeAllCarrierGenre(): String {
@@ -1735,6 +1773,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .removePrefix("https://m.dongmanmanhua.cn")
             .removePrefix("http://m.dongmanmanhua.cn")
             .ifEmpty { rawUrl }
+    }
+
+    private fun canonicalDetailRequestPath(rawUrl: String): String {
+        val cleanPath = cleanMangaDetailPath(rawUrl)
+        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(rawUrl) ?: return cleanPath
+        return "/episodeList?titleNo=$titleNo"
+    }
+
+    private fun isDetailLikePath(path: String): Boolean {
+        return path.endsWith("/episodeList") || path.contains("/list")
     }
 
     private fun cleanMangaDetailPath(rawUrl: String): String {
@@ -1904,6 +1952,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
+        private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val NEW_PROBE_LOG_LIMIT = 5
