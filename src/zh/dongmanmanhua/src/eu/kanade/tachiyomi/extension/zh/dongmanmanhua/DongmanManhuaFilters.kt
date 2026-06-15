@@ -6,18 +6,18 @@ import java.util.Calendar
 
 data class Tag(val name: String, val value: String)
 
-// 排序方式
+// 排序只作用于“更新”入口。站点只接收 sortOrder=READ_COUNT / LIKEIT / UPDATE，
+// 没有升序/降序参数，所以这里用 Select，避免 Filter.Sort 的 ↑/↓ 造成误解。
 private val sortFilter = arrayOf(
     Tag("按人气", "READ_COUNT"),
     Tag("按点赞数", "LIKEIT"),
-    Tag("按更新时间", "UPDATE")
+    Tag("按更新时间", "UPDATE"),
 )
 
 // 我的漫画
 private val migrateFilter = arrayOf(
-    Tag("无", ""),
-    Tag("最近观看", "recent"),
-    Tag("我的已购", "purchased")
+    Tag("我的漫画", "recent"),
+    Tag("已购", "purchased"),
 )
 
 // 题材
@@ -34,7 +34,7 @@ private val themeFilter = arrayOf(
     Tag("悬疑", "SUSPENSE"),
     Tag("励志", "INSPIRATIONAL"),
     Tag("影视化", "FILMADAPTATION"),
-    Tag("完结", "TERMINATION")
+    Tag("完结", "TERMINATION"),
 )
 
 fun getSortFilter(): Array<Tag> = sortFilter
@@ -56,8 +56,13 @@ private fun getCurrentWeekdayCode(): String {
 
 fun buildDongmanFilterList(): FilterList {
     val allWeekdays = listOf(
-        "MONDAY" to "周一", "TUESDAY" to "周二", "WEDNESDAY" to "周三",
-        "THURSDAY" to "周四", "FRIDAY" to "周五", "SATURDAY" to "周六", "SUNDAY" to "周日"
+        "MONDAY" to "周一",
+        "TUESDAY" to "周二",
+        "WEDNESDAY" to "周三",
+        "THURSDAY" to "周四",
+        "FRIDAY" to "周五",
+        "SATURDAY" to "周六",
+        "SUNDAY" to "周日",
     )
     val currentWeekday = getCurrentWeekdayCode()
     val weekdayNames = mutableListOf("今天")
@@ -81,14 +86,14 @@ fun buildDongmanFilterList(): FilterList {
         ThemeFilter(),
         Filter.Separator(),
         Filter.Header("我的漫画"),
-        MigrateFilter()
+        MigrateFilter(),
     )
 }
 
-class SortFilter : Filter.Sort(
+class SortFilter : Filter.Select<String>(
     "排序",
     getSortFilter().map { it.name }.toTypedArray(),
-    Selection(0, true),
+    0,
 )
 
 class WeekdayFilter(
