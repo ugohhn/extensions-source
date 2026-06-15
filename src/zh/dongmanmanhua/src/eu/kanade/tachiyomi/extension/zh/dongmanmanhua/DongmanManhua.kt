@@ -734,6 +734,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val newTitleCache = mutableMapOf<String, Boolean>()
     private val dailyScheduleNewCache = mutableMapOf<String, Boolean>()
 
+    private data class FilterSnapshot(
+        val weekdayState: Int,
+        val sortState: Int,
+        val themeState: Int,
+        val myMangaState: Int,
+        val activeGroup: String,
+    )
+
+    private var lastFilterSnapshot: FilterSnapshot? = null
+
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
 
@@ -741,64 +751,40 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
+        val weekdayState = weekdayFilter?.state ?: 0
         val weekdayValue = weekdayFilter?.getSelectedValue().orEmpty()
 
         val sortFilter = filters.firstOrNull { it is SortFilter } as? SortFilter
         val sortState = sortFilter?.state ?: 0
         val sortValue = getSortFilter().getOrNull(sortState)?.value ?: "READ_COUNT"
 
-        // latestUpdatesParse() 需要知道当前更新分区。
-        // 这里保存的是“更新”自己的状态；题材/我的漫画不会用它组合请求。
         val themeFilter = filters.firstOrNull { it is ThemeFilter } as? ThemeFilter
         val themeState = themeFilter?.state ?: 0
         val themeTag = getThemeFilter().getOrNull(themeState)
         val themeValue = themeTag?.value.orEmpty()
 
-        val recentFilter = filters.firstOrNull { it is RecentMangaFilter } as? RecentMangaFilter
-        val purchasedFilter = filters.firstOrNull { it is PurchasedMangaFilter } as? PurchasedMangaFilter
-        val recentSelected = recentFilter?.state ?: false
-        val purchasedSelected = purchasedFilter?.state ?: false
-        val migrateValue = when {
-            purchasedSelected -> "purchased"
-            recentSelected -> "recent"
-            else -> ""
-        }
-        val migrateName = when (migrateValue) {
-            "purchased" -> "我的已购"
-            "recent" -> "最近观看"
-            else -> "未选择"
-        }
+        val myMangaFilter = filters.firstOrNull { it is MyMangaFilter } as? MyMangaFilter
+        val myMangaState = myMangaFilter?.state ?: 0
+        val myMangaValue = myMangaFilter?.getSelectedValue().orEmpty().ifEmpty { "recent" }
+        val myMangaName = if (myMangaValue == "purchased") "我的已购" else "最近观看"
 
-        // query 为空时走筛选浏览。Mihon 的 Select 状态会保留旧值，
-        // 所以不能简单用“某个筛选非默认”判断入口。
-        // 这里记录上一次 filter state，按“这次实际变化的分组”决定入口，避免：
-        // 先选新作 -> 再选题材时，旧的 NEW 还压着题材。
         if (query.isBlank()) {
-            val prevWeekdayState = preferences.getInt(PREF_FILTER_WEEKDAY_STATE, 0)
-            val prevThemeState = preferences.getInt(PREF_FILTER_THEME_STATE, 0)
-            val prevRecentSelected = preferences.getBoolean(PREF_FILTER_RECENT_SELECTED, false)
-            val prevPurchasedSelected = preferences.getBoolean(PREF_FILTER_PURCHASED_SELECTED, false)
-            val prevSortState = preferences.getInt(PREF_FILTER_SORT_STATE, 0)
-            val prevActiveGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, "").orEmpty()
+            val previous = lastFilterSnapshot
+            val prevActiveGroup = previous?.activeGroup ?: "update"
 
-            val weekdayState = weekdayFilter?.state ?: 0
-
-            val migrateChanged = recentSelected != prevRecentSelected || purchasedSelected != prevPurchasedSelected
-            val themeChanged = themeState != prevThemeState
-            val updateChanged = weekdayState != prevWeekdayState || sortState != prevSortState
-            val migrateSelected = recentSelected || purchasedSelected
+            val updateChanged = previous != null &&
+                (weekdayState != previous.weekdayState || sortState != previous.sortState)
+            val themeChanged = previous != null && themeState != previous.themeState
+            val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
             val activeGroup = when {
-                // “我的漫画”没有“无”选项，所以用两个 CheckBox 代替 Select。
-                // 只有勾选“最近观看/我的已购”时才进入我的漫画分支；没结果就返回空，不回落到题材/更新。
-                migrateChanged && migrateSelected -> "migrate"
+                // 初次进入时固定默认入口为“更新-今天”。
+                // 否则 MyMangaFilter 的第 0 项“最近观看”会在没被点击时自动抢入口。
+                previous == null -> "update"
+                myMangaChanged -> "migrate"
                 themeChanged -> "theme"
                 updateChanged -> "update"
-                prevActiveGroup == "migrate" && migrateSelected -> "migrate"
-                prevActiveGroup == "theme" -> "theme"
-                prevActiveGroup == "update" -> "update"
-                themeValue.isNotEmpty() -> "theme"
-                else -> "update"
+                else -> prevActiveGroup
             }
 
             val todayCode = currentWeekdayCode()
@@ -813,22 +799,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val request: Request
             when (activeGroup) {
                 "migrate" -> {
-                    when (migrateValue) {
+                    when (myMangaValue) {
                         "purchased" -> {
                             branch = "purchased"
                             val url = "$baseUrl/episode/unlock/titleList?platform=MWEB"
                             request = GET(url, ajaxHeaders("$baseUrl/purchased/list"))
                         }
-                        "recent" -> {
-                            branch = "recent"
-                            // 最近观看对应网站的 /recent/more 页面。
-                            // 网页真实记录通常来自浏览器 localStorage；扩展侧如果拿不到，就只返回空结果，绝不回落到题材/更新。
-                            val url = "$baseUrl/recent/more"
-                            request = GET(url, headersBuilder().build())
-                        }
                         else -> {
-                            branch = "migrate-empty"
-                            val url = "$baseUrl/recent/more?mihonMyMangaEmpty=1"
+                            branch = "recent"
+                            // 最近观看尝试请求真实页面；如果网页 localStorage 记录拿不到，解析阶段返回空，不回落到题材/更新。
+                            val url = "$baseUrl/recent/more"
                             request = GET(url, headersBuilder().build())
                         }
                     }
@@ -836,15 +816,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "theme" -> {
                     if (themeValue.isNotEmpty()) {
                         branch = "theme"
-                        // 题材/分类不读取“排序”控件，不拼 sortOrder。
-                        // 排序只属于更新页。题材直接请求自己的分类入口。
+                        // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
                         val url = "$baseUrl/$themeValue/"
                         request = GET(url, headersBuilder().build())
                     } else {
                         branch = "theme-all"
-                        // “题材=全部”走站点首页；用户已验证首页同时含 /LOVE/、/BOY/ 等多个分类链接。
-                        // 这里不回落到更新，也不拼 sortOrder。
-                        val url = "$baseUrl/"
+                        // “全部”应该使用分类页壳，然后把所有题材分区拼在一起；不要请求热门首页。
+                        // /LOVE/ 返回的是完整分类页 HTML，包含 genreList 和全部题材分区。
+                        val url = "$baseUrl/LOVE/?mihonThemeAll=1"
                         request = GET(url, headersBuilder().build())
                     }
                 }
@@ -854,6 +833,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
 
+            lastFilterSnapshot = FilterSnapshot(
+                weekdayState = weekdayState,
+                sortState = sortState,
+                themeState = themeState,
+                myMangaState = myMangaState,
+                activeGroup = activeGroup,
+            )
+
             preferences.edit()
                 .putString(PREF_FILTER_WEEKDAY, weekdayValue)
                 .putString(PREF_FILTER_SORT, sortValue)
@@ -862,17 +849,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .putInt(PREF_FILTER_WEEKDAY_STATE, weekdayState)
                 .putInt(PREF_FILTER_SORT_STATE, sortState)
                 .putInt(PREF_FILTER_THEME_STATE, themeState)
-                .putBoolean(PREF_FILTER_RECENT_SELECTED, recentSelected)
-                .putBoolean(PREF_FILTER_PURCHASED_SELECTED, purchasedSelected)
+                .putInt(PREF_FILTER_MY_MANGA_STATE, myMangaState)
                 .apply()
 
             dlog(
                 "searchMangaRequest filter branch=$branch activeGroup=$activeGroup page=$page " +
-                    "changed(update=$updateChanged, theme=$themeChanged, migrate=$migrateChanged) " +
-                    "weekdayState=$weekdayState/$prevWeekdayState weekday=$weekdayValue sort=$sortValue " +
-                    "themeState=$themeState/$prevThemeState theme=${themeTag?.name.orEmpty()}/$themeValue " +
-                    "recent=$recentSelected/$prevRecentSelected purchased=$purchasedSelected/$prevPurchasedSelected " +
-                    "migrate=$migrateName/$migrateValue " +
+                    "changed(update=$updateChanged, theme=$themeChanged, myManga=$myMangaChanged) " +
+                    "weekdayState=$weekdayState/${previous?.weekdayState ?: -1} weekday=$weekdayValue sort=$sortValue " +
+                    "themeState=$themeState/${previous?.themeState ?: -1} theme=${themeTag?.name.orEmpty()}/$themeValue " +
+                    "myMangaState=$myMangaState/${previous?.myMangaState ?: -1} myManga=$myMangaName/$myMangaValue " +
                     "url=${request.url}"
             )
             return request
@@ -1043,8 +1028,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun parseMangaListHtml(response: Response): MangasPage {
         val document = response.asJsoup()
-        val requestedGenre = preferences.getString(PREF_FILTER_THEME, "").orEmpty()
-            .ifEmpty { genreCodeFromUrl(response.request.url.toString()).orEmpty() }
+        val requestUrl = response.request.url.toString()
+        val requestedGenre = if (requestUrl.contains("mihonThemeAll=1")) {
+            ""
+        } else {
+            preferences.getString(PREF_FILTER_THEME, "").orEmpty()
+                .ifEmpty { genreCodeFromUrl(requestUrl).orEmpty() }
+        }
         val genreItems = document.select("a.genrePageContentItem")
         val allThemeLinkSelector = getThemeFilter()
             .map { it.value }
@@ -1537,8 +1527,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_FILTER_WEEKDAY_STATE = "pref_filter_weekday_state"
         internal const val PREF_FILTER_SORT_STATE = "pref_filter_sort_state"
         internal const val PREF_FILTER_THEME_STATE = "pref_filter_theme_state"
-        internal const val PREF_FILTER_RECENT_SELECTED = "pref_filter_recent_selected"
-        internal const val PREF_FILTER_PURCHASED_SELECTED = "pref_filter_purchased_selected"
+        internal const val PREF_FILTER_MY_MANGA_STATE = "pref_filter_my_manga_state"
         internal const val KEY_NEO_SES = "neo_ses"
         internal const val KEY_NEO_CHK = "neo_chk"
 
