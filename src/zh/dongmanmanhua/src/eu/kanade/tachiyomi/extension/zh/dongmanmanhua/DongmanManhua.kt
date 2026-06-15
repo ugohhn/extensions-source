@@ -39,6 +39,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
 class DongmanManhua : HttpSource(), ConfigurableSource {
@@ -793,10 +795,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val contentType: String,
     )
 
-    private data class DetailHtmlInflightState(
-        var completed: Boolean = false,
-        var failed: Boolean = false,
-    )
+    private class DetailHtmlInflightState {
+        @Volatile
+        var completed: Boolean = false
+
+        @Volatile
+        var failed: Boolean = false
+
+        val latch = CountDownLatch(1)
+    }
 
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
@@ -1913,28 +1920,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         if (!isOwner) {
             val startedAt = System.currentTimeMillis()
-            var ownerCompleted = false
-            var ownerFailed = false
-            synchronized(state) {
-                while (true) {
-                    if (getValidDetailHtmlCache(titleNo) != null) break
-                    if (state.completed) {
-                        ownerCompleted = true
-                        ownerFailed = state.failed
-                        break
-                    }
-                    val elapsed = System.currentTimeMillis() - startedAt
-                    val remaining = detailHtmlInflightWaitMs - elapsed
-                    if (remaining <= 0) break
-                    runCatching { state.wait(remaining.coerceAtMost(1000L)) }
-                }
+            val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
+            if (cacheBeforeWait != null) {
+                dlog("detailHtmlCacheHit titleNo=$titleNo age=${System.currentTimeMillis() - cacheBeforeWait.createdAt}ms url=${request.url}")
+                return cachedDetailHtmlResponse(request, cacheBeforeWait)
             }
+
+            val finished = runCatching {
+                state.latch.await(detailHtmlInflightWaitMs, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+
             getValidDetailHtmlCache(titleNo)?.let { cache ->
                 dlog("detailHtmlInflightJoined titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
                 return cachedDetailHtmlResponse(request, cache)
             }
-            if (ownerCompleted) {
-                val status = if (ownerFailed) "ownerFailed" else "ownerCompletedNoCache"
+
+            if (finished && state.completed) {
+                val status = if (state.failed) "ownerFailed" else "ownerCompletedNoCache"
                 wlog("detailHtmlInflightFallback titleNo=$titleNo status=$status waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
             } else {
                 wlog("detailHtmlInflightTimeout titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
@@ -1961,11 +1963,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ownerFailed = true
             throw e
         } finally {
-            synchronized(state) {
-                state.completed = true
-                state.failed = ownerFailed
-                state.notifyAll()
-            }
+            state.completed = true
+            state.failed = ownerFailed
+            state.latch.countDown()
             synchronized(detailHtmlInflight) {
                 if (detailHtmlInflight[titleNo] === state) detailHtmlInflight.remove(titleNo)
             }
