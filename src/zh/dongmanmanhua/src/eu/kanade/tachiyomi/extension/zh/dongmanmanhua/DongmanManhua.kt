@@ -797,16 +797,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
             val activeGroup = when {
-                // 持久化快照后，previous == null 只代表从未保存过筛选快照。
-                // 此时默认回到更新入口，避免第 0 项默认值抢走更新列表。
-                previous == null -> "update"
+                // 从未保存过筛选快照时，按当前可见的非默认筛选决定入口。
+                previous == null -> when {
+                    myMangaValue.isNotEmpty() -> "migrate"
+                    themeState != 0 -> "theme"
+                    else -> "update"
+                }
                 // 我的漫画有变化：选了某项就走 migrate，切回“不使用”就回到更新。
                 myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
                 // 题材有变化：包括切回“全部”，都先走 theme，由 theme 分支处理“全部”。
                 themeChanged -> "theme"
                 // 更新星期或排序变化，只影响更新入口。
                 updateChanged -> "update"
-                // 翻页或刷新没有状态变化时，沿用上次入口。
+                // 没有变化时，优先尊重当前筛选面板里可见的非默认入口。
+                // 这能修正“界面显示完结/题材，但 activeGroup 仍停在 update”的状态漂移。
+                myMangaValue.isNotEmpty() -> "migrate"
+                themeState != 0 -> "theme"
                 else -> prevActiveGroup
             }
 
