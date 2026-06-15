@@ -1386,7 +1386,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         // 先认列表/JSON 已经为“当前 titleNo”确认过的 newTitle / 当前卡片 NEW 图标。
         if (newTitleCache[titleNo] == true) return true
 
-        // 保守补查：只根据详情页解析出的“每周X更新”去查对应 weekday 的 JSON。
+        // D 方案：详情页自身没有 newTitle 时，按 titleNo 去 /dailySchedule 这个 HTML 总表里找当前卡片。
+        // 抓包确认：2896 反派的温柔在 /dailySchedule 的 li#title_li_2896 下带 ico_new_cn。
+        fetchNewTitleFromDailySchedule(titleNo)?.let { return it }
+
+        // B 方案兜底：只根据详情页解析出的“每周X更新”去查对应 weekday 的 JSON。
         // 不扫整个详情页 html，不认 source/pageModel，也不因为来自 /new 就全标。
         val weekday = weekdayCodeFromUpdateTag(updateTag) ?: return false
         return fetchNewTitleFromWeekday(titleNo, weekday) == true
@@ -1402,6 +1406,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             updateTag.contains("周六") -> "SATURDAY"
             updateTag.contains("周日") -> "SUNDAY"
             else -> null
+        }
+    }
+
+    private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
+        return runCatching {
+            val url = "$baseUrl/dailySchedule"
+            val document = client.newCall(GET(url, headersBuilder().build())).execute().asJsoup()
+            val element = document.selectFirst("li#title_li_$titleNo, li[data-title-no=$titleNo]")
+                ?: run {
+                    dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo notFound")
+                    return@runCatching null
+                }
+
+            val isNew = hasNewBadge(element)
+            cacheNewTitle(titleNo, isNew)
+            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo isNew=$isNew")
+            isNew
+        }.getOrElse { e ->
+            wlog("fetchNewTitleFromDailySchedule failed titleNo=$titleNo", e)
+            null
         }
     }
 
