@@ -865,7 +865,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 themeState == previous.themeState &&
                 myMangaValue.isEmpty() &&
                 !themeChanged &&
-                !myMangaChanged
+                !myMangaChanged &&
+                updateChanged &&
+                weekdayValue.isEmpty()
 
             val activeGroup = when {
                 // 从未保存过筛选快照时，按当前可见的非默认筛选决定入口。
@@ -878,7 +880,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
                 themeChanged -> "theme"
                 // Mihon 会保留其它筛选控件的旧 state。用户停留在题材入口时，weekday 可能从“新作”回到默认，
-                // 这种 updateChanged 不是用户明确要切更新页，不能抢走当前可见题材。
+                // 这种“回默认空值”的 updateChanged 不是用户明确要切更新页，不能抢走当前可见题材。
+                // 但 MONDAY/TUESDAY/NEW/COMPLETE 这类非空更新项必须允许抢回 update 入口。
                 visibleThemeShouldStay -> "theme"
                 // 否则更新项发生变化才进入更新入口。
                 updateChanged -> "update"
