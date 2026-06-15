@@ -764,13 +764,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 "class=${item.className()} href=$href cleanPath=${cached.url}"
                         )
                     }
-                    cached
+                    val marked = cached.copy(hasNew = true)
+                    cacheNewTitle(marked.titleNo, true, "new-page")
+                    marked
                 }
                 .distinctBy { it.url }
             putUpdatePageCache(updateCacheKey("NEW", ""), cachedItems)
             val entries = cachedItems.map(::mangaFromCachedItem)
             val newCount = cachedItems.count { it.hasNew }
-            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount cacheWrite=true")
+            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount cacheWrite=true source=new-page")
             return MangasPage(entries, false)
         }
 
@@ -807,7 +809,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
-    private val detailHtmlCacheTtlMs = 2 * 60 * 1000L
+    private val detailHtmlCacheTtlMs = 2500L
     private val detailHtmlInflightWaitMs = 12 * 1000L
     private val detailHtmlCacheMaxEntries = 24
 
@@ -980,7 +982,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "theme" -> {
                     val genreCacheKey = if (themeValue == "ALL") "ALL" else themeValue
                     val cachedGenrePage = getValidGenrePageCache(genreCacheKey)
-                    val useCachedGenrePage = cachedGenrePage != null
+                    val useCachedGenrePage = page > 1 && cachedGenrePage != null
                     branch = when {
                         themeValue == "ALL" && useCachedGenrePage -> "theme-all-cache"
                         themeValue == "ALL" -> "theme-all"
@@ -999,7 +1001,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
                 else -> {
                     val updateKey = updateCacheKey(weekdayValue, sortValue)
-                    val useCachedUpdatePage = getValidUpdatePageCache(updateKey) != null
+                    val useCachedUpdatePage = page > 1 && getValidUpdatePageCache(updateKey) != null
                     branch = when {
                         useCachedUpdatePage && weekdayValue == "NEW" -> "new-cache"
                         useCachedUpdatePage && weekdayValue == "COMPLETE" -> "update-complete-cache"
@@ -2084,15 +2086,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: Regex("""/title/([0-9]+)""").find(url)?.groupValues?.getOrNull(1)
     }
 
-    private fun cacheNewTitle(titleNo: String?, isNew: Boolean) {
+    private fun cacheNewTitle(titleNo: String?, isNew: Boolean, source: String = "list-or-json") {
         if (titleNo.isNullOrBlank()) return
         if (isNew) {
             newTitleCache[titleNo] = true
             if (VERBOSE_LIST_LOG) {
-                dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=true")
+                dlog("cacheNewTitle titleNo=$titleNo source=$source isNew=true")
             }
         } else if (VERBOSE_LIST_LOG) {
-            dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=false ignored")
+            dlog("cacheNewTitle titleNo=$titleNo source=$source isNew=false ignored")
         }
     }
 
