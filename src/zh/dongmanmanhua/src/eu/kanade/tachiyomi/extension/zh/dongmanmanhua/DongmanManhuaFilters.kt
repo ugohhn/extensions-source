@@ -16,8 +16,10 @@ private val sortFilter = arrayOf(
 )
 
 // 题材
+// 题材恢复网站式写法：第 0 项就是“全部”。
+// 第一次选择非“全部”题材会走题材；从其他题材切回“全部”由 lastFilterSnapshot 识别。
 private val themeFilter = arrayOf(
-    Tag("全部", ""),
+    Tag("全部", "ALL"),
     Tag("恋爱", "LOVE"),
     Tag("少年", "BOY"),
     Tag("古风", "ANCIENTCHINESE"),
@@ -105,8 +107,12 @@ class ThemeFilter : Filter.Select<String>(
 
 class MyMangaFilter : Filter.Select<String>(
     "我的漫画",
-    arrayOf("最近观看", "我的已购"),
+    arrayOf("不使用我的漫画", "最近观看", "我的已购"),
     0,
 ) {
-    fun getSelectedValue(): String = if (state == 1) "purchased" else "recent"
+    fun getSelectedValue(): String = when (state) {
+        1 -> "recent"
+        2 -> "purchased"
+        else -> ""
+    }
 }
