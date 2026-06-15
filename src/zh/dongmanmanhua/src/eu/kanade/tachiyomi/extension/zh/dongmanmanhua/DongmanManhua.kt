@@ -707,8 +707,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val document = response.asJsoup()
             val entries = document.select(".new_works_items").mapNotNull { item ->
                 val href = item.absUrl("href")
-                // “新作页”不等于每一本都带 newTitle。只在元素本身出现 NEW/新图标时缓存。
-                cacheNewTitle(titleNoFromUrl(href), hasNewBadge(item))
+                val titleNo = titleNoFromUrl(href)
+                // /new 是“新作”入口，但不能把入口/来源参数直接当成作品 newTitle。
+                // 只认当前卡片自身的 NEW 图标；JSON 接口另走 newTitle 字段。
+                val isNew = hasNewBadge(item)
+                cacheNewTitle(titleNo, isNew)
+                dlog("latestUpdatesParse NEW item titleNo=$titleNo isNewBadge=$isNew href=$href")
                 SManga.create().apply {
                     setUrlWithoutDomain(href)
                     title = item.selectFirst(".works_tit")?.text() ?: return@mapNotNull null
@@ -758,17 +762,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val migrateTag = getMigrateFilter().getOrNull(migrateState)
         val migrateValue = migrateTag?.value.orEmpty()
 
-        preferences.edit()
-            .putString(PREF_FILTER_WEEKDAY, weekdayValue)
-            .putString(PREF_FILTER_SORT, sortValue)
-            .putString(PREF_FILTER_THEME, themeValue)
-            .apply()
-
-        // query 为空时走筛选浏览。这里照 ColaManga 的思路：
-        // 不额外加“入口”下拉框，而是看哪个筛选项有真实值。
-        // 优先级：我的漫画 > 题材 > 更新。
-        // 这样不会出现“题材 + 周日 + 我的漫画 + 排序”的组合请求。
+        // query 为空时走筛选浏览。Mihon 的 Select 状态会保留旧值，
+        // 所以不能简单用“某个筛选非默认”判断入口。
+        // 这里记录上一次 filter state，按“这次实际变化的分组”决定入口，避免：
+        // 先选新作 -> 再选题材时，旧的 NEW 还压着题材。
         if (query.isBlank()) {
+            val prevWeekdayState = preferences.getInt(PREF_FILTER_WEEKDAY_STATE, 0)
+            val prevThemeState = preferences.getInt(PREF_FILTER_THEME_STATE, 0)
+            val prevMigrateState = preferences.getInt(PREF_FILTER_MIGRATE_STATE, 0)
+            val prevSortState = preferences.getInt(PREF_FILTER_SORT_STATE, 0)
+            val prevActiveGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, "").orEmpty()
+
+            val weekdayState = weekdayFilter?.state ?: 0
+            val sortState = sortSelection?.index ?: 0
+
+            val migrateChanged = migrateState != prevMigrateState
+            val themeChanged = themeState != prevThemeState
+            val updateChanged = weekdayState != prevWeekdayState || sortState != prevSortState
+
+            val activeGroup = when {
+                // “我的漫画”没有“无”选项，默认值不能自动抢入口；只在它本次真的变化时启用。
+                migrateChanged -> "migrate"
+                themeChanged -> if (themeValue.isNotEmpty()) "theme" else "update"
+                updateChanged -> "update"
+                prevActiveGroup.isNotEmpty() -> prevActiveGroup
+                themeValue.isNotEmpty() -> "theme"
+                else -> "update"
+            }
+
             val todayCode = currentWeekdayCode()
             val updateUrl = when (weekdayValue) {
                 "NEW" -> "$baseUrl/new"
@@ -779,45 +800,73 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             val branch: String
             val request: Request
-            when {
-                migrateValue == "purchased" -> {
-                    branch = "purchased"
-                    val url = "$baseUrl/episode/unlock/titleList?platform=MWEB"
-                    request = GET(url, ajaxHeaders("$baseUrl/purchased/list"))
+            when (activeGroup) {
+                "migrate" -> {
+                    when (migrateValue) {
+                        "purchased" -> {
+                            branch = "purchased"
+                            val url = "$baseUrl/episode/unlock/titleList?platform=MWEB"
+                            request = GET(url, ajaxHeaders("$baseUrl/purchased/list"))
+                        }
+                        "recent" -> {
+                            branch = "recent-empty"
+                            // 网页真实“我的漫画/最近观看”依赖浏览器 localStorage，扩展侧拿不到。
+                            // 这里固定返回空结果，不再请求 /home/recentSeeing，也不回落到题材/更新，避免筛选错乱。
+                            val url = "$baseUrl/recent/more?mihonRecentEmpty=1"
+                            request = GET(url, headersBuilder().build())
+                        }
+                        else -> {
+                            branch = "migrate-empty"
+                            val url = "$baseUrl/recent/more?mihonRecentEmpty=1"
+                            request = GET(url, headersBuilder().build())
+                        }
+                    }
                 }
-                migrateValue == "recent" -> {
-                    branch = "recent"
-                    val url = "$baseUrl/home/recentSeeing?size=50"
-                    request = GET(url, ajaxHeaders("$baseUrl/recent/more"))
-                }
-                // 只要“更新”下拉不是默认“今天”，就认为用户正在切换更新分区，覆盖旧题材状态。
-                // 这能避免先选题材后再选“新作/完结/周几”仍停留在题材页。
-                weekdayValue.isNotEmpty() -> {
-                    branch = "update-explicit"
-                    request = GET(updateUrl, headersBuilder().build())
-                }
-                themeValue.isNotEmpty() -> {
-                    branch = "theme"
-                    // 分类页 HTML 一次性预载所有题材分区。为了避免站点把非 LOVE 路径重定向回默认页，
-                    // 这里固定请求网页抓包确认过的分类壳，再在 parse 阶段按 themeValue 取对应 flick-ct。
-                    val url = "$baseUrl/LOVE/?sortOrder=READ_COUNT"
-                    request = GET(url, headersBuilder().build())
+                "theme" -> {
+                    if (themeValue.isNotEmpty()) {
+                        branch = "theme"
+                        // 分类页 HTML 一次性预载所有题材分区。为了避免站点把非 LOVE 路径重定向回默认页，
+                        // 这里固定请求网页抓包确认过的分类壳，再在 parse 阶段按 themeValue 取对应 flick-ct。
+                        val url = "$baseUrl/LOVE/?sortOrder=READ_COUNT"
+                        request = GET(url, headersBuilder().build())
+                    } else {
+                        branch = "update-fallback"
+                        request = GET(updateUrl, headersBuilder().build())
+                    }
                 }
                 else -> {
-                    branch = "update-default"
+                    branch = if (weekdayValue.isNotEmpty()) "update-explicit" else "update-default"
                     request = GET(updateUrl, headersBuilder().build())
                 }
             }
 
+            preferences.edit()
+                .putString(PREF_FILTER_WEEKDAY, weekdayValue)
+                .putString(PREF_FILTER_SORT, sortValue)
+                .putString(PREF_FILTER_THEME, if (activeGroup == "theme") themeValue else "")
+                .putString(PREF_FILTER_ACTIVE_GROUP, activeGroup)
+                .putInt(PREF_FILTER_WEEKDAY_STATE, weekdayState)
+                .putInt(PREF_FILTER_SORT_STATE, sortState)
+                .putInt(PREF_FILTER_THEME_STATE, themeState)
+                .putInt(PREF_FILTER_MIGRATE_STATE, migrateState)
+                .apply()
+
             dlog(
-                "searchMangaRequest filter branch=$branch page=$page " +
-                    "weekdayState=${weekdayFilter?.state ?: 0} weekday=$weekdayValue sort=$sortValue " +
-                    "themeState=$themeState theme=${themeTag?.name.orEmpty()}/$themeValue " +
-                    "migrateState=$migrateState migrate=${migrateTag?.name.orEmpty()}/$migrateValue " +
+                "searchMangaRequest filter branch=$branch activeGroup=$activeGroup page=$page " +
+                    "changed(update=$updateChanged, theme=$themeChanged, migrate=$migrateChanged) " +
+                    "weekdayState=$weekdayState/$prevWeekdayState weekday=$weekdayValue sort=$sortValue " +
+                    "themeState=$themeState/$prevThemeState theme=${themeTag?.name.orEmpty()}/$themeValue " +
+                    "migrateState=$migrateState/$prevMigrateState migrate=${migrateTag?.name.orEmpty()}/$migrateValue " +
                     "url=${request.url}"
             )
             return request
         }
+
+        preferences.edit()
+            .putString(PREF_FILTER_WEEKDAY, weekdayValue)
+            .putString(PREF_FILTER_SORT, sortValue)
+            .putString(PREF_FILTER_THEME, themeValue)
+            .apply()
 
         // 有 query 时走关键词搜索（原有逻辑）
         if (isMixedMode() && page == 1) {
@@ -845,6 +894,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val url = response.request.url.toString()
         dlog("searchMangaParse url=$url contentType=${response.header("Content-Type").orEmpty()}")
         return when {
+            url.contains("mihonRecentEmpty=1") -> {
+                dlog("searchMangaParse MY_MANGA_EMPTY url=$url")
+                response.close()
+                MangasPage(emptyList(), false)
+            }
             url.contains("/home/recentSeeing") || url.contains("/getTodaysWebtoon") -> parseRecentSeeing(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
@@ -1283,8 +1337,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
 
     private fun hasNewBadge(element: Element): Boolean {
-        return element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null ||
-            Regex("""\bNEW\b""", RegexOption.IGNORE_CASE).containsMatchIn(element.text())
+        // 只认卡片自己的 class / 图标，不因为页面文字包含 NEW 就误判。
+        return element.selectFirst(".ico_new_cn, [class*=ico_new], img[src*=icon_new]") != null
     }
 
     private fun genreCodeFromUrl(url: String): String? {
@@ -1322,15 +1376,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (titleNo.isNullOrBlank()) return
         if (isNew || !newTitleCache.containsKey(titleNo)) {
             newTitleCache[titleNo] = isNew
+            dlog("cacheNewTitle titleNo=$titleNo isNew=$isNew")
         }
     }
 
     private fun isNewTitleDetail(url: String, html: String): Boolean {
         val titleNo = titleNoFromUrl(url)
-        if (titleNo != null && newTitleCache[titleNo] == true) return true
 
-        // 只认当前作品自己的字段。不要因为页面里加载了“新”图标静态资源就给所有作品打“新”。
-        return Regex("""["']?newTitle["']?\s*[:=]\s*true""").containsMatchIn(html)
+        // 只认列表/JSON 已经为“当前 titleNo”确认过的 newTitle / 当前卡片 NEW 图标。
+        // 不扫描整个详情页 html，也不认 source=mweb...，因为 source/pageModel 只是来源埋点，不能代表作品是新作。
+        return titleNo != null && newTitleCache[titleNo] == true
     }
 
     private fun joinNonBlank(vararg parts: String): String {
@@ -1359,6 +1414,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
         internal const val PREF_FILTER_SORT = "pref_filter_sort"
         internal const val PREF_FILTER_THEME = "pref_filter_theme"
+        internal const val PREF_FILTER_ACTIVE_GROUP = "pref_filter_active_group"
+        internal const val PREF_FILTER_WEEKDAY_STATE = "pref_filter_weekday_state"
+        internal const val PREF_FILTER_SORT_STATE = "pref_filter_sort_state"
+        internal const val PREF_FILTER_THEME_STATE = "pref_filter_theme_state"
+        internal const val PREF_FILTER_MIGRATE_STATE = "pref_filter_migrate_state"
         internal const val KEY_NEO_SES = "neo_ses"
         internal const val KEY_NEO_CHK = "neo_chk"
 
