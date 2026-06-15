@@ -1150,12 +1150,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
-        val finalUrl = baseUrl + manga.url
-        dlog("mangaDetailsRequest title=${manga.title} manga.url=${manga.url} finalUrl=$finalUrl")
+        val cleanPath = cleanMangaDetailPath(manga.url)
+        val finalUrl = baseUrl + cleanPath
+        dlog(
+            "mangaDetailsRequest title=${manga.title} manga.url=${manga.url} " +
+                "cleanPath=$cleanPath finalUrl=$finalUrl"
+        )
         return GET(finalUrl, reqHeaders)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
+        val parseStartedAt = System.currentTimeMillis()
+        val networkMs = response.receivedResponseAtMillis - response.sentRequestAtMillis
         val document = response.asJsoup()
         val detailDiv = document.selectFirst("div.detail_info")
         return SManga.create().apply {
@@ -1184,7 +1190,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             dlog(
                 "mangaDetailsParse url=${response.request.url} title=$title " +
-                    "genreBase=$genreBase updateTag=$updateTag newTag=$newTag genre=$genre status=$status"
+                    "genreBase=$genreBase updateTag=$updateTag newTag=$newTag genre=$genre status=$status " +
+                    "networkMs=$networkMs parseMs=${System.currentTimeMillis() - parseStartedAt}"
             )
         }
     }
@@ -1197,8 +1204,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun chapterListRequest(manga: SManga): Request {
         val reqHeaders = headersBuilder().build()
-        val finalUrl = baseUrl + manga.url
-        dlog("chapterListRequest title=${manga.title} manga.url=${manga.url} finalUrl=$finalUrl")
+        val cleanPath = cleanMangaDetailPath(manga.url)
+        val finalUrl = baseUrl + cleanPath
+        dlog(
+            "chapterListRequest title=${manga.title} manga.url=${manga.url} " +
+                "cleanPath=$cleanPath finalUrl=$finalUrl"
+        )
         return GET(finalUrl, reqHeaders)
     }
 
@@ -1355,17 +1366,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
-        val titleNo = titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val cleanPath = cleanMangaDetailPath(href)
+        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
-        setUrlWithoutDomain(href)
+        url = cleanPath
         title = element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
         )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
         thumbnail_url = extractThumbnailUrl(element)
         dlog(
-            "mangaFromElement rawHref=$rawHref absHref=$href storedUrl=$url " +
+            "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
                 "titleNo=$titleNo hasNew=$hasNew title=$title"
         )
     }
@@ -1373,10 +1385,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
-        setUrlWithoutDomain(href)
+        val cleanPath = cleanMangaDetailPath(href)
+        url = cleanPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
-        dlog("searchMangaFromElement rawHref=$rawHref absHref=$href storedUrl=$url title=$title")
+        dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url title=$title")
     }
 
 
@@ -1398,6 +1411,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .removePrefix("https://m.dongmanmanhua.cn")
             .removePrefix("http://m.dongmanmanhua.cn")
             .ifEmpty { rawUrl }
+    }
+
+    private fun cleanMangaDetailPath(rawUrl: String): String {
+        val path = normalizeMangaPath(rawUrl).trim()
+        val titleNo = titleNoFromUrl(path) ?: return path
+            .substringBefore("&source")
+            .substringBefore("&pageModel")
+            .substringBefore("?source")
+            .substringBefore("?pageModel")
+
+        val basePath = path.substringBefore("?")
+        return if (basePath.endsWith("/episodeList") || basePath == "/episodeList") {
+            "/episodeList?titleNo=$titleNo"
+        } else {
+            "$basePath?title_no=$titleNo"
+        }
     }
 
     private fun buildThumbnailUrl(rawUrl: String, base: String = cdnBase): String {
