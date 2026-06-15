@@ -80,8 +80,7 @@ fun buildDongmanFilterList(): FilterList {
         ThemeFilter(),
         Filter.Separator(),
         Filter.Header("我的漫画"),
-        RecentMangaFilter(),
-        PurchasedMangaFilter(),
+        MyMangaFilter(),
     )
 }
 
@@ -104,6 +103,10 @@ class ThemeFilter : Filter.Select<String>(
     0,
 )
 
-class RecentMangaFilter : Filter.CheckBox("最近观看", false)
-
-class PurchasedMangaFilter : Filter.CheckBox("我的已购", false)
+class MyMangaFilter : Filter.Select<String>(
+    "我的漫画",
+    arrayOf("最近观看", "我的已购"),
+    0,
+) {
+    fun getSelectedValue(): String = if (state == 1) "purchased" else "recent"
+}
