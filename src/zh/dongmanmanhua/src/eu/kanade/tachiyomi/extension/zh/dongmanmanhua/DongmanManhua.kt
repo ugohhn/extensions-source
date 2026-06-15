@@ -785,10 +785,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 // 初次进入时，如果用户已经选了非占位项，就直接走对应分组。
                 // 只有所有分组都停在占位/默认状态时，才走“更新-今天”。
                 previous == null && myMangaValue.isNotEmpty() -> "migrate"
-                previous == null && themeValue.isNotEmpty() -> "theme"
+                // 题材的第 0 项是“全部”，它本身是有效项，但初次默认停在第 0 项时不能抢走“更新-今天”。
+                // 第一次选择非“全部”的题材，或之后从其他题材切回“全部”，都由下面的 themeChanged 处理。
+                previous == null && themeState != 0 -> "theme"
                 previous == null -> "update"
                 myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
-                themeChanged -> if (themeValue.isNotEmpty()) "theme" else "update"
+                themeChanged -> "theme"
                 updateChanged -> "update"
                 else -> prevActiveGroup
             }
@@ -1461,7 +1463,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun genreCodeFromUrl(url: String): String? {
         return getThemeFilter()
             .map { it.value }
-            .firstOrNull { it.isNotEmpty() && (url.contains("/$it/") || url.endsWith("/$it")) }
+            .firstOrNull { it.isNotEmpty() && it != "ALL" && (url.contains("/$it/") || url.endsWith("/$it")) }
     }
 
 
@@ -1480,7 +1482,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isGenrePageUrl(url: String): Boolean {
         return getThemeFilter().any { tag ->
-            tag.value.isNotEmpty() && (url.contains("/${tag.value}/") || url.endsWith("/${tag.value}"))
+            tag.value.isNotEmpty() && tag.value != "ALL" &&
+                (url.contains("/${tag.value}/") || url.endsWith("/${tag.value}"))
         }
     }
 
