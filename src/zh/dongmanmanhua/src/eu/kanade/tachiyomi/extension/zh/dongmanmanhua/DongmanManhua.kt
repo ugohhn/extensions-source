@@ -765,8 +765,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         val myMangaFilter = filters.firstOrNull { it is MyMangaFilter } as? MyMangaFilter
         val myMangaState = myMangaFilter?.state ?: 0
-        val myMangaValue = myMangaFilter?.getSelectedValue().orEmpty().ifEmpty { "recent" }
-        val myMangaName = if (myMangaValue == "purchased") "我的已购" else "最近观看"
+        val myMangaValue = myMangaFilter?.getSelectedValue().orEmpty()
+        val myMangaName = when (myMangaValue) {
+            "recent" -> "最近观看"
+            "purchased" -> "我的已购"
+            else -> "不使用我的漫画"
+        }
 
         if (query.isBlank()) {
             val previous = lastFilterSnapshot
@@ -778,11 +782,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
             val activeGroup = when {
-                // 初次进入时固定默认入口为“更新-今天”。
-                // 否则 MyMangaFilter 的第 0 项“最近观看”会在没被点击时自动抢入口。
+                // 初次进入时，如果用户已经选了非占位项，就直接走对应分组。
+                // 只有所有分组都停在占位/默认状态时，才走“更新-今天”。
+                previous == null && myMangaValue.isNotEmpty() -> "migrate"
+                previous == null && themeValue.isNotEmpty() -> "theme"
                 previous == null -> "update"
-                myMangaChanged -> "migrate"
-                themeChanged -> "theme"
+                myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
+                themeChanged -> if (themeValue.isNotEmpty()) "theme" else "update"
                 updateChanged -> "update"
                 else -> prevActiveGroup
             }
@@ -814,16 +820,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 }
                 "theme" -> {
-                    if (themeValue.isNotEmpty()) {
-                        branch = "theme"
-                        // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
-                        val url = "$baseUrl/$themeValue/"
-                        request = GET(url, headersBuilder().build())
-                    } else {
+                    if (themeValue == "ALL") {
                         branch = "theme-all"
                         // “全部”应该使用分类页壳，然后把所有题材分区拼在一起；不要请求热门首页。
                         // /LOVE/ 返回的是完整分类页 HTML，包含 genreList 和全部题材分区。
                         val url = "$baseUrl/LOVE/?mihonThemeAll=1"
+                        request = GET(url, headersBuilder().build())
+                    } else {
+                        branch = "theme"
+                        // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
+                        val url = "$baseUrl/$themeValue/"
                         request = GET(url, headersBuilder().build())
                     }
                 }
@@ -1038,7 +1044,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val genreItems = document.select("a.genrePageContentItem")
         val allThemeLinkSelector = getThemeFilter()
             .map { it.value }
-            .filter { it.isNotEmpty() }
+            .filter { it.isNotEmpty() && it != "ALL" }
             .joinToString(", ") { code ->
                 "a[href*='/$code/'][href*='title_no']"
             }
