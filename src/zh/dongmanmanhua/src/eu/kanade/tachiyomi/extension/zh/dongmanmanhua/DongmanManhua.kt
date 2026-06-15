@@ -669,6 +669,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 chain.proceed(request)
             }
         }
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val detailCacheKey = detailHtmlCacheKey(request)
+            if (detailCacheKey == null) {
+                chain.proceed(request)
+            } else {
+                executeDetailHtmlRequestWithCache(detailCacheKey, request, chain)
+            }
+        }
         .addNetworkInterceptor { chain ->
             val request = chain.request()
             val startedAt = System.currentTimeMillis()
@@ -776,6 +785,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var dailyScheduleDocCache: org.jsoup.nodes.Document? = null
     private var dailyScheduleDocCacheTime: Long = 0L
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
+
+    private data class DetailHtmlCache(
+        val titleNo: String,
+        val createdAt: Long,
+        val body: String,
+        val contentType: String,
+    )
+
+    private data class DetailHtmlInflightState(
+        var completed: Boolean = false,
+        var failed: Boolean = false,
+    )
+
+    private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
+    private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
+    private val detailHtmlCacheTtlMs = 2 * 60 * 1000L
+    private val detailHtmlInflightWaitMs = 12 * 1000L
+    private val detailHtmlCacheMaxEntries = 24
 
     private data class CachedMangaItem(
         val url: String,
@@ -1144,6 +1171,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val groupedElements = allWeekElements.groupBy { it.attr("data-week").trim() }.filterKeys { it.isNotEmpty() }
 
         groupedElements.forEach { (week, elements) ->
+            if (week == "COMPLETE" && weekday != "COMPLETE") {
+                dlog("parseDailyScheduleHtml skipCompleteCache sort=$sort requestedWeekday=$weekday raw=${elements.size}")
+                return@forEach
+            }
             val items = elements
                 .map(::cachedMangaItemFromElement)
                 .distinctBy { it.url }
@@ -1810,6 +1841,136 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+
+    private fun detailHtmlCacheKey(request: Request): String? {
+        val url = request.url
+        if (url.encodedPath != "/episodeList") return null
+        val titleNo = url.queryParameter("titleNo")?.trim().orEmpty()
+        return titleNo.takeIf { it.isNotEmpty() }
+    }
+
+    private fun getValidDetailHtmlCache(titleNo: String): DetailHtmlCache? {
+        if (titleNo.isBlank()) return null
+        val now = System.currentTimeMillis()
+        return synchronized(detailHtmlCache) {
+            val cache = detailHtmlCache[titleNo] ?: return@synchronized null
+            if (now - cache.createdAt <= detailHtmlCacheTtlMs) {
+                cache
+            } else {
+                detailHtmlCache.remove(titleNo)
+                null
+            }
+        }
+    }
+
+    private fun putDetailHtmlCache(titleNo: String, body: String, contentType: String) {
+        if (titleNo.isBlank() || body.isBlank()) return
+        synchronized(detailHtmlCache) {
+            detailHtmlCache[titleNo] = DetailHtmlCache(titleNo, System.currentTimeMillis(), body, contentType)
+            while (detailHtmlCache.size > detailHtmlCacheMaxEntries) {
+                val firstKey = detailHtmlCache.keys.firstOrNull() ?: break
+                detailHtmlCache.remove(firstKey)
+            }
+        }
+        dlog("detailHtmlCachePut titleNo=$titleNo bytes=${body.length}")
+    }
+
+    private fun cachedDetailHtmlResponse(request: Request, cache: DetailHtmlCache): Response {
+        val mediaType = cache.contentType.ifBlank { "text/html;charset=UTF-8" }.toMediaType()
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .headers(Headers.Builder().set("Content-Type", cache.contentType.ifBlank { "text/html;charset=UTF-8" }).build())
+            .body(cache.body.toResponseBody(mediaType))
+            .build()
+    }
+
+    private fun executeDetailHtmlRequestWithCache(
+        titleNo: String,
+        request: Request,
+        chain: okhttp3.Interceptor.Chain,
+    ): Response {
+        getValidDetailHtmlCache(titleNo)?.let { cache ->
+            dlog("detailHtmlCacheHit titleNo=$titleNo age=${System.currentTimeMillis() - cache.createdAt}ms url=${request.url}")
+            return cachedDetailHtmlResponse(request, cache)
+        }
+
+        val state: DetailHtmlInflightState
+        val isOwner: Boolean
+        synchronized(detailHtmlInflight) {
+            val existing = detailHtmlInflight[titleNo]
+            if (existing == null) {
+                state = DetailHtmlInflightState()
+                detailHtmlInflight[titleNo] = state
+                isOwner = true
+            } else {
+                state = existing
+                isOwner = false
+            }
+        }
+
+        if (!isOwner) {
+            val startedAt = System.currentTimeMillis()
+            var ownerCompleted = false
+            var ownerFailed = false
+            synchronized(state) {
+                while (true) {
+                    if (getValidDetailHtmlCache(titleNo) != null) break
+                    if (state.completed) {
+                        ownerCompleted = true
+                        ownerFailed = state.failed
+                        break
+                    }
+                    val elapsed = System.currentTimeMillis() - startedAt
+                    val remaining = detailHtmlInflightWaitMs - elapsed
+                    if (remaining <= 0) break
+                    runCatching { state.wait(remaining.coerceAtMost(1000L)) }
+                }
+            }
+            getValidDetailHtmlCache(titleNo)?.let { cache ->
+                dlog("detailHtmlInflightJoined titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                return cachedDetailHtmlResponse(request, cache)
+            }
+            if (ownerCompleted) {
+                val status = if (ownerFailed) "ownerFailed" else "ownerCompletedNoCache"
+                wlog("detailHtmlInflightFallback titleNo=$titleNo status=$status waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+            } else {
+                wlog("detailHtmlInflightTimeout titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+            }
+            return chain.proceed(request)
+        }
+
+        var ownerFailed = false
+        try {
+            val response = chain.proceed(request)
+            val contentType = response.body.contentType()?.toString().orEmpty().ifBlank { "text/html;charset=UTF-8" }
+            val bodyString = response.body.string()
+            val cacheable = response.isSuccessful && bodyString.isNotBlank()
+            if (cacheable) {
+                putDetailHtmlCache(titleNo, bodyString, contentType)
+            } else {
+                ownerFailed = true
+                wlog("detailHtmlOwnerNoCache titleNo=$titleNo code=${response.code} bytes=${bodyString.length} url=${request.url}")
+            }
+            return response.newBuilder()
+                .body(bodyString.toResponseBody(contentType.toMediaType()))
+                .build()
+        } catch (e: Exception) {
+            ownerFailed = true
+            throw e
+        } finally {
+            synchronized(state) {
+                state.completed = true
+                state.failed = ownerFailed
+                state.notifyAll()
+            }
+            synchronized(detailHtmlInflight) {
+                if (detailHtmlInflight[titleNo] === state) detailHtmlInflight.remove(titleNo)
+            }
+        }
+    }
 
     private fun normalizeAbsoluteUrl(rawUrl: String): String {
         val url = rawUrl.trim()
