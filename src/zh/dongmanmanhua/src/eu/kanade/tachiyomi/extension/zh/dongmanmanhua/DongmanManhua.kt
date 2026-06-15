@@ -733,6 +733,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val nextStartMap = mutableMapOf<String, Int>()
     private val newTitleCache = mutableMapOf<String, Boolean>()
     private val dailyScheduleNewCache = mutableMapOf<String, Boolean>()
+    private var dailyScheduleDocCache: org.jsoup.nodes.Document? = null
+    private var dailyScheduleDocCacheTime: Long = 0L
+    private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
 
     private data class FilterSnapshot(
         val weekdayState: Int,
@@ -742,7 +745,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val activeGroup: String,
     )
 
-    private var lastFilterSnapshot: FilterSnapshot? = null
+    private var _lastFilterSnapshot: FilterSnapshot? = null
+
+    private fun loadOrGetLastSnapshot(): FilterSnapshot? {
+        _lastFilterSnapshot?.let { return it }
+        val activeGroup = preferences.getString(PREF_FILTER_ACTIVE_GROUP, null) ?: return null
+        return FilterSnapshot(
+            weekdayState = preferences.getInt(PREF_FILTER_WEEKDAY_STATE, 0),
+            sortState = preferences.getInt(PREF_FILTER_SORT_STATE, 0),
+            themeState = preferences.getInt(PREF_FILTER_THEME_STATE, 0),
+            myMangaState = preferences.getInt(PREF_FILTER_MY_MANGA_STATE, 0),
+            activeGroup = activeGroup,
+        ).also { _lastFilterSnapshot = it }
+    }
 
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
@@ -773,7 +788,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         if (query.isBlank()) {
-            val previous = lastFilterSnapshot
+            val previous = loadOrGetLastSnapshot()
             val prevActiveGroup = previous?.activeGroup ?: "update"
 
             val updateChanged = previous != null &&
@@ -782,16 +797,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val myMangaChanged = previous != null && myMangaState != previous.myMangaState
 
             val activeGroup = when {
-                // 初次进入时，如果用户已经选了非占位项，就直接走对应分组。
-                // 只有所有分组都停在占位/默认状态时，才走“更新-今天”。
-                previous == null && myMangaValue.isNotEmpty() -> "migrate"
-                // 题材的第 0 项是“全部”，它本身是有效项，但初次默认停在第 0 项时不能抢走“更新-今天”。
-                // 第一次选择非“全部”的题材，或之后从其他题材切回“全部”，都由下面的 themeChanged 处理。
-                previous == null && themeState != 0 -> "theme"
+                // 持久化快照后，previous == null 只代表从未保存过筛选快照。
+                // 此时默认回到更新入口，避免第 0 项默认值抢走更新列表。
                 previous == null -> "update"
+                // 我的漫画有变化：选了某项就走 migrate，切回“不使用”就回到更新。
                 myMangaChanged -> if (myMangaValue.isNotEmpty()) "migrate" else "update"
+                // 题材有变化：包括切回“全部”，都先走 theme，由 theme 分支处理“全部”。
                 themeChanged -> "theme"
+                // 更新星期或排序变化，只影响更新入口。
                 updateChanged -> "update"
+                // 翻页或刷新没有状态变化时，沿用上次入口。
                 else -> prevActiveGroup
             }
 
@@ -822,12 +837,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 }
                 "theme" -> {
-                    if (themeValue == "ALL") {
-                        branch = "theme-all"
-                        // “全部”应该使用分类页壳，然后把所有题材分区拼在一起；不要请求热门首页。
-                        // /LOVE/ 返回的是完整分类页 HTML，包含 genreList 和全部题材分区。
-                        val url = "$baseUrl/LOVE/?mihonThemeAll=1"
-                        request = GET(url, headersBuilder().build())
+                    if (themeValue.isEmpty() || themeValue == "ALL") {
+                        branch = "theme-all-as-update"
+                        // 网站没有确认过稳定的“题材全部”统一接口。
+                        // 选“全部”只表示不限制题材，不再用 /LOVE/ 拼首页/推荐链接冒充全部。
+                        request = GET(updateUrl, headersBuilder().build())
                     } else {
                         branch = "theme"
                         // 题材不读取“排序”控件，不拼 sortOrder。排序只属于更新。
@@ -841,7 +855,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
 
-            lastFilterSnapshot = FilterSnapshot(
+            _lastFilterSnapshot = FilterSnapshot(
                 weekdayState = weekdayState,
                 sortState = sortState,
                 themeState = themeState,
@@ -903,13 +917,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val url = response.request.url.toString()
         dlog("searchMangaParse url=$url contentType=${response.header("Content-Type").orEmpty()}")
         return when {
-            url.contains("mihonMyMangaEmpty=1") -> {
-                dlog("searchMangaParse MY_MANGA_EMPTY url=$url")
-                response.close()
-                MangasPage(emptyList(), false)
-            }
             url.contains("/recent/more") -> parseRecentMangaPage(response)
-            url.contains("/home/recentSeeing") || url.contains("/getTodaysWebtoon") -> parseRecentSeeing(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
             url.contains("/dailySchedule") || url.endsWith("/new") || url.contains("/new?") -> latestUpdatesParse(response)
@@ -917,27 +925,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             isGenrePageUrl(url) || url.contains("/list") -> parseMangaListHtml(response)
             else -> parseSearchHtml(response)
         }
-    }
-
-    private fun parseRecentSeeing(response: Response): MangasPage {
-        val body = response.body.string().trim()
-        val entries = mutableListOf<SManga>()
-        val items = when {
-            body.startsWith("[") -> runCatching { org.json.JSONArray(body) }.getOrNull()
-            else -> {
-                val json = runCatching { JSONObject(body) }.getOrNull() ?: return MangasPage(emptyList(), false)
-                if (json.optInt("code", 200) != 200) return MangasPage(emptyList(), false)
-                val data = json.optJSONObject("data") ?: json
-                data.optJSONArray("recentlyViewed") ?: data.optJSONArray("list") ?: data.optJSONArray("titles")
-            }
-        } ?: return MangasPage(emptyList(), false)
-
-        for (i in 0 until items.length()) {
-            val item = items.getJSONObject(i)
-            val manga = mangaFromJsonTitle(item)
-            if (manga.title.isNotEmpty()) entries.add(manga)
-        }
-        return MangasPage(entries.distinctBy { it.url }, false)
     }
 
     private fun parseRecentMangaPage(response: Response): MangasPage {
@@ -1037,24 +1024,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun parseMangaListHtml(response: Response): MangasPage {
         val document = response.asJsoup()
         val requestUrl = response.request.url.toString()
-        val requestedGenre = if (requestUrl.contains("mihonThemeAll=1")) {
-            ""
-        } else {
-            preferences.getString(PREF_FILTER_THEME, "").orEmpty()
-                .ifEmpty { genreCodeFromUrl(requestUrl).orEmpty() }
-        }
+        val requestedGenre = preferences.getString(PREF_FILTER_THEME, "").orEmpty()
+            .ifEmpty { genreCodeFromUrl(requestUrl).orEmpty() }
+            .let { if (it == "ALL") "" else it }
         val genreItems = document.select("a.genrePageContentItem")
-        val allThemeLinkSelector = getThemeFilter()
-            .map { it.value }
-            .filter { it.isNotEmpty() && it != "ALL" }
-            .joinToString(", ") { code ->
-                "a[href*='/$code/'][href*='title_no']"
-            }
-        val allThemeLinks = if (allThemeLinkSelector.isNotEmpty()) {
-            document.select(allThemeLinkSelector)
-        } else {
-            org.jsoup.select.Elements()
-        }
         val genreIndex = if (requestedGenre.isNotEmpty()) {
             document.select("#genreList li").firstOrNull { li ->
                 li.attr("data-genre") == requestedGenre || li.attr("data-genre-seo") == requestedGenre
@@ -1062,10 +1035,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             null
         }
-        val elements = if (requestedGenre.isEmpty() && allThemeLinks.isNotEmpty()) {
-            // 题材“全部”不是回落到更新，也不是空结果；它等同于把首页里所有题材链接拼在一起。
-            allThemeLinks
-        } else if (genreItems.isNotEmpty()) {
+        val elements = if (genreItems.isNotEmpty()) {
             val sectionItems = genreIndex
                 ?.let { document.select("div._genreFlick div.flick-ct").getOrNull(it) }
                 ?.select("a.genrePageContentItem")
@@ -1091,10 +1061,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
         }
-        dlog(
-            "parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre " +
-                "allThemeLinkSelector=$allThemeLinkSelector"
-        )
+        dlog("parseMangaListHtml selectorDebug url=${response.request.url} requestedGenre=$requestedGenre")
         elements.take(30).forEachIndexed { index, item ->
             val rawHref = item.attr("href")
             val absHref = item.absUrl("href")
@@ -1121,7 +1088,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         dlog(
             "parseMangaListHtml url=${response.request.url} requestedGenre=$requestedGenre " +
-                "genreIndex=$genreIndex rawGenreItems=${genreItems.size} allThemeLinks=${allThemeLinks.size} " +
+                "genreIndex=$genreIndex rawGenreItems=${genreItems.size} " +
                 "selectedElements=${elements.size} entries=${entries.size}"
         )
         return MangasPage(entries, false)
@@ -1199,12 +1166,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
-            val updateTag = extractUpdateTag(document.html())
-            val newTag = if (isNewTitleDetail(response.request.url.toString(), updateTag)) "新" else ""
+            val html = document.html()
+            val updateTag = extractUpdateTag(html)
+            val serialStatus = extractSerialStatus(html)
+            val newTag = if (
+                serialStatus != "TERMINATION" &&
+                isNewTitleDetail(response.request.url.toString(), updateTag)
+            ) "新" else ""
             genre = joinNonBlank(genreBase, updateTag, newTag)
             description = detailDiv?.selectFirst("p.summary span.ellipsis")?.text()
                 ?: document.selectFirst("meta[property=og:description]")?.attr("content")
-            status = when (extractSerialStatus(document.html())) {
+            status = when (serialStatus) {
                 "SERIES" -> SManga.ONGOING
                 "TERMINATION" -> SManga.COMPLETED
                 "REST" -> SManga.ON_HIATUS
@@ -1525,26 +1497,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
         return runCatching {
-            val url = "$baseUrl/dailySchedule"
-            val startedAt = System.currentTimeMillis()
-            dlog("fetchNewTitleFromDailySchedule start titleNo=$titleNo url=$url")
-            val document = client.newCall(GET(url, headersBuilder().build())).execute().asJsoup()
+            val now = System.currentTimeMillis()
+            val document = if (
+                dailyScheduleDocCache != null &&
+                now - dailyScheduleDocCacheTime < dailyScheduleDocCacheTtlMs
+            ) {
+                dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo using cached dailySchedule")
+                dailyScheduleDocCache!!
+            } else {
+                val url = "$baseUrl/dailySchedule"
+                val startedAt = now
+                val doc = client.newCall(GET(url, headersBuilder().build())).execute().asJsoup()
+                dailyScheduleDocCache = doc
+                dailyScheduleDocCacheTime = System.currentTimeMillis()
+                dlog("fetchNewTitleFromDailySchedule fetched fresh elapsed=${System.currentTimeMillis() - startedAt}ms")
+                doc
+            }
+
             val element = document.selectFirst("li#title_li_$titleNo, li[data-title-no=$titleNo]")
                 ?: run {
-                    val elapsed = System.currentTimeMillis() - startedAt
                     dailyScheduleNewCache[titleNo] = false
-                    dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false isNew=false elapsed=${elapsed}ms")
+                    dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false completed-or-not-in-schedule")
                     return@runCatching null
                 }
 
             val isNew = hasNewBadge(element)
             dailyScheduleNewCache[titleNo] = isNew
             if (isNew) cacheNewTitle(titleNo, true)
-            val elapsed = System.currentTimeMillis() - startedAt
-            dlog(
-                "fetchNewTitleFromDailySchedule titleNo=$titleNo found=true " +
-                    "isNew=$isNew elapsed=${elapsed}ms href=${element.selectFirst("a")?.attr("href").orEmpty()}"
-            )
+            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=true isNew=$isNew")
             isNew
         }.getOrElse { e ->
             wlog("fetchNewTitleFromDailySchedule failed titleNo=$titleNo", e)
