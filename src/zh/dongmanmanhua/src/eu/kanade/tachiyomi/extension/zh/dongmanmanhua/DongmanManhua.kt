@@ -656,7 +656,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         .cookieJar(CookieJar.NO_COOKIES)
         .addInterceptor { chain ->
             val request = chain.request()
-            if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH) {
+            if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH) {
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
@@ -723,32 +723,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         if (weekday == "NEW" || response.request.url.encodedPath == "/new") {
             val document = response.asJsoup()
-            val entries = document.select(".new_works_items").mapNotNull { item ->
-                val rawHref = item.attr("href")
-                val href = item.absUrl("href").ifEmpty { rawHref }
-                val cleanPath = cleanMangaDetailPath(href)
-                val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href)
-                // /new 是“新作”入口，但不能把入口/来源参数直接当成作品 newTitle。
-                // 只认当前卡片自身的 NEW 图标；JSON 接口另走 newTitle 字段。
-                val isNew = hasNewBadge(item)
-                cacheNewTitle(titleNo, isNew)
-                if (VERBOSE_LIST_LOG || entriesNewProbeShouldLog()) {
-                    dlog(
-                        "latestUpdatesParse NEW probe titleNo=$titleNo isNewBadge=$isNew " +
-                            "hasIcoNewCn=${item.selectFirst(".ico_new_cn") != null} " +
-                            "hasClassIcoNew=${item.selectFirst("[class*=ico_new]") != null} " +
-                            "hasClassIconNew=${item.selectFirst("[class*=icon_new]") != null} " +
-                            "hasImgIconNew=${item.selectFirst("img[src*=icon_new], img[src*=ico_new]") != null} " +
-                            "class=${item.className()} href=$href cleanPath=$cleanPath"
-                    )
+            val cachedItems = document.select(".new_works_items")
+                .mapNotNull { item ->
+                    val cached = cachedMangaItemFromElement(item)
+                    if (cached.title.isBlank()) return@mapNotNull null
+                    if (entriesNewProbeShouldLog()) {
+                        val rawHref = item.attr("href")
+                        val href = item.absUrl("href").ifEmpty { rawHref }
+                        dlog(
+                            "latestUpdatesParse NEW probe titleNo=${cached.titleNo} isNewBadge=${cached.hasNew} " +
+                                "hasIcoNewCn=${item.selectFirst(".ico_new_cn") != null} " +
+                                "hasClassIcoNew=${item.selectFirst("[class*=ico_new]") != null} " +
+                                "hasClassIconNew=${item.selectFirst("[class*=icon_new]") != null} " +
+                                "hasImgIconNew=${item.selectFirst("img[src*=icon_new], img[src*=ico_new]") != null} " +
+                                "class=${item.className()} href=$href cleanPath=${cached.url}"
+                        )
+                    }
+                    cached
                 }
-                SManga.create().apply {
-                    url = cleanPath
-                    title = item.selectFirst(".works_tit")?.text() ?: return@mapNotNull null
-                    thumbnail_url = item.selectFirst(".works_img_area img")?.absUrl("src") ?: ""
-                }
-            }.filter { it.title.isNotEmpty() }
-            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size}")
+                .distinctBy { it.url }
+            putUpdatePageCache(updateCacheKey("NEW", ""), cachedItems)
+            val entries = cachedItems.map(::mangaFromCachedItem)
+            val newCount = cachedItems.count { it.hasNew }
+            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount cacheWrite=true")
             return MangasPage(entries, false)
         }
 
@@ -780,7 +777,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val items: List<CachedMangaItem>,
     )
 
+    private data class UpdatePageCache(
+        val key: String,
+        val createdAt: Long,
+        val items: List<CachedMangaItem>,
+    )
+
     private val genrePageCache = mutableMapOf<String, GenrePageCache>()
+    private val updatePageCache = LinkedHashMap<String, UpdatePageCache>()
 
     private data class FilterSnapshot(
         val weekdayState: Int,
@@ -911,8 +915,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                 }
                 else -> {
-                    branch = if (weekdayValue.isNotEmpty()) "update-explicit" else "update-default"
-                    request = GET(updateUrl, headersBuilder().build())
+                    val updateKey = updateCacheKey(weekdayValue, sortValue)
+                    val useCachedUpdatePage = getValidUpdatePageCache(updateKey) != null
+                    branch = when {
+                        useCachedUpdatePage && weekdayValue == "NEW" -> "new-cache"
+                        useCachedUpdatePage && weekdayValue == "COMPLETE" -> "update-complete-cache"
+                        useCachedUpdatePage -> "daily-cache"
+                        weekdayValue == "NEW" -> "new"
+                        weekdayValue == "COMPLETE" -> "update-complete"
+                        weekdayValue.isNotEmpty() -> "update-explicit"
+                        else -> "update-default"
+                    }
+                    val url = if (useCachedUpdatePage) {
+                        "$baseUrl$LOCAL_UPDATE_CACHE_PATH?weekday=${updateCacheWeekday(weekdayValue)}&sort=$sortValue&mihonPage=$page"
+                    } else {
+                        updateUrl
+                    }
+                    request = GET(url, headersBuilder().build())
                 }
             }
 
@@ -979,6 +998,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog("searchMangaParse url=$url contentType=${response.header("Content-Type").orEmpty()}")
         return when {
             response.request.url.encodedPath == LOCAL_GENRE_CACHE_PATH -> parseCachedGenrePage(response)
+            response.request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH -> parseCachedUpdatePage(response)
             url.contains("/recent/more") -> parseRecentMangaPage(response)
             url.contains("/episode/unlock/titleList") -> parsePurchasedTitles(response)
             url.contains("/searchResult") -> parseSearchResultJson(response)
@@ -1036,18 +1056,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun parseDailyScheduleHtml(response: Response): MangasPage {
         val document = response.asJsoup()
-        val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty().ifEmpty { currentWeekdayCode() }
+        val requestedWeekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
+        val weekday = updateCacheWeekday(requestedWeekday)
+        val sort = response.request.url.queryParameter("sortOrder") ?: preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty()
         val selector = "a.updatePage_lst_item[data-week=$weekday]"
-        val rawElements = document.select(selector)
-        val entries = rawElements
-            .map(::mangaFromElement)
-            .distinctBy { it.url }
-            .filter { it.title.isNotEmpty() }
+        val allWeekElements = document.select("a.updatePage_lst_item[data-week]")
+        val groupedElements = allWeekElements.groupBy { it.attr("data-week").trim() }.filterKeys { it.isNotEmpty() }
+
+        groupedElements.forEach { (week, elements) ->
+            val items = elements
+                .map(::cachedMangaItemFromElement)
+                .distinctBy { it.url }
+                .filter { it.title.isNotEmpty() }
+            putUpdatePageCache(updateCacheKey(week, sort), items)
+        }
+
+        val requestedItems = groupedElements[weekday]
+            ?.map(::cachedMangaItemFromElement)
+            ?.distinctBy { it.url }
+            ?.filter { it.title.isNotEmpty() }
+            ?: document.select(selector)
+                .map(::cachedMangaItemFromElement)
+                .distinctBy { it.url }
+                .filter { it.title.isNotEmpty() }
+                .also { putUpdatePageCache(updateCacheKey(weekday, sort), it) }
+
+        val entries = requestedItems.take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
+        val hasNextPage = requestedItems.size > UPDATE_PAGE_SIZE
+        val weekCounts = groupedElements.entries.joinToString(",") { "${it.key}=${it.value.size}" }
+        val newCount = requestedItems.count { it.hasNew }
         dlog(
-            "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday " +
-                "selector=$selector raw=${rawElements.size} entries=${entries.size}"
+            "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday sort=$sort " +
+                "selector=$selector grouped=${groupedElements.size} weekCounts=$weekCounts " +
+                "raw=${requestedItems.size} entries=${entries.size} newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true"
         )
-        return MangasPage(entries, false)
+        return MangasPage(entries, hasNextPage)
     }
 
     private fun mangaFromJsonTitle(item: org.json.JSONObject): SManga {
@@ -1193,6 +1236,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNextPage = cache.items.size > page * GENRE_PAGE_SIZE
         dlog(
             "parseCachedGenrePage genre=$genre page=$page cacheHit=true " +
+                "total=${cache.items.size} entries=${entries.size} hasNextPage=$hasNextPage"
+        )
+        return MangasPage(entries, hasNextPage)
+    }
+
+    private fun parseCachedUpdatePage(response: Response): MangasPage {
+        val weekday = response.request.url.queryParameter("weekday").orEmpty()
+        val sort = response.request.url.queryParameter("sort").orEmpty()
+        val page = response.request.url.queryParameter("mihonPage")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val key = updateCacheKey(weekday, sort)
+        val cache = getValidUpdatePageCache(key)
+        if (cache == null) {
+            dlog("parseCachedUpdatePage key=$key weekday=$weekday sort=$sort page=$page cacheHit=false")
+            return MangasPage(emptyList(), false)
+        }
+        val fromIndex = (page - 1) * UPDATE_PAGE_SIZE
+        if (fromIndex >= cache.items.size) {
+            dlog("parseCachedUpdatePage key=$key page=$page cacheHit=true total=${cache.items.size} entries=0 hasNextPage=false")
+            return MangasPage(emptyList(), false)
+        }
+        val toIndex = minOf(fromIndex + UPDATE_PAGE_SIZE, cache.items.size)
+        val entries = cache.items.subList(fromIndex, toIndex).map(::mangaFromCachedItem)
+        val hasNextPage = toIndex < cache.items.size
+        dlog(
+            "parseCachedUpdatePage key=$key weekday=$weekday sort=$sort page=$page cacheHit=true " +
                 "total=${cache.items.size} entries=${entries.size} hasNextPage=$hasNextPage"
         )
         return MangasPage(entries, hasNextPage)
@@ -1467,6 +1535,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 元素解析（依赖 HttpSource 的 setUrlWithoutDomain）
     // ══════════════════════════════════════════════════════════════════════
 
+    private fun updateCacheWeekday(weekday: String): String {
+        return weekday.ifBlank { currentWeekdayCode() }
+    }
+
+    private fun updateCacheKey(weekday: String, sort: String): String {
+        val normalizedWeekday = updateCacheWeekday(weekday)
+        return if (normalizedWeekday == "NEW") "NEW" else "$normalizedWeekday|$sort"
+    }
+
+    private fun getValidUpdatePageCache(key: String): UpdatePageCache? {
+        if (key.isBlank()) return null
+        val now = System.currentTimeMillis()
+        return synchronized(updatePageCache) {
+            val cache = updatePageCache[key] ?: return@synchronized null
+            if (now - cache.createdAt <= UPDATE_PAGE_CACHE_TTL_MS) {
+                cache
+            } else {
+                updatePageCache.remove(key)
+                null
+            }
+        }
+    }
+
+    private fun putUpdatePageCache(key: String, items: List<CachedMangaItem>) {
+        if (key.isBlank() || items.isEmpty()) return
+        synchronized(updatePageCache) {
+            updatePageCache[key] = UpdatePageCache(key, System.currentTimeMillis(), items)
+            while (updatePageCache.size > UPDATE_PAGE_CACHE_MAX_ENTRIES) {
+                val firstKey = updatePageCache.keys.firstOrNull() ?: break
+                updatePageCache.remove(firstKey)
+            }
+        }
+        dlog("putUpdatePageCache key=$key total=${items.size}")
+    }
+
     private fun getValidGenrePageCache(genre: String): GenrePageCache? {
         if (genre.isBlank()) return null
         val now = System.currentTimeMillis()
@@ -1663,7 +1766,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (titleNo.isNullOrBlank()) return
         if (isNew) {
             newTitleCache[titleNo] = true
-            dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=true")
+            if (VERBOSE_LIST_LOG) {
+                dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=true")
+            }
         } else if (VERBOSE_LIST_LOG) {
             dlog("cacheNewTitle titleNo=$titleNo source=list-or-json isNew=false ignored")
         }
@@ -1737,8 +1842,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     companion object {
         private const val TAG = "DongmanManhua"
         private const val GENRE_PAGE_SIZE = 50
+        private const val UPDATE_PAGE_SIZE = 50
         private const val GENRE_PAGE_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
+        private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
+        private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
 
