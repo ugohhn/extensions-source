@@ -751,8 +751,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val key = System.identityHashCode(element)
                 if (seen.add(key)) {
                     element.attr("data-mihon-origin", origin)
-                    result += element
-                    added += element
+                    result.add(element)
+                    added.add(element)
                 }
             }
             logPopularModuleProbe(origin, added)
@@ -1930,7 +1930,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val genre = tag.value
                 if (genre.isBlank() || genre == "ALL") return@forEach
                 val items = genrePageCache[genre]?.items.orEmpty()
-                if (items.isNotEmpty()) result += items
+                if (items.isNotEmpty()) result.addAll(items)
             }
         }
         return result
