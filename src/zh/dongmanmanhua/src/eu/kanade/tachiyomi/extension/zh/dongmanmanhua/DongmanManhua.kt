@@ -455,12 +455,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
-        SwitchPreferenceCompat(ctx).apply {
-            key = PREF_POPULAR_BANNER_THUMBNAIL
-            title = "热门轮播图使用横幅图作封面"
-            summary = "关闭时，首页轮播图不使用横幅图作为漫画封面；若已缓存正常封面则复用正常封面"
-            setDefaultValue(false)
-        }.also(screen::addPreference)
 
         MultiSelectListPreference(ctx).apply {
             key = PREF_POPULAR_GENRE_ENABLED
@@ -741,6 +735,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun popularMangaRequest(page: Int): Request {
         probeIsLoginValid()
+        if (page == 1) {
+            resetFilterSessionState("popular-page1")
+        }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
 
@@ -801,7 +798,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun selectPopularMangaElements(rawElements: List<Element>): List<Element> {
-        val bannerEnabled = preferences.getBoolean(PREF_POPULAR_BANNER_THUMBNAIL, false)
         val groups = linkedMapOf<String, MutableList<Element>>()
         rawElements.forEach { element ->
             val key = popularElementIdentityKey(element)
@@ -809,24 +805,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             groups.getOrPut(key) { mutableListOf() }.add(element)
         }
 
-        var bannerOnlyEmptyThumbnail = 0
+        var bannerOnlyNoThumbnail = 0
         var preferredNonBanner = 0
         val selected = groups.values.mapNotNull { candidates ->
-            val chosen = choosePopularElement(candidates, bannerEnabled) ?: return@mapNotNull null
-            if (candidates.any { it.attr("data-mihon-origin") == "popular-banner" } &&
-                chosen.attr("data-mihon-origin") != "popular-banner"
-            ) {
+            val chosen = choosePopularElement(candidates) ?: return@mapNotNull null
+            val hasBanner = candidates.any { it.attr("data-mihon-origin") == "popular-banner" }
+            if (hasBanner && chosen.attr("data-mihon-origin") != "popular-banner") {
                 preferredNonBanner += 1
             }
-            if (!bannerEnabled && chosen.attr("data-mihon-origin") == "popular-banner") {
-                bannerOnlyEmptyThumbnail += 1
+            if (chosen.attr("data-mihon-origin") == "popular-banner") {
+                bannerOnlyNoThumbnail += 1
             }
             chosen
         }
 
         dlog(
-            "popularSelect bannerEnabled=$bannerEnabled raw=${rawElements.size} groups=${groups.size} " +
-                "selected=${selected.size} bannerOnlyEmptyThumbnail=$bannerOnlyEmptyThumbnail " +
+            "popularSelect bannerThumbnail=false raw=${rawElements.size} groups=${groups.size} " +
+                "selected=${selected.size} bannerOnlyNoThumbnail=$bannerOnlyNoThumbnail " +
                 "preferredNonBanner=$preferredNonBanner"
         )
         return selected
@@ -841,20 +836,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return cleanPath.ifBlank { href }
     }
 
-    private fun choosePopularElement(candidates: List<Element>, bannerEnabled: Boolean): Element? {
-        if (bannerEnabled) {
-            return candidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
-        }
+    private fun choosePopularElement(candidates: List<Element>): Element? {
         val nonBannerCandidates = candidates.filter { it.attr("data-mihon-origin") != "popular-banner" }
         return if (nonBannerCandidates.isNotEmpty()) {
-            nonBannerCandidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
+            nonBannerCandidates.maxByOrNull { popularElementScore(it) }
         } else {
-            // 不跳过纯轮播独占条目；保留条目本身，但 extractThumbnailUrl 会在开关关闭时返回空封面。
-            candidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
+            // 轮播独占条目保留漫画身份，但不写横幅图到 thumbnailUrl。
+            candidates.maxByOrNull { popularElementScore(it) }
         }
     }
 
-    private fun popularElementScore(element: Element, bannerEnabled: Boolean): Int {
+    private fun popularElementScore(element: Element): Int {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
@@ -867,7 +859,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-ranking" -> 90
             "popular-common-card" -> 80
             "popular-genre-category" -> 70
-            "popular-banner" -> if (bannerEnabled) 60 else -10_000
+            "popular-banner" -> 10
             else -> 10
         }
         return score
@@ -968,9 +960,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int): Request {
+        val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
+        val sort = preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty().ifBlank { "READ_COUNT" }
         val todayCode = currentWeekdayCode()
-        val url = "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=READ_COUNT"
-        dlog("latestUpdatesRequest defaultWeekday=$todayCode url=$url")
+        val url = when (weekday) {
+            "NEW" -> "$baseUrl/new"
+            "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sort"
+            "" -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sort"
+            else -> "$baseUrl/dailySchedule?weekday=$weekday&sortOrder=$sort"
+        }
+        dlog("latestUpdatesRequest sessionWeekday=${weekday.ifBlank { todayCode }} sort=$sort url=$url")
         return GET(url, headersBuilder().build())
     }
 
@@ -1139,6 +1138,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             myMangaState = preferences.getInt(PREF_FILTER_MY_MANGA_STATE, 0),
             activeGroup = activeGroup,
         ).also { cachedLastFilterSnapshot = it }
+    }
+
+    private fun resetFilterSessionState(reason: String) {
+        cachedLastFilterSnapshot = null
+        preferences.edit()
+            .remove(PREF_FILTER_WEEKDAY)
+            .remove(PREF_FILTER_SORT)
+            .remove(PREF_FILTER_THEME)
+            .remove(PREF_FILTER_ACTIVE_GROUP)
+            .remove(PREF_FILTER_WEEKDAY_STATE)
+            .remove(PREF_FILTER_SORT_STATE)
+            .remove(PREF_FILTER_THEME_STATE)
+            .remove(PREF_FILTER_MY_MANGA_STATE)
+            .putInt(PREF_FILTER_SCHEMA_VERSION, FILTER_SCHEMA_VERSION)
+            .apply()
+        dlog("filterSessionReset reason=$reason")
     }
 
     private fun dlog(message: String) = Log.d(TAG, message)
@@ -2849,7 +2864,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
-        if (origin == "popular-banner" && !preferences.getBoolean(PREF_POPULAR_BANNER_THUMBNAIL, false)) {
+        if (origin == "popular-banner") {
             return ""
         }
 
@@ -2858,13 +2873,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             ?: ""
-        if (rawUrl.isNotBlank()) {
+        if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) {
             return buildThumbnailUrl(rawUrl, cdnBase)
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
         val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
-        return buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
+        val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
+        return if (styleUrl.isNotBlank() && !styleUrl.contains("/banner/")) {
+            buildThumbnailUrl(styleUrl, cdnBase)
+        } else {
+            ""
+        }
     }
 
     private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
@@ -3030,7 +3050,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
-        internal const val PREF_POPULAR_BANNER_THUMBNAIL = "pref_popular_banner_thumbnail"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
