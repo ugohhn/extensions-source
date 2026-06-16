@@ -8,6 +8,7 @@ import android.webkit.CookieManager
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -454,6 +455,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_POPULAR_BANNER_THUMBNAIL
+            title = "热门轮播图使用横幅图作封面"
+            summary = "关闭时，首页轮播图不使用横幅图作为漫画封面；若已缓存正常封面则复用正常封面"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        MultiSelectListPreference(ctx).apply {
+            key = PREF_POPULAR_GENRE_ENABLED
+            title = "首页热门题材模块"
+            summary = "控制首页热门里的题材推荐块；默认排除悬疑、搞笑"
+            val tags = getThemeFilter().filter { it.value.isNotBlank() && it.value != "ALL" }
+            entries = tags.map { it.name }.toTypedArray()
+            entryValues = tags.map { it.value }.toTypedArray()
+            setDefaultValue(defaultPopularGenreValues())
+        }.also(screen::addPreference)
+
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -743,9 +761,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val result = mutableListOf<Element>()
         val seen = mutableSetOf<Int>()
 
-        fun addModule(origin: String, selector: String) {
+        fun addModule(origin: String, selector: String, includeElement: (Element) -> Boolean = { true }) {
             val items = document.select(selector)
                 .filter { it.attr("href").isNotBlank() }
+                .filter(includeElement)
             val added = mutableListOf<Element>()
             items.forEach { element ->
                 val key = System.identityHashCode(element)
@@ -771,7 +790,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-genre-category",
             ".homeGenreContent a.lst_item[href], .genre_content_c a.lst_item[href], " +
                 "a[data-sc-name=M_discover-page_genre-title-list-item][href]"
-        )
+        ) { isPopularGenreEnabled(it) }
         addModule(
             "popular-common-card",
             "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
@@ -798,6 +817,33 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val emptyTitle = elements.count { mangaTitleFromElement(it).isBlank() }
         dlog("popularModule origin=$origin count=${elements.size} clean=$clean episode=$episode emptyTitle=$emptyTitle")
+    }
+
+    private fun defaultPopularGenreValues(): Set<String> {
+        return getThemeFilter()
+            .map { it.value }
+            .filter { it.isNotBlank() && it != "ALL" && it != "COMEDY" && it != "SUSPENSE" }
+            .toSet()
+    }
+
+    private fun enabledPopularGenreValues(): Set<String> {
+        return preferences.getStringSet(PREF_POPULAR_GENRE_ENABLED, defaultPopularGenreValues())
+            ?.takeIf { it.isNotEmpty() }
+            ?: emptySet()
+    }
+
+    private fun isPopularGenreEnabled(element: Element): Boolean {
+        val genreName = element.parents()
+            .firstOrNull { it.hasClass("genre_content_c") }
+            ?.id()
+            ?.trim()
+            .orEmpty()
+        if (genreName.isBlank()) return true
+        val genreCode = getThemeFilter()
+            .firstOrNull { it.name == genreName || it.value == genreName }
+            ?.value
+            ?: genreName
+        return enabledPopularGenreValues().contains(genreCode)
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -870,6 +916,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
 
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
+    private val normalThumbnailUrlByTitleNo = mutableMapOf<String, String>()
+    private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
@@ -1302,6 +1350,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val groupedElements = allWeekElements.groupBy { it.attr("data-week").trim() }.filterKeys { it.isNotEmpty() }
 
         groupedElements.forEach { (week, elements) ->
+            rememberUpdateWeekdaysFromElements(week, elements)
             if (week == "COMPLETE" && weekday != "COMPLETE") {
                 dlog("parseDailyScheduleHtml skipCompleteCache sort=$sort requestedWeekday=$weekday raw=${elements.size}")
                 return@forEach
@@ -1626,6 +1675,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val networkMs = response.receivedResponseAtMillis - response.sentRequestAtMillis
         val document = response.asJsoup()
         val detailDiv = document.selectFirst("div.detail_info")
+        val titleNo = titleNoFromUrl(response.request.url.toString())
         return SManga.create().apply {
             title = detailDiv?.selectFirst("p.subj")?.text()
                 ?: document.selectFirst("h1.subj, h3.subj")?.text()
@@ -1633,9 +1683,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             author = detailDiv?.selectFirst("p.author")?.text()
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
+            val detailThumbnail = extractDetailThumbnailUrl(document)
+            if (detailThumbnail.isNotBlank()) {
+                thumbnail_url = detailThumbnail
+                rememberNormalThumbnail(titleNo, detailThumbnail, "detail")
+            }
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
-            val updateTag = extractUpdateTag(html)
+            val updateTag = extractUpdateTag(html, titleNo)
             val serialStatus = extractSerialStatus(html)
             val newTag = if (
                 serialStatus != "TERMINATION" &&
@@ -1951,7 +2006,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
-        val thumbnailUrl = extractThumbnailUrl(element)
+        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
@@ -2026,7 +2081,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         cacheNewTitle(titleNo, hasNew)
         url = identityPath
         title = mangaTitleFromElement(element)
-        thumbnail_url = extractThumbnailUrl(element)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog(
@@ -2048,7 +2103,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         url = identityPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
-        thumbnail_url = extractThumbnailUrl(element)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url titleNo=$titleNo title=$title")
@@ -2520,6 +2575,171 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun rememberNormalThumbnail(titleNo: String?, thumbnailUrl: String, source: String) {
+        if (titleNo.isNullOrBlank() || thumbnailUrl.isBlank()) return
+        if (thumbnailUrl.contains("/banner/")) return
+        synchronized(normalThumbnailUrlByTitleNo) {
+            normalThumbnailUrlByTitleNo[titleNo] = thumbnailUrl
+        }
+        if (VERBOSE_LIST_LOG) {
+            dlog("rememberNormalThumbnail titleNo=$titleNo source=$source url=$thumbnailUrl")
+        }
+    }
+
+    private fun normalThumbnailForTitleNo(titleNo: String?): String {
+        if (titleNo.isNullOrBlank()) return ""
+        return synchronized(normalThumbnailUrlByTitleNo) {
+            normalThumbnailUrlByTitleNo[titleNo].orEmpty()
+        }
+    }
+
+    private fun rememberUpdateWeekdaysFromElements(weekday: String, elements: List<Element>) {
+        val normalizedWeekday = normalizedWeekdayCode(weekday) ?: return
+        elements.forEach { element ->
+            val rawHref = element.attr("href")
+            val href = element.absUrl("href").ifEmpty { rawHref }
+            val cleanPath = cleanMangaDetailPath(href)
+            val titleNo = titleNoFromUrl(cleanPath)
+                ?: titleNoFromUrl(href)
+                ?: titleNoFromUrl(rawHref)
+                ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+                ?: scEventParameterValue(element, "recommended_titleNo")
+            if (titleNo.isNullOrBlank()) return@forEach
+            synchronized(updateWeekdaysByTitleNo) {
+                updateWeekdaysByTitleNo.getOrPut(titleNo) { linkedSetOf() }.add(normalizedWeekday)
+            }
+        }
+    }
+
+    private fun extractUpdateTag(html: String, titleNo: String? = null): String {
+        val fromText = extractUpdateTagFromText(html)
+        if (fromText.isNotBlank()) return fromText
+        val fromCache = updateTagFromScheduleCache(titleNo)
+        if (fromCache.isNotBlank()) return fromCache
+        return ""
+    }
+
+    private fun extractUpdateTagFromText(html: String): String {
+        val patterns = listOf(
+            Regex("""每周\s*([周星期礼拜一二三四五六日天、,，/和与及&\+至到~\-—\s]+?)\s*更新"""),
+            Regex("""在\s*([周星期礼拜一二三四五六日天、,，/和与及&\+至到~\-—\s]+?)\s*更新"""),
+            Regex("""周\s*([一二三四五六日天、,，/和与及&\+至到~\-—\s]+?)\s*更新"""),
+        )
+        patterns.forEach { pattern ->
+            val expression = pattern.find(html)?.groupValues?.getOrNull(1).orEmpty()
+            val weekdays = parseChineseWeekdayExpression(expression)
+            val tag = updateTagFromWeekdayCodes(weekdays)
+            if (tag.isNotBlank()) return tag
+        }
+        val englishDays = Regex("""\b(MONDAY|TUESDAY|WEDNESDAY|THURSDAY|FRIDAY|SATURDAY|SUNDAY)\b""")
+            .findAll(html)
+            .map { it.groupValues[1] }
+            .toSet()
+        if (englishDays.size in 1..5) {
+            return updateTagFromWeekdayCodes(englishDays)
+        }
+        return ""
+    }
+
+    private fun parseChineseWeekdayExpression(expression: String): Set<String> {
+        val normalized = expression.replace("周", "").replace("星期", "").replace("礼拜", "").replace("天", "日")
+        val range = Regex("""([一二三四五六日])\s*(?:至|到|~|-|—)\s*([一二三四五六日])""").find(normalized)
+        if (range != null) {
+            val start = chineseWeekdayToIndex(range.groupValues[1])
+            val end = chineseWeekdayToIndex(range.groupValues[2])
+            if (start != null && end != null && start <= end) {
+                return (start..end).mapNotNull { weekdayCodeByIndex(it) }.toSet()
+            }
+        }
+        return normalized.mapNotNull { chineseWeekdayToCode(it.toString()) }.toSet()
+    }
+
+    private fun updateTagFromScheduleCache(titleNo: String?): String {
+        if (titleNo.isNullOrBlank()) return ""
+        val weekdays = synchronized(updateWeekdaysByTitleNo) {
+            updateWeekdaysByTitleNo[titleNo]?.toSet().orEmpty()
+        }
+        val tag = updateTagFromWeekdayCodes(weekdays)
+        if (tag.isNotBlank()) {
+            dlog("updateTagFromScheduleCache titleNo=$titleNo weekdays=${weekdays.joinToString("|")} tag=$tag")
+        }
+        return tag
+    }
+
+    private fun updateTagFromWeekdayCodes(weekdays: Set<String>): String {
+        val indexes = weekdays.mapNotNull(::weekdayIndex).distinct().sorted()
+        if (indexes.isEmpty()) return ""
+        val label = if (indexes.size >= 3 && indexes.zipWithNext().all { (a, b) -> b == a + 1 }) {
+            "${weekdayCnByIndex(indexes.first())}至${weekdayCnByIndex(indexes.last())}"
+        } else {
+            indexes.joinToString("") { weekdayCnByIndex(it) }
+        }
+        return "每周${label}更新"
+    }
+
+    private fun normalizedWeekdayCode(weekday: String): String? {
+        return when (weekday.uppercase(Locale.ROOT)) {
+            "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY" -> weekday.uppercase(Locale.ROOT)
+            else -> null
+        }
+    }
+
+    private fun weekdayIndex(weekday: String): Int? {
+        return when (weekday.uppercase(Locale.ROOT)) {
+            "MONDAY" -> 1
+            "TUESDAY" -> 2
+            "WEDNESDAY" -> 3
+            "THURSDAY" -> 4
+            "FRIDAY" -> 5
+            "SATURDAY" -> 6
+            "SUNDAY" -> 7
+            else -> null
+        }
+    }
+
+    private fun weekdayCodeByIndex(index: Int): String? {
+        return when (index) {
+            1 -> "MONDAY"
+            2 -> "TUESDAY"
+            3 -> "WEDNESDAY"
+            4 -> "THURSDAY"
+            5 -> "FRIDAY"
+            6 -> "SATURDAY"
+            7 -> "SUNDAY"
+            else -> null
+        }
+    }
+
+    private fun weekdayCnByIndex(index: Int): String {
+        return when (index) {
+            1 -> "一"
+            2 -> "二"
+            3 -> "三"
+            4 -> "四"
+            5 -> "五"
+            6 -> "六"
+            7 -> "日"
+            else -> ""
+        }
+    }
+
+    private fun chineseWeekdayToIndex(value: String): Int? {
+        return weekdayIndex(chineseWeekdayToCode(value) ?: return null)
+    }
+
+    private fun chineseWeekdayToCode(value: String): String? {
+        return when (value) {
+            "一" -> "MONDAY"
+            "二" -> "TUESDAY"
+            "三" -> "WEDNESDAY"
+            "四" -> "THURSDAY"
+            "五" -> "FRIDAY"
+            "六" -> "SATURDAY"
+            "日", "天" -> "SUNDAY"
+            else -> null
+        }
+    }
+
     private fun buildThumbnailUrl(rawUrl: String, base: String = cdnBase): String {
         val url = rawUrl.trim()
         return when {
@@ -2531,19 +2751,44 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun extractThumbnailUrl(element: Element): String {
+    private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
+        if (origin == "popular-banner" && !preferences.getBoolean(PREF_POPULAR_BANNER_THUMBNAIL, false)) {
+            return normalThumbnailForTitleNo(titleNo)
+        }
+
         val img = element.selectFirst("img")
         val rawUrl = img?.attr("data-original")
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             ?: ""
         if (rawUrl.isNotBlank()) {
-            return buildThumbnailUrl(rawUrl, cdnBase)
+            val thumbnailUrl = buildThumbnailUrl(rawUrl, cdnBase)
+            rememberNormalThumbnail(titleNo, thumbnailUrl, origin)
+            return thumbnailUrl
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
         val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
-        return buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
+        val thumbnailUrl = buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
+        rememberNormalThumbnail(titleNo, thumbnailUrl, origin)
+        return thumbnailUrl
+    }
+
+    private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
+        val metaUrl = document.selectFirst("meta[property=og:image]")?.attr("content")
+            ?.ifBlank { document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty() }
+            .orEmpty()
+        if (metaUrl.isNotBlank()) return buildThumbnailUrl(metaUrl, cdnBase)
+
+        val img = document.selectFirst(
+            "div.detail_info img, .detail_info img, .detail_header img, .detail_img img, " +
+                ".detail_lst_thumb img, .pic img, img[src*=dongmanmanhua]"
+        )
+        val rawUrl = img?.attr("data-original")
+            ?.ifEmpty { img.attr("data-src") }
+            ?.ifEmpty { img.attr("src") }
+            .orEmpty()
+        return buildThumbnailUrl(rawUrl, cdnBase)
     }
 
 
@@ -2692,6 +2937,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
+        internal const val PREF_POPULAR_BANNER_THUMBNAIL = "pref_popular_banner_thumbnail"
+        internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
