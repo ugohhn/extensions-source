@@ -447,6 +447,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }.also(screen::addPreference)
 
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_LIST_INFLIGHT_COALESCE
+            title = "合并短时间重复刷新请求"
+            summary = "开启后，仅合并正在进行中的相同列表请求；第一页仍然真实请求，不使用旧缓存"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
@@ -673,6 +680,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         .addInterceptor { chain ->
             val request = chain.request()
+            val listKey = listInflightCoalesceKey(request)
+            if (listKey != null && getListInflightCoalesceEnable()) {
+                executeListRequestWithInflightCoalesce(listKey, request, chain)
+            } else {
+                chain.proceed(request)
+            }
+        }
+        .addInterceptor { chain ->
+            val request = chain.request()
             val detailCacheKey = detailHtmlCacheKey(request)
             if (detailCacheKey == null) {
                 chain.proceed(request)
@@ -807,11 +823,39 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val latch = CountDownLatch(1)
     }
 
+    private class ListInflightState(
+        val createdAt: Long = System.currentTimeMillis(),
+    ) {
+        @Volatile
+        var completed: Boolean = false
+
+        @Volatile
+        var failed: Boolean = false
+
+        @Volatile
+        var code: Int = 599
+
+        @Volatile
+        var message: String = ""
+
+        @Volatile
+        var headers: Headers = Headers.Builder().build()
+
+        @Volatile
+        var body: String? = null
+
+        val latch = CountDownLatch(1)
+    }
+
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
     private val detailHtmlCacheTtlMs = 2500L
     private val detailHtmlInflightWaitMs = 12 * 1000L
     private val detailHtmlCacheMaxEntries = 24
+
+    private val listInflight = mutableMapOf<String, ListInflightState>()
+    private val listInflightJoinWindowMs = 2500L
+    private val listInflightWaitMs = 8 * 1000L
 
     private data class CachedMangaItem(
         val url: String,
@@ -879,6 +923,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
 
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
+
+    private fun getListInflightCoalesceEnable(): Boolean = preferences.getBoolean(PREF_LIST_INFLIGHT_COALESCE, false)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
@@ -1851,6 +1897,105 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
 
+    private fun listInflightCoalesceKey(request: Request): String? {
+        if (request.method != "GET") return null
+        val url = request.url
+        if (url.host != "m.dongmanmanhua.cn") return null
+        val path = url.encodedPath
+        if (path == LOCAL_GENRE_CACHE_PATH || path == LOCAL_UPDATE_CACHE_PATH) return null
+        if (path == "/episodeList" || path.contains("/list")) return null
+        if (path.startsWith("/member/")) return null
+        return url.newBuilder()
+            .fragment(null)
+            .build()
+            .toString()
+    }
+
+    private fun listInflightResponse(request: Request, state: ListInflightState): Response? {
+        val bodyString = state.body ?: return null
+        val contentType = state.headers["Content-Type"].orEmpty().ifBlank { "text/html;charset=UTF-8" }
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(state.code)
+            .message(state.message.ifBlank { "OK" })
+            .headers(state.headers)
+            .body(bodyString.toResponseBody(contentType.toMediaType()))
+            .build()
+    }
+
+    private fun executeListRequestWithInflightCoalesce(
+        key: String,
+        request: Request,
+        chain: okhttp3.Interceptor.Chain,
+    ): Response {
+        val now = System.currentTimeMillis()
+        val state: ListInflightState
+        val isOwner: Boolean
+        synchronized(listInflight) {
+            val existing = listInflight[key]
+            if (existing != null && now - existing.createdAt <= listInflightJoinWindowMs) {
+                state = existing
+                isOwner = false
+            } else {
+                state = ListInflightState(now)
+                listInflight[key] = state
+                isOwner = true
+            }
+        }
+
+        if (!isOwner) {
+            val startedAt = System.currentTimeMillis()
+            val finished = runCatching {
+                state.latch.await(listInflightWaitMs, TimeUnit.MILLISECONDS)
+            }.getOrDefault(false)
+            listInflightResponse(request, state)?.let { response ->
+                dlog("listInflightJoined key=$key waited=${System.currentTimeMillis() - startedAt}ms code=${state.code}")
+                return response
+            }
+            if (finished && state.completed) {
+                val status = if (state.failed) "ownerFailed" else "ownerCompletedNoBody"
+                wlog("listInflightFallback key=$key status=$status waited=${System.currentTimeMillis() - startedAt}ms")
+            } else {
+                wlog("listInflightTimeout key=$key waited=${System.currentTimeMillis() - startedAt}ms")
+            }
+            return chain.proceed(request)
+        }
+
+        var ownerFailed = false
+        try {
+            val response = chain.proceed(request)
+            val contentType = response.body.contentType()?.toString().orEmpty()
+                .ifBlank { response.header("Content-Type").orEmpty().ifBlank { "text/html;charset=UTF-8" } }
+            val bodyString = response.body.string()
+            state.code = response.code
+            state.message = response.message
+            state.headers = response.headers.newBuilder()
+                .set("Content-Type", contentType)
+                .build()
+            state.body = bodyString
+            ownerFailed = !response.isSuccessful || bodyString.isBlank()
+            if (ownerFailed) {
+                wlog("listInflightOwnerNoBody key=$key code=${response.code} bytes=${bodyString.length}")
+            } else {
+                dlog("listInflightOwnerPut key=$key bytes=${bodyString.length} code=${response.code}")
+            }
+            return response.newBuilder()
+                .body(bodyString.toResponseBody(contentType.toMediaType()))
+                .build()
+        } catch (e: Exception) {
+            ownerFailed = true
+            throw e
+        } finally {
+            state.completed = true
+            state.failed = ownerFailed
+            state.latch.countDown()
+            synchronized(listInflight) {
+                if (listInflight[key] === state) listInflight.remove(key)
+            }
+        }
+    }
+
     private fun detailHtmlCacheKey(request: Request): String? {
         val url = request.url
         if (url.encodedPath != "/episodeList") return null
@@ -2189,6 +2334,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
+        internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
         internal const val PREF_FILTER_SORT = "pref_filter_sort"
         internal const val PREF_FILTER_THEME = "pref_filter_theme"
