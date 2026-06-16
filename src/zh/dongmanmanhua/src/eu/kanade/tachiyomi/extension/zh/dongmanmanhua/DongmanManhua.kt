@@ -792,7 +792,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-common-card",
             "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
                 "a[href*=list?title_no], a[href*=episodeList?titleNo]"
-        ) { hasCleanOrKnownCanonicalIdentity(it) && isPopularGenreEnabled(it) }
+        ) { hasCleanOrKnownCanonicalIdentity(it) && !isPopularGenreCategoryElement(it) }
 
         return result
     }
@@ -935,6 +935,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return enabledPopularGenreValues().contains(mappedCode)
     }
 
+    private fun isPopularGenreCategoryElement(element: Element): Boolean {
+        val scName = element.attr("data-sc-name").trim()
+        if (scName == "M_discover-page_genre-title-list-item") return true
+        return element.parents().any { parent ->
+            parent.hasClass("genre_content_c") || parent.hasClass("homeGenreContent")
+        }
+    }
+
     private fun popularElementGenreCode(element: Element): String {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
@@ -990,8 +998,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val sort = preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty().ifBlank { "READ_COUNT" }
         val todayCode = currentWeekdayCode()
         val startWeekday = normalizedWeekdayCode(weekday) ?: todayCode
-        val url = "$baseUrl/dailySchedule?weekday=$startWeekday&sortOrder=$sort&mihonLatest=1"
-        dlog("latestUpdatesRequest sessionWeekday=$startWeekday sort=$sort combined=true url=$url")
+        val requestPage = page.coerceAtLeast(1)
+        val url = "$baseUrl/dailySchedule?weekday=$startWeekday&sortOrder=$sort" +
+            "&mihonLatest=1&mihonLatestPage=$requestPage"
+        dlog(
+            "latestUpdatesRequest sessionWeekday=$startWeekday sort=$sort " +
+                "combined=true page=$requestPage url=$url"
+        )
         return GET(url, headersBuilder().build())
     }
 
@@ -1526,14 +1539,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             requestedItems
         }
 
-        val entries = pageItems.take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
-        val hasNextPage = pageItems.size > UPDATE_PAGE_SIZE
+        val latestPage = response.request.url.queryParameter("mihonLatestPage")
+            ?.toIntOrNull()
+            ?.coerceAtLeast(1)
+            ?: 1
+        val startIndex = if (latestCombined) (latestPage - 1) * UPDATE_PAGE_SIZE else 0
+        val entries = pageItems.drop(startIndex).take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
+        val hasNextPage = pageItems.size > startIndex + UPDATE_PAGE_SIZE
         val weekCounts = groupedElements.entries.joinToString(",") { "${it.key}=${it.value.size}" }
         val newCount = pageItems.count { it.hasNew }
         dlog(
             "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday sort=$sort " +
                 "selector=$selector grouped=${groupedElements.size} weekCounts=$weekCounts " +
-                "combinedLatest=$latestCombined raw=${pageItems.size} entries=${entries.size} " +
+                "combinedLatest=$latestCombined page=$latestPage start=$startIndex raw=${pageItems.size} entries=${entries.size} " +
                 "newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true"
         )
         return MangasPage(entries, hasNextPage)
