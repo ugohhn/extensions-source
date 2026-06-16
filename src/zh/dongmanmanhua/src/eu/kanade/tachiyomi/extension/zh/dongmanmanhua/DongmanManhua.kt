@@ -748,12 +748,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val document = response.asJsoup()
         val rawElements = collectPopularMangaElements(document)
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
-        val elements = distinctMangaElementsByIdentity(rawElements)
+        val elements = selectPopularMangaElements(rawElements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
             .filter { it.title.isNotEmpty() }
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
-        dlog("popularMangaParse modules raw=${rawElements.size} deduped=${elements.size} entries=${entries.size}")
+        dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         return MangasPage(entries, false)
     }
 
@@ -790,14 +790,100 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-genre-category",
             ".homeGenreContent a.lst_item[href], .genre_content_c a.lst_item[href], " +
                 "a[data-sc-name=M_discover-page_genre-title-list-item][href]"
-        ) { isPopularGenreEnabled(it) }
+        ) { isPopularGenreEnabled(it) && hasCleanOrKnownCanonicalIdentity(it) }
         addModule(
             "popular-common-card",
             "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
                 "a[href*=list?title_no], a[href*=episodeList?titleNo]"
-        )
+        ) { hasCleanOrKnownCanonicalIdentity(it) }
 
         return result
+    }
+
+    private fun selectPopularMangaElements(rawElements: List<Element>): List<Element> {
+        val bannerEnabled = preferences.getBoolean(PREF_POPULAR_BANNER_THUMBNAIL, false)
+        val groups = linkedMapOf<String, MutableList<Element>>()
+        rawElements.forEach { element ->
+            val key = popularElementIdentityKey(element)
+            if (key.isBlank()) return@forEach
+            groups.getOrPut(key) { mutableListOf() }.add(element)
+        }
+
+        var bannerOnlyEmptyThumbnail = 0
+        var preferredNonBanner = 0
+        val selected = groups.values.mapNotNull { candidates ->
+            val chosen = choosePopularElement(candidates, bannerEnabled) ?: return@mapNotNull null
+            if (candidates.any { it.attr("data-mihon-origin") == "popular-banner" } &&
+                chosen.attr("data-mihon-origin") != "popular-banner"
+            ) {
+                preferredNonBanner += 1
+            }
+            if (!bannerEnabled && chosen.attr("data-mihon-origin") == "popular-banner") {
+                bannerOnlyEmptyThumbnail += 1
+            }
+            chosen
+        }
+
+        dlog(
+            "popularSelect bannerEnabled=$bannerEnabled raw=${rawElements.size} groups=${groups.size} " +
+                "selected=${selected.size} bannerOnlyEmptyThumbnail=$bannerOnlyEmptyThumbnail " +
+                "preferredNonBanner=$preferredNonBanner"
+        )
+        return selected
+    }
+
+    private fun popularElementIdentityKey(element: Element): String {
+        val titleNo = titleNoFromElementIdentity(element)
+        if (!titleNo.isNullOrBlank()) return "titleNo:$titleNo"
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        return cleanPath.ifBlank { href }
+    }
+
+    private fun choosePopularElement(candidates: List<Element>, bannerEnabled: Boolean): Element? {
+        if (bannerEnabled) {
+            return candidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
+        }
+        val nonBannerCandidates = candidates.filter { it.attr("data-mihon-origin") != "popular-banner" }
+        return if (nonBannerCandidates.isNotEmpty()) {
+            nonBannerCandidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
+        } else {
+            // 不跳过纯轮播独占条目；保留条目本身，但 extractThumbnailUrl 会在开关关闭时返回空封面。
+            candidates.maxByOrNull { popularElementScore(it, bannerEnabled) }
+        }
+    }
+
+    private fun popularElementScore(element: Element, bannerEnabled: Boolean): Int {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        val origin = element.attr("data-mihon-origin")
+        var score = 0
+        if (isCleanWorkPagePath(cleanPath)) score += 10_000
+        if (hasCleanOrKnownCanonicalIdentity(element)) score += 1_000
+        if (hasUsableNonBannerThumbnail(element)) score += 500
+        score += when (origin) {
+            "popular-ranking" -> 90
+            "popular-common-card" -> 80
+            "popular-genre-category" -> 70
+            "popular-banner" -> if (bannerEnabled) 60 else -10_000
+            else -> 10
+        }
+        return score
+    }
+
+    private fun hasUsableNonBannerThumbnail(element: Element): Boolean {
+        val img = element.selectFirst("img")
+        val rawUrl = img?.attr("data-original")
+            ?.ifEmpty { img.attr("data-src") }
+            ?.ifEmpty { img.attr("src") }
+            ?: ""
+        if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) return true
+        val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
+        val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
+        val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
+        return styleUrl.isNotBlank() && !styleUrl.contains("/banner/")
     }
 
     private fun logPopularModuleProbe(origin: String, elements: List<Element>) {
@@ -846,32 +932,50 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return enabledPopularGenreValues().contains(genreCode)
     }
 
+    private fun titleNoFromElementIdentity(element: Element): String? {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        return titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(href)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
+    }
+
+    private fun knownCanonicalMangaIdentity(titleNo: String?): String {
+        if (titleNo.isNullOrBlank()) return ""
+        synchronized(canonicalMangaUrlByTitleNo) {
+            ensureCanonicalMangaIdentityStoreLoadedLocked()
+            return canonicalMangaUrlByTitleNo[titleNo].orEmpty()
+        }
+    }
+
+    private fun hasCleanOrKnownCanonicalIdentity(element: Element): Boolean {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        if (isCleanWorkPagePath(cleanPath)) return true
+        return knownCanonicalMangaIdentity(titleNoFromElementIdentity(element)).isNotBlank()
+    }
+
+    private fun shouldIncludePopularBannerElement(element: Element): Boolean {
+        return true
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 最新更新
     // ══════════════════════════════════════════════════════════════════════
 
     override fun latestUpdatesRequest(page: Int): Request {
-        val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
-        val sort = preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty()
-        val todayCode = when (Calendar.getInstance().get(Calendar.DAY_OF_WEEK)) {
-            Calendar.MONDAY -> "MONDAY"; Calendar.TUESDAY -> "TUESDAY"
-            Calendar.WEDNESDAY -> "WEDNESDAY"; Calendar.THURSDAY -> "THURSDAY"
-            Calendar.FRIDAY -> "FRIDAY"; Calendar.SATURDAY -> "SATURDAY"
-            Calendar.SUNDAY -> "SUNDAY"; else -> "MONDAY"
-        }
-        val url = when (weekday) {
-            "NEW" -> "$baseUrl/new"
-            "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sort"
-            "" -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sort"
-            else -> "$baseUrl/dailySchedule?weekday=$weekday&sortOrder=$sort"
-        }
+        val todayCode = currentWeekdayCode()
+        val url = "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=READ_COUNT"
+        dlog("latestUpdatesRequest defaultWeekday=$todayCode url=$url")
         return GET(url, headersBuilder().build())
     }
 
     override fun latestUpdatesParse(response: Response): MangasPage {
-        val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
-
-        if (weekday == "NEW" || response.request.url.encodedPath == "/new") {
+        if (response.request.url.encodedPath == "/new") {
             val document = response.asJsoup()
             val cachedItems = document.select(".new_works_items")
                 .mapNotNull { item ->
@@ -916,7 +1020,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
 
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
-    private val normalThumbnailUrlByTitleNo = mutableMapOf<String, String>()
     private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
@@ -1341,9 +1444,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun parseDailyScheduleHtml(response: Response): MangasPage {
         val document = response.asJsoup()
-        val requestedWeekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
-        val weekday = updateCacheWeekday(requestedWeekday)
-        val sort = response.request.url.queryParameter("sortOrder") ?: preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty()
+        val requestedWeekday = response.request.url.queryParameter("weekday").orEmpty()
+        val weekday = updateCacheWeekday(requestedWeekday.ifBlank { currentWeekdayCode() })
+        val sort = response.request.url.queryParameter("sortOrder") ?: "READ_COUNT"
         val selector = "a.updatePage_lst_item[data-week=$weekday]"
         val allWeekElements = document.select("a.updatePage_lst_item[data-week]")
         rememberCanonicalMangaIdentitiesFromElements(allWeekElements)
@@ -1686,7 +1789,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val detailThumbnail = extractDetailThumbnailUrl(document)
             if (detailThumbnail.isNotBlank()) {
                 thumbnail_url = detailThumbnail
-                rememberNormalThumbnail(titleNo, detailThumbnail, "detail")
             }
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
@@ -2131,7 +2233,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var knownUrls = ""
         synchronized(identityProbeUrlsByTitleNo) {
             val urls = identityProbeUrlsByTitleNo.getOrPut(titleNoValue) { linkedSetOf() }
-            val added = urls.add(normalizedStored)
+            val storedIsClean = isCleanWorkPagePath(normalizedStored)
+            if (storedIsClean) {
+                urls.removeAll { it.startsWith("/episodeList?titleNo=$titleNoValue") }
+            }
+            val shouldTrack = storedIsClean || urls.none(::isCleanWorkPagePath)
+            val added = if (shouldTrack) urls.add(normalizedStored) else false
             knownUrls = urls.joinToString(" | ")
             if (added && identityProbeSeenLogCount < IDENTITY_PROBE_SEEN_LOG_LIMIT) {
                 identityProbeSeenLogCount += 1
@@ -2576,21 +2683,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun rememberNormalThumbnail(titleNo: String?, thumbnailUrl: String, source: String) {
-        if (titleNo.isNullOrBlank() || thumbnailUrl.isBlank()) return
-        if (thumbnailUrl.contains("/banner/")) return
-        synchronized(normalThumbnailUrlByTitleNo) {
-            normalThumbnailUrlByTitleNo[titleNo] = thumbnailUrl
-        }
-        if (VERBOSE_LIST_LOG) {
-            dlog("rememberNormalThumbnail titleNo=$titleNo source=$source url=$thumbnailUrl")
-        }
+        // 不缓存封面。轮播图关闭时只在本次热门解析里优先选用非轮播候选项，避免跨天/跨轮播复用旧封面。
     }
 
     private fun normalThumbnailForTitleNo(titleNo: String?): String {
-        if (titleNo.isNullOrBlank()) return ""
-        return synchronized(normalThumbnailUrlByTitleNo) {
-            normalThumbnailUrlByTitleNo[titleNo].orEmpty()
-        }
+        return ""
     }
 
     private fun rememberUpdateWeekdaysFromElements(weekday: String, elements: List<Element>) {
@@ -2753,7 +2850,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
         if (origin == "popular-banner" && !preferences.getBoolean(PREF_POPULAR_BANNER_THUMBNAIL, false)) {
-            return normalThumbnailForTitleNo(titleNo)
+            return ""
         }
 
         val img = element.selectFirst("img")
@@ -2762,16 +2859,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.ifEmpty { img.attr("src") }
             ?: ""
         if (rawUrl.isNotBlank()) {
-            val thumbnailUrl = buildThumbnailUrl(rawUrl, cdnBase)
-            rememberNormalThumbnail(titleNo, thumbnailUrl, origin)
-            return thumbnailUrl
+            return buildThumbnailUrl(rawUrl, cdnBase)
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
         val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
-        val thumbnailUrl = buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
-        rememberNormalThumbnail(titleNo, thumbnailUrl, origin)
-        return thumbnailUrl
+        return buildThumbnailUrl(match?.groupValues?.getOrNull(1).orEmpty(), cdnBase)
     }
 
     private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
