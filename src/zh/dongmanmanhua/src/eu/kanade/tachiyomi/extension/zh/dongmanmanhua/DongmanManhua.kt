@@ -787,12 +787,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-genre-category",
             ".homeGenreContent a.lst_item[href], .genre_content_c a.lst_item[href], " +
                 "a[data-sc-name=M_discover-page_genre-title-list-item][href]"
-        ) { isPopularGenreEnabled(it) && hasCleanOrKnownCanonicalIdentity(it) }
+        ) { hasCleanOrKnownCanonicalIdentity(it) && isPopularGenreEnabled(it) }
         addModule(
             "popular-common-card",
             "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
                 "a[href*=list?title_no], a[href*=episodeList?titleNo]"
-        ) { hasCleanOrKnownCanonicalIdentity(it) }
+        ) { hasCleanOrKnownCanonicalIdentity(it) && isPopularGenreEnabled(it) }
 
         return result
     }
@@ -911,17 +911,43 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun isPopularGenreEnabled(element: Element): Boolean {
+        val genreCode = popularElementGenreCode(element)
+        if (genreCode.isNotBlank()) {
+            val enabled = enabledPopularGenreValues()
+            val allowed = enabled.contains(genreCode)
+            if (!allowed) {
+                val titleNo = titleNoFromElementIdentity(element).orEmpty()
+                dlog("popularGenreFiltered titleNo=$titleNo genre=$genreCode")
+            }
+            return allowed
+        }
+
         val genreName = element.parents()
             .firstOrNull { it.hasClass("genre_content_c") }
             ?.id()
             ?.trim()
             .orEmpty()
         if (genreName.isBlank()) return true
-        val genreCode = getThemeFilter()
+        val mappedCode = getThemeFilter()
             .firstOrNull { it.name == genreName || it.value == genreName }
             ?.value
             ?: genreName
-        return enabledPopularGenreValues().contains(genreCode)
+        return enabledPopularGenreValues().contains(mappedCode)
+    }
+
+    private fun popularElementGenreCode(element: Element): String {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        val directGenre = genreCodeFromCleanWorkPath(cleanPath)
+        if (directGenre.isNotBlank()) return directGenre
+        val knownPath = knownCanonicalMangaIdentity(titleNoFromElementIdentity(element))
+        return genreCodeFromCleanWorkPath(knownPath)
+    }
+
+    private fun genreCodeFromCleanWorkPath(path: String): String {
+        if (!isCleanWorkPagePath(path)) return ""
+        return path.trimStart('/').substringBefore('/').uppercase(Locale.ROOT)
     }
 
     private fun titleNoFromElementIdentity(element: Element): String? {
@@ -963,13 +989,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val weekday = preferences.getString(PREF_FILTER_WEEKDAY, "").orEmpty()
         val sort = preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty().ifBlank { "READ_COUNT" }
         val todayCode = currentWeekdayCode()
-        val url = when (weekday) {
-            "NEW" -> "$baseUrl/new"
-            "COMPLETE" -> "$baseUrl/dailySchedule?weekday=COMPLETE&sortOrder=$sort"
-            "" -> "$baseUrl/dailySchedule?weekday=$todayCode&sortOrder=$sort"
-            else -> "$baseUrl/dailySchedule?weekday=$weekday&sortOrder=$sort"
-        }
-        dlog("latestUpdatesRequest sessionWeekday=${weekday.ifBlank { todayCode }} sort=$sort url=$url")
+        val startWeekday = normalizedWeekdayCode(weekday) ?: todayCode
+        val url = "$baseUrl/dailySchedule?weekday=$startWeekday&sortOrder=$sort&mihonLatest=1"
+        dlog("latestUpdatesRequest sessionWeekday=$startWeekday sort=$sort combined=true url=$url")
         return GET(url, headersBuilder().build())
     }
 
@@ -1490,14 +1512,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .filter { it.title.isNotEmpty() }
                 .also { putUpdatePageCache(updateCacheKey(weekday, sort), it) }
 
-        val entries = requestedItems.take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
-        val hasNextPage = requestedItems.size > UPDATE_PAGE_SIZE
+        val latestCombined = response.request.url.queryParameter("mihonLatest") == "1"
+        val pageItems = if (latestCombined && weekday != "COMPLETE") {
+            orderedUpdateWeekdaysFrom(weekday)
+                .flatMap { week ->
+                    groupedElements[week]
+                        ?.map { cachedMangaItemFromElement(it, "dailySchedule-latest-$week") }
+                        .orEmpty()
+                }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
+                .filter { it.title.isNotEmpty() }
+        } else {
+            requestedItems
+        }
+
+        val entries = pageItems.take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
+        val hasNextPage = pageItems.size > UPDATE_PAGE_SIZE
         val weekCounts = groupedElements.entries.joinToString(",") { "${it.key}=${it.value.size}" }
-        val newCount = requestedItems.count { it.hasNew }
+        val newCount = pageItems.count { it.hasNew }
         dlog(
             "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday sort=$sort " +
                 "selector=$selector grouped=${groupedElements.size} weekCounts=$weekCounts " +
-                "raw=${requestedItems.size} entries=${entries.size} newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true"
+                "combinedLatest=$latestCombined raw=${pageItems.size} entries=${entries.size} " +
+                "newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true"
         )
         return MangasPage(entries, hasNextPage)
     }
@@ -2789,6 +2826,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return "每周${label}更新"
     }
 
+    private fun orderedUpdateWeekdaysFrom(startWeekday: String): List<String> {
+        val startIndex = weekdayIndex(startWeekday) ?: weekdayIndex(currentWeekdayCode()) ?: 1
+        return (0 until 7).mapNotNull { offset ->
+            val index = ((startIndex - 1 + offset) % 7) + 1
+            weekdayCodeByIndex(index)
+        }
+    }
+
     private fun normalizedWeekdayCode(weekday: String): String? {
         return when (weekday.uppercase(Locale.ROOT)) {
             "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY" -> weekday.uppercase(Locale.ROOT)
@@ -2853,7 +2898,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun buildThumbnailUrl(rawUrl: String, base: String = cdnBase): String {
-        val url = rawUrl.trim()
+        val url = stripImageProcessParams(rawUrl.trim())
         return when {
             url.isBlank() -> ""
             url.startsWith("http://") || url.startsWith("https://") -> url
@@ -2861,6 +2906,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             url.startsWith("/") -> "$base$url"
             else -> "$base/$url"
         }
+    }
+
+    private fun stripImageProcessParams(rawUrl: String): String {
+        if (rawUrl.isBlank()) return ""
+        return rawUrl
+            .substringBefore("?x-oss-process=")
+            .substringBefore("&x-oss-process=")
     }
 
     private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
