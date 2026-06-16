@@ -732,7 +732,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
             .distinctBy { it.absUrl("href") }
             .filter { it.attr("href").isNotEmpty() }
-            .map(::mangaFromElement)
+            .map { mangaFromElement(it, "popular") }
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
     }
@@ -766,7 +766,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val document = response.asJsoup()
             val cachedItems = document.select(".new_works_items")
                 .mapNotNull { item ->
-                    val cached = cachedMangaItemFromElement(item)
+                    val cached = cachedMangaItemFromElement(item, "new")
                     if (cached.title.isBlank()) return@mapNotNull null
                     if (entriesNewProbeShouldLog()) {
                         val rawHref = item.attr("href")
@@ -805,6 +805,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var dailyScheduleDocCache: org.jsoup.nodes.Document? = null
     private var dailyScheduleDocCacheTime: Long = 0L
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
+
+    private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
+    private var identityProbeSeenLogCount = 0
+    private var identityProbeConflictLogCount = 0
 
     private data class DetailHtmlCache(
         val titleNo: String,
@@ -1189,6 +1193,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         ?: a.selectFirst("img")?.attr("alt")
                         ?: ""
                     thumbnail_url = buildThumbnailUrl(a.selectFirst("img")?.attr("src").orEmpty())
+                    logIdentityProbe("recent", titleNoFromUrl(url), title, a.attr("href"), a.absUrl("href"), url)
                 }
             }
             .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
@@ -1231,18 +1236,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 return@forEach
             }
             val items = elements
-                .map(::cachedMangaItemFromElement)
+                .map { cachedMangaItemFromElement(it, "dailySchedule-cache-$week") }
                 .distinctBy { it.url }
                 .filter { it.title.isNotEmpty() }
             putUpdatePageCache(updateCacheKey(week, sort), items)
         }
 
         val requestedItems = groupedElements[weekday]
-            ?.map(::cachedMangaItemFromElement)
+            ?.map { cachedMangaItemFromElement(it, "dailySchedule-requested-$weekday") }
             ?.distinctBy { it.url }
             ?.filter { it.title.isNotEmpty() }
             ?: document.select(selector)
-                .map(::cachedMangaItemFromElement)
+                .map { cachedMangaItemFromElement(it, "dailySchedule-selector-$weekday") }
                 .distinctBy { it.url }
                 .filter { it.title.isNotEmpty() }
                 .also { putUpdatePageCache(updateCacheKey(weekday, sort), it) }
@@ -1280,6 +1285,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "representGenre=${item.optString("representGenre", "")} genreSeo=$genreSeo " +
                     "groupName=$groupName newTitle=$newTitle url=$url"
             )
+            logIdentityProbe("json-title", titleNoText, item.optString("title", ""), "", "", url)
             title = item.optString("title", "")
             thumbnail_url = buildThumbnailUrl(
                 item.optString("thumbnail", "")
@@ -1374,7 +1380,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNextPage: Boolean
         if (shouldClientPaginate) {
             val cachedItems = dedupedElements
-                .map(::cachedMangaItemFromElement)
+                .map { cachedMangaItemFromElement(it, "mangaList-cache-$cacheKey") }
                 .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
                 .distinctBy { it.url }
             putGenrePageCache(cacheKey, cachedItems)
@@ -1384,7 +1390,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             hasNextPage = cachedItems.size > page * GENRE_PAGE_SIZE
         } else {
             entries = dedupedElements
-                .map(::mangaFromElement)
+                .map { mangaFromElement(it, "mangaList") }
                 .distinctBy { it.url }
                 .filter { it.title.isNotEmpty() }
             totalSize = dedupedElements.size
@@ -1449,7 +1455,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val allItems = document.select("ul._searchResultList > li")
         val totalEntries = allItems.size
         val entries = allItems
-            .mapNotNull { li -> li.selectFirst("a.cleFix")?.let { searchMangaFromElement(it) } }
+            .mapNotNull { li -> li.selectFirst("a.cleFix")?.let { searchMangaFromElement(it, "search-html") } }
             .filter { it.title.isNotEmpty() }
         val total = document.select("._totalCount").attr("data-total").toIntOrNull() ?: 0
         val hasNextPage = total > totalEntries
@@ -1482,6 +1488,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             .ifEmpty { item.optString("representGenreBackgroundImageUrl", "") },
                         cdnBase
                     )
+                    logIdentityProbe("search-json", titleNo, title, "", "", url)
                 }
                 if (manga.title.isNotEmpty()) entries.add(manga)
             }
@@ -1791,7 +1798,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val items = sections.getOrNull(index)
                 ?.select("a.genrePageContentItem")
                 .orEmpty()
-                .map(::cachedMangaItemFromElement)
+                .map { cachedMangaItemFromElement(it, "genreBulk-cache-$genre") }
                 .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
                 .distinctBy { it.url }
             if (items.isNotEmpty()) {
@@ -1829,17 +1836,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return getThemeFilter().firstOrNull { it.value.isNotBlank() && it.value != "ALL" }?.value ?: "LOVE"
     }
 
-    private fun cachedMangaItemFromElement(element: Element): CachedMangaItem {
+    private fun cachedMangaItemFromElement(element: Element, origin: String = "cached-element"): CachedMangaItem {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
         val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val titleText = mangaTitleFromElement(element)
+        val thumbnailUrl = extractThumbnailUrl(element)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
+        logIdentityProbe(origin, titleNo, titleText, rawHref, href, cleanPath)
         return CachedMangaItem(
             url = cleanPath,
-            title = mangaTitleFromElement(element),
-            thumbnailUrl = extractThumbnailUrl(element),
+            title = titleText,
+            thumbnailUrl = thumbnailUrl,
             titleNo = titleNo,
             hasNew = hasNew,
         )
@@ -1849,6 +1859,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         url = item.url
         title = item.title
         thumbnail_url = item.thumbnailUrl
+        logIdentityProbe("cached-page", item.titleNo, title, "", "", url)
     }
 
     private fun mangaTitleFromElement(element: Element): String {
@@ -1866,7 +1877,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return true
     }
 
-    private fun mangaFromElement(element: Element): SManga = SManga.create().apply {
+    private fun mangaFromElement(element: Element, origin: String = "manga-element"): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
@@ -1876,6 +1887,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         url = cleanPath
         title = mangaTitleFromElement(element)
         thumbnail_url = extractThumbnailUrl(element)
+        logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog(
                 "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
@@ -1884,18 +1896,64 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun searchMangaFromElement(element: Element): SManga = SManga.create().apply {
+    private fun searchMangaFromElement(element: Element, origin: String = "search-html"): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
+        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
         url = cleanPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
+        logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
-            dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url title=$title")
+            dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url titleNo=$titleNo title=$title")
         }
     }
 
+
+    private fun logIdentityProbe(
+        origin: String,
+        titleNo: String?,
+        title: String,
+        rawHref: String,
+        absHref: String,
+        storedUrl: String,
+    ) {
+        val normalizedStored = normalizeMangaPath(storedUrl).trim()
+        val titleNoValue = titleNo?.takeIf { it.isNotBlank() }
+            ?: titleNoFromUrl(normalizedStored)
+            ?: titleNoFromUrl(absHref)
+            ?: titleNoFromUrl(rawHref)
+            ?: return
+        val requestPath = canonicalDetailRequestPath(normalizedStored)
+        var shouldLogSeen = false
+        var shouldLogConflict = false
+        var knownUrls = ""
+        synchronized(identityProbeUrlsByTitleNo) {
+            val urls = identityProbeUrlsByTitleNo.getOrPut(titleNoValue) { linkedSetOf() }
+            val added = urls.add(normalizedStored)
+            knownUrls = urls.joinToString(" | ")
+            if (added && identityProbeSeenLogCount < IDENTITY_PROBE_SEEN_LOG_LIMIT) {
+                identityProbeSeenLogCount += 1
+                shouldLogSeen = true
+            }
+            if (added && urls.size > 1 && identityProbeConflictLogCount < IDENTITY_PROBE_CONFLICT_LOG_LIMIT) {
+                identityProbeConflictLogCount += 1
+                shouldLogConflict = true
+            }
+        }
+        if (shouldLogConflict) {
+            dlog(
+                "identityProbe CONFLICT titleNo=$titleNoValue title=$title origin=$origin " +
+                    "storedUrl=$normalizedStored requestPath=$requestPath rawHref=$rawHref absHref=$absHref knownUrls=$knownUrls"
+            )
+        } else if (shouldLogSeen) {
+            dlog(
+                "identityProbe seen titleNo=$titleNoValue title=$title origin=$origin " +
+                    "storedUrl=$normalizedStored requestPath=$requestPath rawHref=$rawHref absHref=$absHref"
+            )
+        }
+    }
 
     private fun listInflightCoalesceKey(request: Request): String? {
         if (request.method != "GET") return null
@@ -2321,6 +2379,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
+        private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
+        private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
