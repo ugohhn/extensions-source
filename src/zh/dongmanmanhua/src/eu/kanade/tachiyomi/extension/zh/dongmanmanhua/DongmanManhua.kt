@@ -807,10 +807,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
 
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
+    private var canonicalMangaUrlStoreLoaded = false
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
     private var identityProbeConflictLogCount = 0
     private var identityFallbackEpisodeLogCount = 0
+    private var identityReuseCanonicalLogCount = 0
 
     private data class DetailHtmlCache(
         val titleNo: String,
@@ -2242,12 +2244,52 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return path.contains("/list?title_no=") && !path.substringBefore("?").endsWith("/episodeList")
     }
 
+    private fun ensureCanonicalMangaIdentityStoreLoadedLocked() {
+        if (canonicalMangaUrlStoreLoaded) return
+        canonicalMangaUrlStoreLoaded = true
+        val json = preferences.getString(PREF_CANONICAL_IDENTITY_MAP, "").orEmpty()
+        if (json.isBlank()) return
+        try {
+            val obj = JSONObject(json)
+            val keys = obj.keys()
+            var loaded = 0
+            while (keys.hasNext()) {
+                val titleNo = keys.next().trim()
+                val path = obj.optString(titleNo, "").trim()
+                if (titleNo.isNotBlank() && isCleanWorkPagePath(path) && !canonicalMangaUrlByTitleNo.containsKey(titleNo)) {
+                    canonicalMangaUrlByTitleNo[titleNo] = path
+                    loaded += 1
+                }
+            }
+            if (loaded > 0) dlog("identityCanonicalStoreLoad count=$loaded")
+        } catch (e: Exception) {
+            wlog("identityCanonicalStoreLoad failed", e)
+        }
+    }
+
+    private fun persistCanonicalMangaIdentityStoreLocked() {
+        try {
+            val obj = JSONObject()
+            canonicalMangaUrlByTitleNo.entries
+                .asSequence()
+                .filter { it.key.isNotBlank() && isCleanWorkPagePath(it.value) }
+                .take(CANONICAL_IDENTITY_STORE_MAX_ENTRIES)
+                .forEach { (titleNo, path) -> obj.put(titleNo, path) }
+            preferences.edit().putString(PREF_CANONICAL_IDENTITY_MAP, obj.toString()).apply()
+        } catch (e: Exception) {
+            wlog("identityCanonicalStoreSave failed", e)
+        }
+    }
+
     private fun rememberCanonicalMangaIdentity(titleNo: String, path: String): String {
         if (titleNo.isBlank() || !isCleanWorkPagePath(path)) return path
         synchronized(canonicalMangaUrlByTitleNo) {
+            ensureCanonicalMangaIdentityStoreLoadedLocked()
             val existing = canonicalMangaUrlByTitleNo[titleNo]
-            if (existing.isNullOrBlank() || existing.startsWith("/episodeList")) {
+            val shouldWrite = existing.isNullOrBlank() || existing.startsWith("/episodeList")
+            if (shouldWrite) {
                 canonicalMangaUrlByTitleNo[titleNo] = path
+                persistCanonicalMangaIdentityStoreLocked()
             }
             return canonicalMangaUrlByTitleNo[titleNo].orEmpty().ifBlank { path }
         }
@@ -2272,7 +2314,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (isCleanWorkPagePath(cleanPath)) return rememberCanonicalMangaIdentity(titleNo, cleanPath)
 
         synchronized(canonicalMangaUrlByTitleNo) {
-            canonicalMangaUrlByTitleNo[titleNo]?.takeIf { it.isNotBlank() }?.let { return it }
+            ensureCanonicalMangaIdentityStoreLoadedLocked()
+            canonicalMangaUrlByTitleNo[titleNo]?.takeIf { it.isNotBlank() }?.let { knownPath ->
+                if (identityReuseCanonicalLogCount < IDENTITY_PROBE_CONFLICT_LOG_LIMIT) {
+                    identityReuseCanonicalLogCount += 1
+                    dlog("identityReuseCanonical titleNo=$titleNo storedUrl=$knownPath rawUrl=$rawUrl cleanPath=$cleanPath")
+                }
+                return knownPath
+            }
         }
 
         if (identityFallbackEpisodeLogCount < IDENTITY_PROBE_CONFLICT_LOG_LIMIT) {
@@ -2538,6 +2587,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
+        private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
+        private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
         internal const val PREF_FILTER_SORT = "pref_filter_sort"
         internal const val PREF_FILTER_THEME = "pref_filter_theme"
