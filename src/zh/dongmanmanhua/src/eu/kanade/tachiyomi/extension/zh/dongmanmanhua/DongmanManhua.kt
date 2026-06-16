@@ -728,10 +728,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val entries = document
-            .select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
-            .distinctBy { it.absUrl("href") }
-            .filter { it.attr("href").isNotEmpty() }
+        val entries = distinctMangaElementsByIdentity(
+            document.select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
+                .filter { it.attr("href").isNotEmpty() }
+        )
             .map { mangaFromElement(it, "popular") }
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
@@ -784,7 +784,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     cacheNewTitle(marked.titleNo, true, "new-page")
                     marked
                 }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             putUpdatePageCache(updateCacheKey("NEW", ""), cachedItems)
             val entries = cachedItems.map(::mangaFromCachedItem)
             val newCount = cachedItems.count { it.hasNew }
@@ -806,6 +806,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var dailyScheduleDocCacheTime: Long = 0L
     private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
 
+    private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
     private var identityProbeConflictLogCount = 0
@@ -1188,16 +1189,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val entries = realItems
             .map { a ->
                 SManga.create().apply {
-                    setUrlWithoutDomain(a.absUrl("href").ifEmpty { a.attr("href") })
+                    val rawHref = a.attr("href")
+                    val href = a.absUrl("href").ifEmpty { rawHref }
+                    val titleNo = titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: a.attr("data-title-no")
+                    url = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
                     title = a.selectFirst(".tit, .items_content_right .tit")?.text()
                         ?: a.selectFirst("img")?.attr("alt")
                         ?: ""
                     thumbnail_url = buildThumbnailUrl(a.selectFirst("img")?.attr("src").orEmpty())
-                    logIdentityProbe("recent", titleNoFromUrl(url), title, a.attr("href"), a.absUrl("href"), url)
+                    logIdentityProbe("recent", titleNo, title, rawHref, href, url)
                 }
             }
             .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
-            .distinctBy { it.url }
+            .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         dlog(
             "parseRecentMangaPage url=${response.request.url} " +
                 "candidates=${candidates.size} realItems=${realItems.size} entries=${entries.size}"
@@ -1218,7 +1222,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val manga = mangaFromJsonTitle(item)
             if (manga.title.isNotEmpty()) entries.add(manga)
         }
-        return MangasPage(entries.distinctBy { it.url }, false)
+        return MangasPage(entries.distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }, false)
     }
 
     private fun parseDailyScheduleHtml(response: Response): MangasPage {
@@ -1237,18 +1241,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             val items = elements
                 .map { cachedMangaItemFromElement(it, "dailySchedule-cache-$week") }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
                 .filter { it.title.isNotEmpty() }
             putUpdatePageCache(updateCacheKey(week, sort), items)
         }
 
         val requestedItems = groupedElements[weekday]
             ?.map { cachedMangaItemFromElement(it, "dailySchedule-requested-$weekday") }
-            ?.distinctBy { it.url }
+            ?.distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             ?.filter { it.title.isNotEmpty() }
             ?: document.select(selector)
                 .map { cachedMangaItemFromElement(it, "dailySchedule-selector-$weekday") }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
                 .filter { it.title.isNotEmpty() }
                 .also { putUpdatePageCache(updateCacheKey(weekday, sort), it) }
 
@@ -1270,16 +1274,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val newTitle = item.optBoolean("newTitle", false)
         cacheNewTitle(titleNoText, newTitle)
         return SManga.create().apply {
-            val genreSeo = item.optString("representGenreSeoCode", "")
-            val groupName = item.optString("groupName", "")
-            url = when {
-                // 只有 SEO 题材码明确存在时才拼网页详情地址。
-                // representGenre 是 ROMANCE/ACTION 这类内部枚举，不等于 URL 里的 LOVE/BOY，不能拿来拼。
-                titleNoText.isNotEmpty() && genreSeo.isNotEmpty() && groupName.isNotEmpty() ->
-                    "/$genreSeo/$groupName/list?title_no=$titleNoText"
-                titleNoText.isNotEmpty() -> "/episodeList?titleNo=$titleNoText"
-                else -> ""
-            }
+            val genreSeo = firstNonBlankJsonString(
+                item,
+                "representGenreSeoCode",
+                "genreSeoCode",
+                "genreSeo",
+                "mainGenreSeoCode",
+            )
+            val groupName = firstNonBlankJsonString(
+                item,
+                "groupName",
+                "seoName",
+                "urlName",
+                "titleSeoName",
+            )
+            val rawUrl = firstNonBlankJsonString(
+                item,
+                "url",
+                "linkUrl",
+                "titleUrl",
+                "mobileUrl",
+            )
+            url = canonicalMangaIdentityPath(rawUrl = rawUrl, titleNoHint = titleNoText, genreSeoHint = genreSeo, groupNameHint = groupName)
             dlog(
                 "mangaFromJsonTitle titleNo=$titleNoText title=${item.optString("title", "")} " +
                     "representGenre=${item.optString("representGenre", "")} genreSeo=$genreSeo " +
@@ -1349,11 +1365,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         val page = response.request.url.queryParameter("mihonPage")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-        val dedupedElements = elements.distinctBy { item ->
-            val rawHref = item.attr("href")
-            val href = item.absUrl("href").ifEmpty { rawHref }
-            cleanMangaDetailPath(href)
-        }
+        val dedupedElements = distinctMangaElementsByIdentity(elements)
         val shouldClientPaginate = requestedGenre.isNotEmpty() && isGenrePageUrl(requestUrl)
         val cacheKey = if (requestedGenre == "ALL") "ALL" else filterGenre
 
@@ -1382,7 +1394,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cachedItems = dedupedElements
                 .map { cachedMangaItemFromElement(it, "mangaList-cache-$cacheKey") }
                 .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             putGenrePageCache(cacheKey, cachedItems)
             totalSize = cachedItems.size
             val pageItems = cachedItems.drop((page - 1) * GENRE_PAGE_SIZE).take(GENRE_PAGE_SIZE)
@@ -1391,7 +1403,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             entries = dedupedElements
                 .map { mangaFromElement(it, "mangaList") }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
                 .filter { it.title.isNotEmpty() }
             totalSize = dedupedElements.size
             hasNextPage = false
@@ -1480,7 +1492,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (platform != "ALL" && platform != "WEB") continue
                 val manga = SManga.create().apply {
                     val titleNo = item.optString("titleNo", "")
-                    url = "/episodeList?titleNo=$titleNo"
+                    val genreSeo = firstNonBlankJsonString(
+                        item,
+                        "representGenreSeoCode",
+                        "genreSeoCode",
+                        "genreSeo",
+                        "mainGenreSeoCode",
+                    )
+                    val groupName = firstNonBlankJsonString(
+                        item,
+                        "groupName",
+                        "seoName",
+                        "urlName",
+                        "titleSeoName",
+                    )
+                    val rawUrl = firstNonBlankJsonString(
+                        item,
+                        "url",
+                        "linkUrl",
+                        "titleUrl",
+                        "mobileUrl",
+                    )
+                    url = canonicalMangaIdentityPath(rawUrl = rawUrl, titleNoHint = titleNo, genreSeoHint = genreSeo, groupNameHint = groupName)
                     title = item.optString("title", "")
                     thumbnail_url = buildThumbnailUrl(
                         item.optString("thumbnailMobile", "")
@@ -1800,7 +1833,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .orEmpty()
                 .map { cachedMangaItemFromElement(it, "genreBulk-cache-$genre") }
                 .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
-                .distinctBy { it.url }
+                .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             if (items.isNotEmpty()) {
                 putGenrePageCache(genre, items)
                 cachedGenres += 1
@@ -1841,13 +1874,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
         val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
         val thumbnailUrl = extractThumbnailUrl(element)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
-        logIdentityProbe(origin, titleNo, titleText, rawHref, href, cleanPath)
+        logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
         return CachedMangaItem(
-            url = cleanPath,
+            url = identityPath,
             title = titleText,
             thumbnailUrl = thumbnailUrl,
             titleNo = titleNo,
@@ -1882,9 +1916,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
         val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
-        url = cleanPath
+        url = identityPath
         title = mangaTitleFromElement(element)
         thumbnail_url = extractThumbnailUrl(element)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
@@ -1901,7 +1936,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
         val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
-        url = cleanPath
+        val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
+        url = identityPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
         thumbnail_url = extractThumbnailUrl(element)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
@@ -2174,6 +2210,90 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             synchronized(detailHtmlInflight) {
                 if (detailHtmlInflight[titleNo] === state) detailHtmlInflight.remove(titleNo)
             }
+        }
+    }
+
+    private fun firstNonBlankJsonString(item: org.json.JSONObject, vararg keys: String): String {
+        keys.forEach { key ->
+            val value = item.optString(key, "").trim()
+            if (value.isNotEmpty() && value != "null") return value
+        }
+        return ""
+    }
+
+    private fun normalizeSeoSegment(value: String): String {
+        return value.trim().trim('/').substringBefore('?').substringBefore('&')
+    }
+
+    private fun workPagePathFromSeo(titleNo: String, genreSeo: String?, groupName: String?): String {
+        val genre = normalizeSeoSegment(genreSeo.orEmpty())
+        val group = normalizeSeoSegment(groupName.orEmpty())
+        if (titleNo.isBlank() || genre.isBlank() || group.isBlank()) return ""
+        return "/$genre/$group/list?title_no=$titleNo"
+    }
+
+    private fun isCleanWorkPagePath(path: String): Boolean {
+        return path.contains("/list?title_no=") && !path.substringBefore("?").endsWith("/episodeList")
+    }
+
+    private fun rememberCanonicalMangaIdentity(titleNo: String, path: String): String {
+        if (titleNo.isBlank() || !isCleanWorkPagePath(path)) return path
+        synchronized(canonicalMangaUrlByTitleNo) {
+            val existing = canonicalMangaUrlByTitleNo[titleNo]
+            if (existing.isNullOrBlank() || existing.startsWith("/episodeList")) {
+                canonicalMangaUrlByTitleNo[titleNo] = path
+            }
+            return canonicalMangaUrlByTitleNo[titleNo].orEmpty().ifBlank { path }
+        }
+    }
+
+    private fun canonicalMangaIdentityPath(
+        rawUrl: String,
+        titleNoHint: String? = null,
+        genreSeoHint: String? = null,
+        groupNameHint: String? = null,
+    ): String {
+        val cleanPath = cleanMangaDetailPath(rawUrl)
+        val titleNo = titleNoHint?.takeIf { it.isNotBlank() }
+            ?: titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(rawUrl)
+            ?: ""
+        if (titleNo.isBlank()) return cleanPath
+
+        val seoPath = workPagePathFromSeo(titleNo, genreSeoHint, groupNameHint)
+        if (seoPath.isNotBlank()) return rememberCanonicalMangaIdentity(titleNo, seoPath)
+
+        if (isCleanWorkPagePath(cleanPath)) return rememberCanonicalMangaIdentity(titleNo, cleanPath)
+
+        synchronized(canonicalMangaUrlByTitleNo) {
+            canonicalMangaUrlByTitleNo[titleNo]?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+
+        return "/episodeList?titleNo=$titleNo"
+    }
+
+    private fun mangaIdentityDedupKey(titleNo: String?, url: String): String {
+        return titleNo?.takeIf { it.isNotBlank() }
+            ?: titleNoFromUrl(url)
+            ?: normalizeMangaPath(url)
+    }
+
+    private fun mangaElementDedupKey(element: Element): String {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val titleNo = titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        return mangaIdentityDedupKey(titleNo, href)
+    }
+
+    private fun isWorkPageElement(element: Element): Boolean {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        return isCleanWorkPagePath(cleanMangaDetailPath(href))
+    }
+
+    private fun distinctMangaElementsByIdentity(elements: List<Element>): List<Element> {
+        return elements.groupBy(::mangaElementDedupKey).values.map { group ->
+            group.firstOrNull(::isWorkPageElement) ?: group.first()
         }
     }
 
