@@ -728,10 +728,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val entries = distinctMangaElementsByIdentity(
-            document.select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
-                .filter { it.attr("href").isNotEmpty() }
-        )
+        val elements = document.select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
+            .filter { it.attr("href").isNotEmpty() }
+        rememberCanonicalMangaIdentitiesFromElements(elements)
+        val entries = distinctMangaElementsByIdentity(elements)
             .map { mangaFromElement(it, "popular") }
             .filter { it.title.isNotEmpty() }
         return MangasPage(entries, false)
@@ -810,6 +810,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
     private var identityProbeConflictLogCount = 0
+    private var identityFallbackEpisodeLogCount = 0
 
     private data class DetailHtmlCache(
         val titleNo: String,
@@ -1232,6 +1233,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val sort = response.request.url.queryParameter("sortOrder") ?: preferences.getString(PREF_FILTER_SORT, "READ_COUNT").orEmpty()
         val selector = "a.updatePage_lst_item[data-week=$weekday]"
         val allWeekElements = document.select("a.updatePage_lst_item[data-week]")
+        rememberCanonicalMangaIdentitiesFromElements(allWeekElements)
         val groupedElements = allWeekElements.groupBy { it.attr("data-week").trim() }.filterKeys { it.isNotEmpty() }
 
         groupedElements.forEach { (week, elements) ->
@@ -1337,6 +1339,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (genreItems.isNotEmpty() && isGenrePageUrl(requestUrl)) {
             putGenrePageCachesFromDocument(document, includeAll = isThemeAll)
         }
+        rememberCanonicalMangaIdentitiesFromElements(
+            document.select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
+        )
 
         val elements = if (genreItems.isNotEmpty()) {
             val sectionItems = genreIndex
@@ -1464,6 +1469,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun parseSearchHtml(response: Response): MangasPage {
         val document = response.asJsoup()
+        rememberCanonicalMangaIdentitiesFromElements(document.select("ul._searchResultList a[href*=list?title_no]"))
         val allItems = document.select("ul._searchResultList > li")
         val totalEntries = allItems.size
         val entries = allItems
@@ -2269,6 +2275,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             canonicalMangaUrlByTitleNo[titleNo]?.takeIf { it.isNotBlank() }?.let { return it }
         }
 
+        if (identityFallbackEpisodeLogCount < IDENTITY_PROBE_CONFLICT_LOG_LIMIT) {
+            identityFallbackEpisodeLogCount += 1
+            dlog("identityFallbackEpisode titleNo=$titleNo rawUrl=$rawUrl cleanPath=$cleanPath")
+        }
         return "/episodeList?titleNo=$titleNo"
     }
 
@@ -2283,6 +2293,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val href = element.absUrl("href").ifEmpty { rawHref }
         val titleNo = titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
         return mangaIdentityDedupKey(titleNo, href)
+    }
+
+    private fun rememberCanonicalMangaIdentitiesFromElements(elements: Iterable<Element>) {
+        elements.forEach { element ->
+            val rawHref = element.attr("href")
+            if (rawHref.isBlank()) return@forEach
+            val href = element.absUrl("href").ifEmpty { rawHref }
+            val cleanPath = cleanMangaDetailPath(href)
+            val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+            if (!titleNo.isNullOrBlank() && isCleanWorkPagePath(cleanPath)) {
+                rememberCanonicalMangaIdentity(titleNo, cleanPath)
+            }
+        }
     }
 
     private fun isWorkPageElement(element: Element): Boolean {
