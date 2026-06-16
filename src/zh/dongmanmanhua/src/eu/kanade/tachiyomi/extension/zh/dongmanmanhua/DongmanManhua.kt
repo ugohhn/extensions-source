@@ -728,13 +728,76 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val elements = document.select("a[href*=list?title_no], a[href*=episodeList?titleNo]")
-            .filter { it.attr("href").isNotEmpty() }
-        rememberCanonicalMangaIdentitiesFromElements(elements)
-        val entries = distinctMangaElementsByIdentity(elements)
-            .map { mangaFromElement(it, "popular") }
+        val rawElements = collectPopularMangaElements(document)
+        rememberCanonicalMangaIdentitiesFromElements(rawElements)
+        val elements = distinctMangaElementsByIdentity(rawElements)
+        val entries = elements
+            .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
             .filter { it.title.isNotEmpty() }
+            .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
+        dlog("popularMangaParse modules raw=${rawElements.size} deduped=${elements.size} entries=${entries.size}")
         return MangasPage(entries, false)
+    }
+
+    private fun collectPopularMangaElements(document: org.jsoup.nodes.Document): List<Element> {
+        val result = mutableListOf<Element>()
+        val seen = mutableSetOf<Int>()
+
+        fun addModule(origin: String, selector: String) {
+            val items = document.select(selector)
+                .filter { it.attr("href").isNotBlank() }
+            val added = mutableListOf<Element>()
+            items.forEach { element ->
+                val key = System.identityHashCode(element)
+                if (seen.add(key)) {
+                    element.attr("data-mihon-origin", origin)
+                    result += element
+                    added += element
+                }
+            }
+            logPopularModuleProbe(origin, added)
+        }
+
+        // 首页热门按模块拆开，避免继续用一条全局选择器粗暴扫。
+        addModule(
+            "popular-banner",
+            ".main_banner a[href], a[data-sc-name=M_discover-page_banner][href]"
+        )
+        addModule(
+            "popular-ranking",
+            "a.ranking_list_items[href], a[data-sc-name=M_discover-page_rank-list-item][href]"
+        )
+        addModule(
+            "popular-genre-category",
+            ".homeGenreContent a.lst_item[href], .genre_content_c a.lst_item[href], " +
+                "a[data-sc-name=M_discover-page_genre-title-list-item][href]"
+        )
+        addModule(
+            "popular-common-card",
+            "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
+                "a[href*=list?title_no], a[href*=episodeList?titleNo]"
+        )
+
+        return result
+    }
+
+    private fun logPopularModuleProbe(origin: String, elements: List<Element>) {
+        if (elements.isEmpty()) {
+            dlog("popularModule origin=$origin count=0")
+            return
+        }
+        val clean = elements.count { element ->
+            val rawHref = element.attr("href")
+            val href = element.absUrl("href").ifEmpty { rawHref }
+            isCleanWorkPagePath(cleanMangaDetailPath(href))
+        }
+        val episode = elements.count { element ->
+            val rawHref = element.attr("href")
+            val href = element.absUrl("href").ifEmpty { rawHref }
+            cleanMangaDetailPath(href).startsWith("/episodeList")
+        }
+        val emptyTitle = elements.count { mangaTitleFromElement(it).isBlank() }
+        dlog("popularModule origin=$origin count=${elements.size} clean=$clean episode=$episode emptyTitle=$emptyTitle")
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1881,7 +1944,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
-        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val titleNo = titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(href)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
         val thumbnailUrl = extractThumbnailUrl(element)
@@ -1908,7 +1975,33 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return element.selectFirst(
             "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
                 "p.chapter-title-02, .chapter-title-01, .tit_content"
-        )?.text() ?: element.attr("title").ifEmpty { element.selectFirst("img")?.attr("alt") ?: "" }
+        )?.text()
+            ?.takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommend_title_title")
+            ?: element.attr("title").takeIf { it.isNotBlank() }
+            ?: element.selectFirst("img")?.attr("alt")?.takeIf { it.isNotBlank() }
+            ?: ""
+    }
+
+    private fun scEventParameterValue(element: Element, key: String): String? {
+        val raw = element.attr("data-sc-event-parameter")
+        if (raw.isBlank()) return null
+        val quotedSingle = Regex("""(?:^|[,\{])\s*${Regex.escape(key)}\s*:\s*'([^']*)'""").find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+        if (!quotedSingle.isNullOrBlank()) return quotedSingle
+        val quotedDouble = Regex("""(?:^|[,\{])\s*${Regex.escape(key)}\s*:\s*\"([^\"]*)\"""").find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+        if (!quotedDouble.isNullOrBlank()) return quotedDouble
+        val bare = Regex("""(?:^|[,\{])\s*${Regex.escape(key)}\s*:\s*([^,\}]+)""").find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.trim('\'', '\"')
+        return bare?.takeIf { it.isNotBlank() }
     }
 
     private var newProbeLogCount = 0
@@ -1923,7 +2016,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
-        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val titleNo = titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(href)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
@@ -1943,7 +2040,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
         val cleanPath = cleanMangaDetailPath(href)
-        val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+        val titleNo = titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(href)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         url = identityPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
@@ -2350,7 +2451,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (rawHref.isBlank()) return@forEach
             val href = element.absUrl("href").ifEmpty { rawHref }
             val cleanPath = cleanMangaDetailPath(href)
-            val titleNo = titleNoFromUrl(cleanPath) ?: titleNoFromUrl(href) ?: titleNoFromUrl(rawHref) ?: element.attr("data-title-no")
+            val titleNo = titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(href)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
             if (!titleNo.isNullOrBlank() && isCleanWorkPagePath(cleanPath)) {
                 rememberCanonicalMangaIdentity(titleNo, cleanPath)
             }
