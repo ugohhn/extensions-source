@@ -1121,6 +1121,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNew: Boolean,
     )
 
+    private data class CoverCandidate(
+        val rawUrl: String,
+        val finalUrl: String,
+        val source: String,
+        val isBanner: Boolean,
+    )
+
+    private data class ListCoverSnapshot(
+        val origin: String,
+        val pageModel: String,
+        val title: String,
+        val rawHref: String,
+        val rawCover: String,
+        val finalCover: String,
+    )
+
+    private val listCoverSnapshotsByTitleNo = mutableMapOf<String, MutableList<ListCoverSnapshot>>()
+    private var coverListProbeLogCount = 0
+    private var coverDetailProbeLogCount = 0
+    private var coverCompareProbeLogCount = 0
+
     private data class GenrePageCache(
         val genre: String,
         val createdAt: Long,
@@ -1860,7 +1881,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             author = detailDiv?.selectFirst("p.author")?.text()
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
-            val detailThumbnail = extractDetailThumbnailUrl(document)
+            val detailThumbnail = extractDetailThumbnailUrl(document, titleNo, title)
             if (detailThumbnail.isNotBlank()) {
                 thumbnail_url = detailThumbnail
             }
@@ -2182,7 +2203,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
-        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
+        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo, titleText)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
@@ -2257,7 +2278,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         cacheNewTitle(titleNo, hasNew)
         url = identityPath
         title = mangaTitleFromElement(element)
-        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo, title)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog(
@@ -2279,7 +2300,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         url = identityPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
-        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo, title)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url titleNo=$titleNo title=$title")
@@ -2937,35 +2958,142 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .substringBefore("&x-oss-process=")
     }
 
-    private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
+    private fun extractThumbnailUrl(
+        element: Element,
+        origin: String = "",
+        titleNo: String? = null,
+        title: String = "",
+    ): String {
         if (origin == "popular-banner") {
+            val candidate = extractElementCoverCandidate(element)
+            registerListCoverSnapshot(element, origin, titleNo, title, candidate.rawUrl, "")
             return ""
         }
 
+        val candidate = extractElementCoverCandidate(element)
+        val finalUrl = if (candidate.rawUrl.isNotBlank() && !candidate.isBanner) candidate.finalUrl else ""
+        registerListCoverSnapshot(element, origin, titleNo, title, candidate.rawUrl, finalUrl)
+        return finalUrl
+    }
+
+    private fun extractElementCoverCandidate(element: Element): CoverCandidate {
         val img = element.selectFirst("img")
         val rawUrl = img?.attr("data-original")
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             ?: ""
-        if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) {
-            return buildThumbnailUrl(rawUrl, cdnBase)
+        if (rawUrl.isNotBlank()) {
+            return CoverCandidate(
+                rawUrl = rawUrl,
+                finalUrl = buildThumbnailUrl(rawUrl, cdnBase),
+                source = "element-img",
+                isBanner = rawUrl.contains("/banner/"),
+            )
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
-        val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
+        val match = Regex("""url\(['\"]?([^)'\"]+)['\"]?\)""").find(style)
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
-        return if (styleUrl.isNotBlank() && !styleUrl.contains("/banner/")) {
-            buildThumbnailUrl(styleUrl, cdnBase)
+        return if (styleUrl.isNotBlank()) {
+            CoverCandidate(
+                rawUrl = styleUrl,
+                finalUrl = buildThumbnailUrl(styleUrl, cdnBase),
+                source = "element-style",
+                isBanner = styleUrl.contains("/banner/"),
+            )
         } else {
-            ""
+            CoverCandidate("", "", "none", false)
         }
     }
 
-    private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
+    private fun registerListCoverSnapshot(
+        element: Element,
+        origin: String,
+        titleNo: String?,
+        title: String,
+        rawCover: String,
+        finalCover: String,
+    ) {
+        val titleNoValue = titleNo?.takeIf { it.isNotBlank() } ?: return
+        val rawHref = element.attr("href")
+        val absHref = element.absUrl("href").ifEmpty { rawHref }
+        val pageModel = queryParamValueFromUrlLike(absHref, "pageModel")
+            .ifBlank { queryParamValueFromUrlLike(rawHref, "pageModel") }
+        val snapshot = ListCoverSnapshot(
+            origin = origin,
+            pageModel = pageModel,
+            title = title,
+            rawHref = rawHref,
+            rawCover = rawCover,
+            finalCover = finalCover,
+        )
+        synchronized(listCoverSnapshotsByTitleNo) {
+            val list = listCoverSnapshotsByTitleNo.getOrPut(titleNoValue) { mutableListOf() }
+            val exists = list.any {
+                it.origin == snapshot.origin &&
+                    it.pageModel == snapshot.pageModel &&
+                    it.title == snapshot.title &&
+                    it.rawCover == snapshot.rawCover &&
+                    it.finalCover == snapshot.finalCover
+            }
+            if (!exists) {
+                list += snapshot
+                if (list.size > 8) list.removeAt(0)
+            }
+            if (listCoverSnapshotsByTitleNo.size > COVER_PROBE_TITLE_CACHE_MAX) {
+                val firstKey = listCoverSnapshotsByTitleNo.keys.firstOrNull()
+                if (firstKey != null) listCoverSnapshotsByTitleNo.remove(firstKey)
+            }
+        }
+        if (coverListProbeLogCount < COVER_PROBE_LIST_LOG_LIMIT && shouldLogCoverListProbe(origin, pageModel)) {
+            coverListProbeLogCount += 1
+            dlog(
+                "coverListProbe titleNo=$titleNoValue origin=$origin pageModel=$pageModel " +
+                    "title=$title rawCover=$rawCover finalCover=$finalCover rawHref=$rawHref"
+            )
+        }
+    }
+
+    private fun shouldLogCoverListProbe(origin: String, pageModel: String): Boolean {
+        return origin == "popular-common-card" ||
+            pageModel.contains("新作登场") ||
+            pageModel.contains("新作登場")
+    }
+
+    private fun queryParamValueFromUrlLike(raw: String, key: String): String {
+        if (raw.isBlank()) return ""
+        return Regex("""(?:[?&])${Regex.escape(key)}=([^&#]*)""")
+            .find(raw)
+            ?.groupValues
+            ?.getOrNull(1)
+            .orEmpty()
+    }
+
+    private fun extractDetailThumbnailUrl(
+        document: org.jsoup.nodes.Document,
+        titleNo: String?,
+        title: String,
+    ): String {
+        val candidate = extractDetailCoverCandidate(document)
+        val titleNoValue = titleNo?.takeIf { it.isNotBlank() }
+        if (titleNoValue != null) {
+            logDetailCoverProbe(titleNoValue, title, candidate)
+        }
+        return candidate.finalUrl
+    }
+
+    private fun extractDetailCoverCandidate(document: org.jsoup.nodes.Document): CoverCandidate {
         val metaUrl = document.selectFirst("meta[property=og:image]")?.attr("content")
             ?.ifBlank { document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty() }
             .orEmpty()
-        if (metaUrl.isNotBlank()) return buildThumbnailUrl(metaUrl, cdnBase)
+        if (metaUrl.isNotBlank()) {
+            return CoverCandidate(
+                rawUrl = metaUrl,
+                finalUrl = buildThumbnailUrl(metaUrl, cdnBase),
+                source = "detail-meta",
+                isBanner = metaUrl.contains("/banner/"),
+            )
+        }
 
         val img = document.selectFirst(
             "div.detail_info img, .detail_info img, .detail_header img, .detail_img img, " +
@@ -2975,9 +3103,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             .orEmpty()
-        return buildThumbnailUrl(rawUrl, cdnBase)
+        return if (rawUrl.isNotBlank()) {
+            CoverCandidate(
+                rawUrl = rawUrl,
+                finalUrl = buildThumbnailUrl(rawUrl, cdnBase),
+                source = "detail-img",
+                isBanner = rawUrl.contains("/banner/"),
+            )
+        } else {
+            CoverCandidate("", "", "detail-none", false)
+        }
     }
 
+    private fun logDetailCoverProbe(titleNo: String, title: String, candidate: CoverCandidate) {
+        if (coverDetailProbeLogCount < COVER_PROBE_DETAIL_LOG_LIMIT) {
+            coverDetailProbeLogCount += 1
+            dlog(
+                "coverDetailProbe titleNo=$titleNo title=$title source=${candidate.source} " +
+                    "rawCover=${candidate.rawUrl} finalCover=${candidate.finalUrl} isBanner=${candidate.isBanner}"
+            )
+        }
+        val snapshots = synchronized(listCoverSnapshotsByTitleNo) {
+            listCoverSnapshotsByTitleNo[titleNo]?.toList().orEmpty()
+        }
+        snapshots.forEach { snapshot ->
+            if (coverCompareProbeLogCount >= COVER_PROBE_COMPARE_LOG_LIMIT) return@forEach
+            coverCompareProbeLogCount += 1
+            dlog(
+                "coverCompare titleNo=$titleNo listOrigin=${snapshot.origin} pageModel=${snapshot.pageModel} " +
+                    "sameTitle=${snapshot.title == title} sameCover=${snapshot.finalCover == candidate.finalUrl} " +
+                    "listTitle=${snapshot.title} detailTitle=$title " +
+                    "listCover=${snapshot.finalCover} detailCover=${candidate.finalUrl} " +
+                    "listRawCover=${snapshot.rawCover} detailRawCover=${candidate.rawUrl}"
+            )
+        }
+    }
 
     private fun hasNewBadge(element: Element): Boolean {
         // 只认卡片自己的 class / 图标，不因为页面文字包含 NEW 就误判。
@@ -3110,6 +3270,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val VERBOSE_LIST_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
+        private const val COVER_PROBE_TITLE_CACHE_MAX = 500
+        private const val COVER_PROBE_LIST_LOG_LIMIT = 80
+        private const val COVER_PROBE_DETAIL_LOG_LIMIT = 120
+        private const val COVER_PROBE_COMPARE_LOG_LIMIT = 160
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
