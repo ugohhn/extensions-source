@@ -739,6 +739,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
+            clearLegacyNewWorkPersistentCaches()
             ensureNewPageTitlePrefetchStarted("popular-request")
             ensureNewWorkCoverPrefetchStarted(
                 reason = "popular-request",
@@ -1199,6 +1200,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val newWorkCoverCacheLock = Any()
     private var newWorkCoverCache: NewWorkCoverCache? = null
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
+
+    @Volatile
+    private var legacyNewWorkPersistentCacheCleared = false
 
     private data class GenrePageCache(
         val genre: String,
@@ -2451,16 +2455,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun getNewPageTitleCache(): Map<String, String> {
+        val now = System.currentTimeMillis()
         return synchronized(newPageTitleCacheLock) {
-            val cache = newPageTitleCache ?: readPersistedNewPageTitleCache()?.also { newPageTitleCache = it }
-            cache?.titlesByTitleNo.orEmpty()
+            val cache = newPageTitleCache
+            if (cache == null || now - cache.createdAt > NEW_PAGE_TITLE_CACHE_TTL_MS) {
+                emptyMap()
+            } else {
+                cache.titlesByTitleNo
+            }
         }
     }
 
     private fun isNewPageTitleCacheFresh(): Boolean {
         val now = System.currentTimeMillis()
         return synchronized(newPageTitleCacheLock) {
-            val cache = newPageTitleCache ?: readPersistedNewPageTitleCache()?.also { newPageTitleCache = it }
+            val cache = newPageTitleCache
             cache != null && now - cache.createdAt <= NEW_PAGE_TITLE_CACHE_TTL_MS
         }
     }
@@ -2473,9 +2482,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filterValues { it.isNotBlank() }
         if (cleanTitles.isEmpty()) return
         synchronized(newPageTitleCacheLock) {
-            val existing = newPageTitleCache ?: readPersistedNewPageTitleCache()
             val mergedTitles = linkedMapOf<String, String>()
-            existing?.titlesByTitleNo.orEmpty().forEach { (titleNo, title) ->
+            newPageTitleCache?.titlesByTitleNo.orEmpty().forEach { (titleNo, title) ->
                 if (titleNo.isNotBlank() && title.isNotBlank()) mergedTitles[titleNo] = title
             }
             cleanTitles.forEach { (titleNo, title) -> mergedTitles[titleNo] = title }
@@ -2483,45 +2491,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val firstKey = mergedTitles.keys.firstOrNull() ?: break
                 mergedTitles.remove(firstKey)
             }
-            val cache = NewPageTitleCache(
+            newPageTitleCache = NewPageTitleCache(
                 createdAt = System.currentTimeMillis(),
                 titlesByTitleNo = mergedTitles,
             )
-            newPageTitleCache = cache
-            persistNewPageTitleCache(cache)
         }
     }
 
-    private fun readPersistedNewPageTitleCache(): NewPageTitleCache? {
-        val raw = preferences.getString(PREF_NEW_PAGE_TITLE_CACHE, "").orEmpty()
-        if (raw.isBlank()) return null
-        return runCatching {
-            val obj = JSONObject(raw)
-            val createdAt = obj.optLong("createdAt", 0L)
-            val titlesObj = obj.optJSONObject("titles") ?: return@runCatching null
-            val titles = linkedMapOf<String, String>()
-            val keys = titlesObj.keys()
-            while (keys.hasNext()) {
-                val titleNo = keys.next().trim()
-                val title = titlesObj.optString(titleNo).trim()
-                if (titleNo.isNotBlank() && title.isNotBlank()) {
-                    titles[titleNo] = title
-                }
-            }
-            if (titles.isEmpty()) null else NewPageTitleCache(createdAt, titles)
-        }.getOrNull()
-    }
-
-    private fun persistNewPageTitleCache(cache: NewPageTitleCache) {
-        runCatching {
-            val titlesObj = JSONObject()
-            cache.titlesByTitleNo.forEach { (titleNo, title) ->
-                if (titleNo.isNotBlank() && title.isNotBlank()) titlesObj.put(titleNo, title)
-            }
-            val obj = JSONObject()
-                .put("createdAt", cache.createdAt)
-                .put("titles", titlesObj)
-            preferences.edit().putString(PREF_NEW_PAGE_TITLE_CACHE, obj.toString()).apply()
+    private fun clearLegacyNewWorkPersistentCaches() {
+        if (legacyNewWorkPersistentCacheCleared) return
+        synchronized(newPageTitleCacheLock) {
+            if (legacyNewWorkPersistentCacheCleared) return
+            preferences.edit()
+                .remove(PREF_NEW_PAGE_TITLE_CACHE)
+                .remove(PREF_NEW_WORK_COVER_CACHE)
+                .apply()
+            legacyNewWorkPersistentCacheCleared = true
+            dlog("legacyNewWorkPersistentCacheCleared")
         }
     }
 
@@ -2651,7 +2637,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun getNewWorkCoverCache(): Map<String, String> {
         val now = System.currentTimeMillis()
         return synchronized(newWorkCoverCacheLock) {
-            val cache = newWorkCoverCache ?: readPersistedNewWorkCoverCache()?.also { newWorkCoverCache = it }
+            val cache = newWorkCoverCache
             if (cache == null || now - cache.createdAt > NEW_WORK_COVER_CACHE_TTL_MS) {
                 emptyMap()
             } else {
@@ -2668,9 +2654,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filterValues { it.isNotBlank() }
         if (cleanCovers.isEmpty()) return
         synchronized(newWorkCoverCacheLock) {
-            val existing = newWorkCoverCache ?: readPersistedNewWorkCoverCache()
             val mergedCovers = linkedMapOf<String, String>()
-            existing?.coversByTitleNo.orEmpty().forEach { (titleNo, cover) ->
+            newWorkCoverCache?.coversByTitleNo.orEmpty().forEach { (titleNo, cover) ->
                 if (titleNo.isNotBlank() && cover.isNotBlank()) mergedCovers[titleNo] = cover
             }
             cleanCovers.forEach { (titleNo, cover) -> mergedCovers[titleNo] = cover }
@@ -2678,45 +2663,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val firstKey = mergedCovers.keys.firstOrNull() ?: break
                 mergedCovers.remove(firstKey)
             }
-            val cache = NewWorkCoverCache(
+            newWorkCoverCache = NewWorkCoverCache(
                 createdAt = System.currentTimeMillis(),
                 coversByTitleNo = mergedCovers,
             )
-            newWorkCoverCache = cache
-            persistNewWorkCoverCache(cache)
-        }
-    }
-
-    private fun readPersistedNewWorkCoverCache(): NewWorkCoverCache? {
-        val raw = preferences.getString(PREF_NEW_WORK_COVER_CACHE, "").orEmpty()
-        if (raw.isBlank()) return null
-        return runCatching {
-            val obj = JSONObject(raw)
-            val createdAt = obj.optLong("createdAt", 0L)
-            val coversObj = obj.optJSONObject("covers") ?: return@runCatching null
-            val covers = linkedMapOf<String, String>()
-            val keys = coversObj.keys()
-            while (keys.hasNext()) {
-                val titleNo = keys.next().trim()
-                val cover = coversObj.optString(titleNo).trim()
-                if (titleNo.isNotBlank() && cover.isNotBlank()) {
-                    covers[titleNo] = cover
-                }
-            }
-            if (covers.isEmpty()) null else NewWorkCoverCache(createdAt, covers)
-        }.getOrNull()
-    }
-
-    private fun persistNewWorkCoverCache(cache: NewWorkCoverCache) {
-        runCatching {
-            val coversObj = JSONObject()
-            cache.coversByTitleNo.forEach { (titleNo, cover) ->
-                if (titleNo.isNotBlank() && cover.isNotBlank()) coversObj.put(titleNo, cover)
-            }
-            val obj = JSONObject()
-                .put("createdAt", cache.createdAt)
-                .put("covers", coversObj)
-            preferences.edit().putString(PREF_NEW_WORK_COVER_CACHE, obj.toString()).apply()
         }
     }
 
@@ -2727,7 +2677,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank()) return@forEach
             val cover = coversByTitleNo[titleNo]?.trim().orEmpty()
             if (cover.isBlank()) return@forEach
-            if (rememberOfficialMangaMeta(titleNo, "", cover, "detail-cache") != null) {
+            if (rememberOfficialMangaMeta(titleNo, "", cover, "detail-memory") != null) {
                 filled += 1
             }
         }
@@ -2776,7 +2726,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         val candidate = fetchOfficialCoverCandidateFromDetail(titleNo, NEW_WORK_COVER_PREFETCH_TIMEOUT_MS)
                         if (candidate != null && candidate.thumbnailUrl.isNotBlank()) {
                             covers[titleNo] = candidate.thumbnailUrl
-                            rememberOfficialMangaMeta(titleNo, candidate.title, candidate.thumbnailUrl, "detail-cache")
+                            rememberOfficialMangaMeta(titleNo, candidate.title, candidate.thumbnailUrl, "detail-memory")
                         }
                     } catch (e: Exception) {
                         dlog("popularNewWorkCoverPrefetchItemFailed titleNo=$titleNo reason=${e.javaClass.simpleName}")
@@ -2855,7 +2805,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isTrustedOfficialMetaSource(source: String): Boolean {
         return source == "detail" ||
             source == "detail-marketing" ||
-            source == "detail-cache" ||
+            source == "detail-memory" ||
             source == "popular-ranking" ||
             source == "popular-genre-category" ||
             source == "popular-banner-title" ||
@@ -2869,7 +2819,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun officialMetaSourcePriority(source: String): Int {
         return when {
             source == "detail" || source == "detail-marketing" -> 1000
-            source == "detail-cache" -> 995
+            source == "detail-memory" -> 995
             source.startsWith("dailySchedule") -> 900
             source.startsWith("mangaList") -> 850
             source.startsWith("genreBulk") -> 825
@@ -3738,7 +3688,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_500L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 120L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
-        private const val NEW_WORK_COVER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+        private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 120L
         private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 2_000L
         private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 2_500L
