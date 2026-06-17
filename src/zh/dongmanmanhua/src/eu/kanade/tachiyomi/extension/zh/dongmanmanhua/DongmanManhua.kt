@@ -2313,7 +2313,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (isMarketingNewWork) {
             dlog(
                 "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
-                    "officialTitle=$title marketingThumbUsed=${thumbnail_url.isNotBlank()} " +
+                    "officialTitle=$title marketingThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
                     "officialSource=${officialMeta?.source ?: "none"}"
             )
         }
