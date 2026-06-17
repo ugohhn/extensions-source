@@ -41,6 +41,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
@@ -739,6 +740,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (page == 1) {
             resetFilterSessionState("popular-page1")
             ensureNewPageTitlePrefetchStarted("popular-request")
+            ensureNewWorkCoverPrefetchStarted(
+                reason = "popular-request",
+                targetTitleNos = getNewPageTitleCache().keys.take(NEW_WORK_COVER_PREFETCH_MAX_TARGETS).toSet(),
+            )
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -749,6 +754,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
         preseedOfficialMetaFromPopularRawElements(rawElements)
         preseedOfficialTitlesFromNewPageForMarketingNewWorks(rawElements)
+        preseedOfficialCoversForMarketingNewWorks(rawElements)
         val elements = selectPopularMangaElements(rawElements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -1170,10 +1176,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt: Long,
     )
 
+    private data class NewWorkCoverCache(
+        val createdAt: Long,
+        val coversByTitleNo: Map<String, String>,
+    )
+
+    private data class NewWorkCoverPrefetchState(
+        val latch: CountDownLatch,
+        val startedAt: Long,
+        val targetTitleNos: Set<String>,
+    )
+
+    private data class OfficialCoverCandidate(
+        val title: String,
+        val thumbnailUrl: String,
+    )
+
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
     private val newPageTitleCacheLock = Any()
     private var newPageTitleCache: NewPageTitleCache? = null
     private var newPageTitlePrefetchState: NewPageTitlePrefetchState? = null
+    private val newWorkCoverCacheLock = Any()
+    private var newWorkCoverCache: NewWorkCoverCache? = null
+    private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
 
     private data class GenrePageCache(
         val genre: String,
@@ -1924,6 +1949,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 thumbnail_url = detailThumbnail
             }
             rememberOfficialMangaMeta(titleNo, title, detailThumbnail, "detail")
+            if (!titleNo.isNullOrBlank() && detailThumbnail.isNotBlank()) {
+                rememberNewWorkCoverCache(mapOf(titleNo to detailThumbnail))
+            }
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
             val updateTag = extractUpdateTag(html, titleNo)
@@ -2571,6 +2599,224 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return filled
     }
 
+    private fun preseedOfficialCoversForMarketingNewWorks(rawElements: List<Element>) {
+        val targetTitleNos = rawElements.asSequence()
+            .filter { element ->
+                element.attr("data-mihon-origin") == "popular-common-card" &&
+                    isPopularCommonCardNewWork(element)
+            }
+            .mapNotNull { titleNoFromElementIdentity(it)?.trim()?.takeIf { titleNo -> titleNo.isNotBlank() } }
+            .distinct()
+            .toSet()
+        if (targetTitleNos.isEmpty()) return
+
+        val startedAt = System.currentTimeMillis()
+        val cachedCovers = getNewWorkCoverCache()
+        val filledFromCache = applyNewWorkOfficialCovers(targetTitleNos, cachedCovers)
+        var remainingTitleNos = targetTitleNos
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank() }
+            .toSet()
+        if (remainingTitleNos.isEmpty()) {
+            dlog(
+                "popularNewWorkCoverFill targets=${targetTitleNos.size} remaining=0 " +
+                    "filled=$filledFromCache cacheFilled=$filledFromCache prefetchFilled=0 " +
+                    "cacheHit=${cachedCovers.isNotEmpty()} prefetch=false wait=false " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms"
+            )
+            return
+        }
+
+        val latch = ensureNewWorkCoverPrefetchStarted(
+            reason = "popular-missing-cover",
+            targetTitleNos = remainingTitleNos,
+            force = true,
+        )
+        val waited = latch?.let {
+            runCatching { it.await(NEW_WORK_COVER_PREFETCH_WAIT_MS, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+        } ?: false
+        val refreshedCovers = getNewWorkCoverCache()
+        val filledFromPrefetch = applyNewWorkOfficialCovers(remainingTitleNos, refreshedCovers)
+        remainingTitleNos = targetTitleNos
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank() }
+            .toSet()
+        val filled = filledFromCache + filledFromPrefetch
+        dlog(
+            "popularNewWorkCoverFill targets=${targetTitleNos.size} remaining=${remainingTitleNos.size} " +
+                "filled=$filled cacheFilled=$filledFromCache prefetchFilled=$filledFromPrefetch " +
+                "cacheHit=${cachedCovers.isNotEmpty()} prefetch=${latch != null} wait=$waited " +
+                "elapsed=${System.currentTimeMillis() - startedAt}ms"
+        )
+    }
+
+    private fun getNewWorkCoverCache(): Map<String, String> {
+        val now = System.currentTimeMillis()
+        return synchronized(newWorkCoverCacheLock) {
+            val cache = newWorkCoverCache ?: readPersistedNewWorkCoverCache()?.also { newWorkCoverCache = it }
+            if (cache == null || now - cache.createdAt > NEW_WORK_COVER_CACHE_TTL_MS) {
+                emptyMap()
+            } else {
+                cache.coversByTitleNo
+            }
+        }
+    }
+
+    private fun rememberNewWorkCoverCache(coversByTitleNo: Map<String, String>) {
+        val cleanCovers = coversByTitleNo
+            .mapKeys { (titleNo, _) -> titleNo.trim() }
+            .mapValues { (_, cover) -> cover.trim() }
+            .filterKeys { it.isNotBlank() }
+            .filterValues { it.isNotBlank() }
+        if (cleanCovers.isEmpty()) return
+        synchronized(newWorkCoverCacheLock) {
+            val existing = newWorkCoverCache ?: readPersistedNewWorkCoverCache()
+            val mergedCovers = linkedMapOf<String, String>()
+            existing?.coversByTitleNo.orEmpty().forEach { (titleNo, cover) ->
+                if (titleNo.isNotBlank() && cover.isNotBlank()) mergedCovers[titleNo] = cover
+            }
+            cleanCovers.forEach { (titleNo, cover) -> mergedCovers[titleNo] = cover }
+            while (mergedCovers.size > NEW_WORK_COVER_CACHE_MAX_ENTRIES) {
+                val firstKey = mergedCovers.keys.firstOrNull() ?: break
+                mergedCovers.remove(firstKey)
+            }
+            val cache = NewWorkCoverCache(
+                createdAt = System.currentTimeMillis(),
+                coversByTitleNo = mergedCovers,
+            )
+            newWorkCoverCache = cache
+            persistNewWorkCoverCache(cache)
+        }
+    }
+
+    private fun readPersistedNewWorkCoverCache(): NewWorkCoverCache? {
+        val raw = preferences.getString(PREF_NEW_WORK_COVER_CACHE, "").orEmpty()
+        if (raw.isBlank()) return null
+        return runCatching {
+            val obj = JSONObject(raw)
+            val createdAt = obj.optLong("createdAt", 0L)
+            val coversObj = obj.optJSONObject("covers") ?: return@runCatching null
+            val covers = linkedMapOf<String, String>()
+            val keys = coversObj.keys()
+            while (keys.hasNext()) {
+                val titleNo = keys.next().trim()
+                val cover = coversObj.optString(titleNo).trim()
+                if (titleNo.isNotBlank() && cover.isNotBlank()) {
+                    covers[titleNo] = cover
+                }
+            }
+            if (covers.isEmpty()) null else NewWorkCoverCache(createdAt, covers)
+        }.getOrNull()
+    }
+
+    private fun persistNewWorkCoverCache(cache: NewWorkCoverCache) {
+        runCatching {
+            val coversObj = JSONObject()
+            cache.coversByTitleNo.forEach { (titleNo, cover) ->
+                if (titleNo.isNotBlank() && cover.isNotBlank()) coversObj.put(titleNo, cover)
+            }
+            val obj = JSONObject()
+                .put("createdAt", cache.createdAt)
+                .put("covers", coversObj)
+            preferences.edit().putString(PREF_NEW_WORK_COVER_CACHE, obj.toString()).apply()
+        }
+    }
+
+    private fun applyNewWorkOfficialCovers(targetTitleNos: Set<String>, coversByTitleNo: Map<String, String>): Int {
+        if (targetTitleNos.isEmpty() || coversByTitleNo.isEmpty()) return 0
+        var filled = 0
+        targetTitleNos.forEach { titleNo ->
+            if (!getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank()) return@forEach
+            val cover = coversByTitleNo[titleNo]?.trim().orEmpty()
+            if (cover.isBlank()) return@forEach
+            if (rememberOfficialMangaMeta(titleNo, "", cover, "detail-cache") != null) {
+                filled += 1
+            }
+        }
+        return filled
+    }
+
+    private fun ensureNewWorkCoverPrefetchStarted(
+        reason: String,
+        targetTitleNos: Set<String>,
+        force: Boolean = false,
+    ): CountDownLatch? {
+        val target = targetTitleNos
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .filter { titleNo ->
+                force || (getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank() && getNewWorkCoverCache()[titleNo].isNullOrBlank())
+            }
+            .take(NEW_WORK_COVER_PREFETCH_MAX_TARGETS)
+            .toSet()
+        if (target.isEmpty()) return null
+
+        var shouldStart = false
+        val latch = synchronized(newWorkCoverCacheLock) {
+            newWorkCoverPrefetchState?.latch ?: CountDownLatch(1).also { createdLatch ->
+                newWorkCoverPrefetchState = NewWorkCoverPrefetchState(
+                    latch = createdLatch,
+                    startedAt = System.currentTimeMillis(),
+                    targetTitleNos = target,
+                )
+                shouldStart = true
+            }
+        }
+        if (!shouldStart) return latch
+
+        Thread({
+            val startedAt = System.currentTimeMillis()
+            val covers = java.util.Collections.synchronizedMap(linkedMapOf<String, String>())
+            val completed = java.util.concurrent.atomic.AtomicInteger(0)
+            val poolSize = minOf(target.size, NEW_WORK_COVER_PREFETCH_CONCURRENCY)
+            val pool = Executors.newFixedThreadPool(poolSize)
+            val taskLatch = CountDownLatch(target.size)
+            target.forEach { titleNo ->
+                pool.execute {
+                    try {
+                        val candidate = fetchOfficialCoverCandidateFromDetail(titleNo, NEW_WORK_COVER_PREFETCH_TIMEOUT_MS)
+                        if (candidate != null && candidate.thumbnailUrl.isNotBlank()) {
+                            covers[titleNo] = candidate.thumbnailUrl
+                            rememberOfficialMangaMeta(titleNo, candidate.title, candidate.thumbnailUrl, "detail-cache")
+                        }
+                    } catch (e: Exception) {
+                        dlog("popularNewWorkCoverPrefetchItemFailed titleNo=$titleNo reason=${e.javaClass.simpleName}")
+                    } finally {
+                        completed.incrementAndGet()
+                        taskLatch.countDown()
+                    }
+                }
+            }
+            runCatching { taskLatch.await(NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
+            pool.shutdownNow()
+            rememberNewWorkCoverCache(covers)
+            synchronized(newWorkCoverCacheLock) {
+                if (newWorkCoverPrefetchState?.latch === latch) {
+                    newWorkCoverPrefetchState = null
+                }
+            }
+            latch.countDown()
+            dlog(
+                "popularNewWorkCoverPrefetch reason=$reason targets=${target.size} " +
+                    "completed=${completed.get()} filled=${covers.size} " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms"
+            )
+        }, "DongmanNewWorkCoverPrefetch").start()
+        return latch
+    }
+
+    private fun fetchOfficialCoverCandidateFromDetail(titleNo: String, timeoutMs: Long): OfficialCoverCandidate? {
+        val timedClient = client.newBuilder()
+            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+        val document = timedClient.newCall(GET("$baseUrl/episodeList?titleNo=$titleNo", headersBuilder().build())).execute().use { response ->
+            response.asJsoup()
+        }
+        val title = detailTitleFromDocument(document).trim()
+        val thumbnail = extractDetailThumbnailUrl(document).trim()
+        if (title.isBlank() && thumbnail.isBlank()) return null
+        return OfficialCoverCandidate(title, thumbnail)
+    }
+
     private fun rememberOfficialMangaMetaFromList(titleNo: String?, title: String, thumbnailUrl: String, source: String): OfficialMangaMeta? {
         if (titleNo.isNullOrBlank()) return null
         if (!isTrustedOfficialMetaSource(source)) return null
@@ -2609,6 +2855,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isTrustedOfficialMetaSource(source: String): Boolean {
         return source == "detail" ||
             source == "detail-marketing" ||
+            source == "detail-cache" ||
             source == "popular-ranking" ||
             source == "popular-genre-category" ||
             source == "popular-banner-title" ||
@@ -2622,6 +2869,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun officialMetaSourcePriority(source: String): Int {
         return when {
             source == "detail" || source == "detail-marketing" -> 1000
+            source == "detail-cache" -> 995
             source.startsWith("dailySchedule") -> 900
             source.startsWith("mangaList") -> 850
             source.startsWith("genreBulk") -> 825
@@ -3490,6 +3738,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_500L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 120L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
+        private const val NEW_WORK_COVER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000L
+        private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 120L
+        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 2_000L
+        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 2_500L
+        private const val NEW_WORK_COVER_PREFETCH_CONCURRENCY = 3
+        private const val NEW_WORK_COVER_PREFETCH_MAX_TARGETS = 12
+        private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 300
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
@@ -3510,6 +3765,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
         private const val PREF_NEW_PAGE_TITLE_CACHE = "pref_new_page_title_cache_v1"
+        private const val PREF_NEW_WORK_COVER_CACHE = "pref_new_work_cover_cache_v1"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
