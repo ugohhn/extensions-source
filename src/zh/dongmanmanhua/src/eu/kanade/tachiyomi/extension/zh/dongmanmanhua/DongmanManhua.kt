@@ -741,10 +741,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             resetFilterSessionState("popular-page1")
             clearLegacyNewWorkPersistentCaches()
             ensureNewPageTitlePrefetchStarted("popular-request")
-            ensureNewWorkCoverPrefetchStarted(
-                reason = "popular-request",
-                targetTitleNos = getNewPageTitleCache().keys.take(NEW_WORK_COVER_PREFETCH_MAX_TARGETS).toSet(),
-            )
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -773,10 +769,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .filter { it.attr("href").isNotBlank() }
                 .filter { includeElement(it) }
             val added = mutableListOf<Element>()
-            items.forEach { element ->
+            items.forEachIndexed { index, element ->
                 val key = System.identityHashCode(element)
                 if (seen.add(key)) {
                     element.attr("data-mihon-origin", origin)
+                    element.attr("data-mihon-origin-index", index.toString())
+                    element.attr("data-mihon-raw-index", result.size.toString())
                     result.add(element)
                     added.add(element)
                 }
@@ -820,8 +818,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var bannerOnlyNoThumbnail = 0
         var preferredNonBanner = 0
-        val selected = groups.values.mapNotNull { candidates ->
-            val chosen = choosePopularElement(candidates) ?: return@mapNotNull null
+        data class PopularSelection(
+            val element: Element,
+            val displayOrder: Int,
+            val displayIndex: Int,
+            val groupIndex: Int,
+        )
+
+        val selected = groups.values.mapIndexedNotNull { groupIndex, candidates ->
+            val chosen = choosePopularElement(candidates) ?: return@mapIndexedNotNull null
             val hasBanner = candidates.any { it.attr("data-mihon-origin") == "popular-banner" }
             if (hasBanner && chosen.attr("data-mihon-origin") != "popular-banner") {
                 preferredNonBanner += 1
@@ -829,12 +834,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (chosen.attr("data-mihon-origin") == "popular-banner") {
                 bannerOnlyNoThumbnail += 1
             }
-            chosen
+            PopularSelection(
+                element = chosen,
+                displayOrder = popularGroupDisplayOrder(candidates, chosen),
+                displayIndex = popularGroupDisplayIndex(candidates, chosen),
+                groupIndex = groupIndex,
+            )
         }
         val ordered = selected
-            .mapIndexed { index, element -> index to element }
-            .sortedWith(compareBy<Pair<Int, Element>> { popularDisplayOrder(it.second) }.thenBy { it.first })
-            .map { it.second }
+            .sortedWith(
+                compareBy<PopularSelection> { it.displayOrder }
+                    .thenBy { it.displayIndex }
+                    .thenBy { it.groupIndex }
+            )
+            .map { it.element }
 
         dlog(
             "popularSelect bannerThumbnail=false raw=${rawElements.size} groups=${groups.size} " +
@@ -842,6 +855,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "preferredNonBanner=$preferredNonBanner"
         )
         return ordered
+    }
+
+    private fun popularGroupDisplayOrder(candidates: List<Element>, chosen: Element): Int {
+        return if (candidates.any { it.attr("data-mihon-origin") == "popular-banner" }) {
+            0
+        } else {
+            popularDisplayOrder(chosen)
+        }
+    }
+
+    private fun popularGroupDisplayIndex(candidates: List<Element>, chosen: Element): Int {
+        val bannerCandidate = candidates
+            .filter { it.attr("data-mihon-origin") == "popular-banner" }
+            .minByOrNull(::popularElementOriginIndex)
+        return popularElementOriginIndex(bannerCandidate ?: chosen)
+    }
+
+    private fun popularElementOriginIndex(element: Element): Int {
+        return element.attr("data-mihon-origin-index").toIntOrNull()
+            ?: element.attr("data-mihon-raw-index").toIntOrNull()
+            ?: Int.MAX_VALUE
     }
 
     private fun popularElementIdentityKey(element: Element): String {
