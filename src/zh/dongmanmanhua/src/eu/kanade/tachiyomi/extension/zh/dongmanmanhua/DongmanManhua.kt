@@ -763,6 +763,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         scheduleOfficialCoverPrefetchForMarketingNewWorks(rawElements)
+        scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements)
         return MangasPage(entries, false)
     }
 
@@ -1243,6 +1244,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val newWorkCoverCacheLock = Any()
     private var newWorkCoverCache: NewWorkCoverCache? = null
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
+    private var newPageCoverWarmupLastStartedAt = 0L
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
 
@@ -2674,6 +2676,39 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
+    private fun scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements: List<Element>) {
+        val currentTitleNos = marketingNewWorkTitleNos(rawElements)
+        val titleCache = getNewPageTitleCache()
+        if (titleCache.isEmpty()) return
+        val now = System.currentTimeMillis()
+        synchronized(newWorkCoverCacheLock) {
+            if (now - newPageCoverWarmupLastStartedAt < NEW_PAGE_COVER_WARMUP_COOLDOWN_MS) return
+        }
+        val coverCache = getNewWorkCoverCache()
+        val warmupTargets = titleCache.keys.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .filterNot { titleNo -> currentTitleNos.contains(titleNo) }
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank() }
+            .filter { titleNo -> coverCache[titleNo].isNullOrBlank() }
+            .take(NEW_PAGE_COVER_WARMUP_MAX_TARGETS)
+            .toSet()
+        if (warmupTargets.isEmpty()) return
+        synchronized(newWorkCoverCacheLock) {
+            val freshNow = System.currentTimeMillis()
+            if (freshNow - newPageCoverWarmupLastStartedAt < NEW_PAGE_COVER_WARMUP_COOLDOWN_MS) return
+            newPageCoverWarmupLastStartedAt = freshNow
+        }
+        Thread({
+            runCatching { Thread.sleep(NEW_PAGE_COVER_WARMUP_DELAY_MS) }
+            ensureNewWorkCoverPrefetchStarted(
+                reason = "new-page-cover-warmup",
+                targetTitleNos = warmupTargets,
+            )
+        }, "DongmanNewPageCoverWarmup").start()
+        dlog("popularNewPageCoverWarmupScheduled targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms")
+    }
+
     private fun marketingNewWorkTitleNos(rawElements: List<Element>): Set<String> {
         return rawElements.asSequence()
             .filter { element ->
@@ -3798,6 +3833,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
         private const val NEW_WORK_COVER_FAILURE_COOLDOWN_MS = 3 * 60 * 1000L
         private const val NEW_WORK_COVER_FAILURE_MAX_ENTRIES = 120
+        private const val NEW_PAGE_COVER_WARMUP_DELAY_MS = 2_600L
+        private const val NEW_PAGE_COVER_WARMUP_COOLDOWN_MS = 60_000L
+        private const val NEW_PAGE_COVER_WARMUP_MAX_TARGETS = 6
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
