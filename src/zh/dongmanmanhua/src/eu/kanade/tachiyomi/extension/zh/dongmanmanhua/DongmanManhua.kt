@@ -751,7 +751,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val document = response.asJsoup()
         val rawElements = collectPopularMangaElements(document)
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
+        preseedOfficialMetaFromPopularRawElements(rawElements)
         val elements = selectPopularMangaElements(rawElements)
+        prefetchMarketingNewWorkOfficialMeta(elements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
             .filter { it.title.isNotEmpty() }
@@ -826,13 +828,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             chosen
         }
+        val ordered = selected
+            .mapIndexed { index, element -> index to element }
+            .sortedWith(compareBy<Pair<Int, Element>> { popularDisplayOrder(it.second) }.thenBy { it.first })
+            .map { it.second }
 
         dlog(
             "popularSelect bannerThumbnail=false raw=${rawElements.size} groups=${groups.size} " +
-                "selected=${selected.size} bannerOnlyNoThumbnail=$bannerOnlyNoThumbnail " +
+                "selected=${ordered.size} bannerOnlyNoThumbnail=$bannerOnlyNoThumbnail " +
                 "preferredNonBanner=$preferredNonBanner"
         )
-        return selected
+        return ordered
     }
 
     private fun popularElementIdentityKey(element: Element): String {
@@ -851,6 +857,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             // 轮播独占条目保留漫画身份，但不写横幅图到 thumbnailUrl。
             candidates.maxByOrNull { popularElementScore(it) }
+        }
+    }
+
+    private fun popularDisplayOrder(element: Element): Int {
+        val origin = element.attr("data-mihon-origin")
+        return when {
+            origin == "popular-banner" -> 0
+            origin == "popular-common-card" && isPopularCommonCardNewWork(element) -> 1
+            origin == "popular-ranking" -> 2
+            origin == "popular-genre-category" -> 3
+            origin == "popular-common-card" -> 4
+            else -> 5
         }
     }
 
@@ -1147,6 +1165,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     )
 
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
+    private val marketingOfficialFetchAttemptedTitleNo = mutableSetOf<String>()
 
     private data class GenrePageCache(
         val genre: String,
@@ -2313,7 +2332,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (isMarketingNewWork) {
             dlog(
                 "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
-                    "officialTitle=$title marketingThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
+                    "officialTitle=$title officialThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
                     "officialSource=${officialMeta?.source ?: "none"}"
             )
         }
@@ -2322,6 +2341,77 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
                     "titleNo=$titleNo hasNew=$hasNew title=$title"
             )
+        }
+    }
+
+    private fun preseedOfficialMetaFromPopularRawElements(rawElements: List<Element>) {
+        var count = 0
+        rawElements.forEach { element ->
+            val origin = element.attr("data-mihon-origin").ifBlank { return@forEach }
+            if (!isTrustedOfficialMetaSource(origin)) return@forEach
+            if (origin == "popular-common-card" && isPopularCommonCardNewWork(element)) return@forEach
+            val titleNo = titleNoFromElementIdentity(element)
+            val title = mangaTitleFromElement(element)
+            val thumbnail = extractThumbnailUrl(element, origin, titleNo)
+            if (rememberOfficialMangaMetaFromList(titleNo, title, thumbnail, origin) != null) {
+                count += 1
+            }
+        }
+        if (count > 0) dlog("popularOfficialMetaPreseed count=$count")
+    }
+
+    private fun prefetchMarketingNewWorkOfficialMeta(elements: List<Element>) {
+        val targets = elements
+            .filter { it.attr("data-mihon-origin") == "popular-common-card" && isPopularCommonCardNewWork(it) }
+            .mapNotNull { element ->
+                val titleNo = titleNoFromElementIdentity(element)?.trim().orEmpty()
+                if (titleNo.isBlank()) return@mapNotNull null
+                val rawHref = element.attr("href")
+                val href = element.absUrl("href").ifEmpty { rawHref }
+                val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
+                titleNo to identityPath
+            }
+            .distinctBy { it.first }
+            .filter { (titleNo, _) ->
+                val existing = getOfficialMangaMeta(titleNo)
+                val complete = existing != null && existing.title.isNotBlank() && existing.thumbnailUrl.isNotBlank()
+                !complete && !wasMarketingOfficialFetchAttempted(titleNo)
+            }
+        if (targets.isEmpty()) return
+
+        val startedAt = System.currentTimeMillis()
+        val latch = CountDownLatch(targets.size)
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(
+            minOf(targets.size, MARKETING_DETAIL_PREFETCH_CONCURRENCY)
+        )
+        targets.forEach { (titleNo, identityPath) ->
+            executor.execute {
+                try {
+                    fetchOfficialMangaMetaFromDetail(titleNo, identityPath)
+                } finally {
+                    latch.countDown()
+                }
+            }
+        }
+        val completed = latch.await(MARKETING_DETAIL_PREFETCH_WAIT_MS, TimeUnit.MILLISECONDS)
+        val remaining = latch.count
+        executor.shutdownNow()
+        dlog(
+            "popularCommonCardNewWorkOfficialPrefetch total=${targets.size} " +
+                "completed=${targets.size - remaining.toInt()} timeout=${!completed} " +
+                "elapsed=${System.currentTimeMillis() - startedAt}ms"
+        )
+    }
+
+    private fun wasMarketingOfficialFetchAttempted(titleNo: String): Boolean {
+        return synchronized(marketingOfficialFetchAttemptedTitleNo) {
+            marketingOfficialFetchAttemptedTitleNo.contains(titleNo)
+        }
+    }
+
+    private fun markMarketingOfficialFetchAttempted(titleNo: String) {
+        synchronized(marketingOfficialFetchAttemptedTitleNo) {
+            marketingOfficialFetchAttemptedTitleNo.add(titleNo)
         }
     }
 
@@ -2390,11 +2480,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         marketingTitle: String,
         marketingThumbnail: String,
     ): OfficialMangaMeta? {
+        val key = titleNo?.trim().orEmpty()
         getOfficialMangaMeta(titleNo)?.let { existing ->
             if (existing.title.isNotBlank() && existing.thumbnailUrl.isNotBlank()) return existing
         }
-        val fetched = fetchOfficialMangaMetaFromDetail(titleNo, identityPath)
-        if (fetched != null && (fetched.title.isNotBlank() || fetched.thumbnailUrl.isNotBlank())) return fetched
+        if (key.isNotBlank() && !wasMarketingOfficialFetchAttempted(key)) {
+            val fetched = fetchOfficialMangaMetaFromDetail(titleNo, identityPath)
+            if (fetched != null && (fetched.title.isNotBlank() || fetched.thumbnailUrl.isNotBlank())) return fetched
+        }
         val cached = getOfficialMangaMeta(titleNo)
         if (cached != null && (cached.title.isNotBlank() || cached.thumbnailUrl.isNotBlank())) return cached
         dlog(
@@ -2407,6 +2500,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun fetchOfficialMangaMetaFromDetail(titleNo: String?, identityPath: String): OfficialMangaMeta? {
         val key = titleNo?.trim().orEmpty()
         if (key.isBlank()) return null
+        markMarketingOfficialFetchAttempted(key)
         val requestPath = canonicalDetailRequestPath(identityPath.ifBlank { "/episodeList?titleNo=$key" })
         val finalUrl = baseUrl + requestPath
         return try {
@@ -3272,6 +3366,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val MARKETING_DETAIL_FETCH_TIMEOUT_MS = 6_000L
+        private const val MARKETING_DETAIL_PREFETCH_WAIT_MS = 6_500L
+        private const val MARKETING_DETAIL_PREFETCH_CONCURRENCY = 4
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
