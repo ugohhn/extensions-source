@@ -761,14 +761,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         fun addModule(origin: String, selector: String, includeElement: (Element) -> Boolean = { true }) {
             val items = document.select(selector)
                 .filter { it.attr("href").isNotBlank() }
-                .filter(includeElement)
             val added = mutableListOf<Element>()
             items.forEach { element ->
+                val includedByModule = includeElement(element)
+                registerRawPopularEntryProbe(
+                    element = element,
+                    origin = origin,
+                    includedByModule = includedByModule,
+                    dropReason = if (includedByModule) "raw-included" else "module-filtered",
+                )
+                if (!includedByModule) return@forEach
                 val key = System.identityHashCode(element)
                 if (seen.add(key)) {
                     element.attr("data-mihon-origin", origin)
                     result.add(element)
                     added.add(element)
+                } else {
+                    registerRawPopularEntryProbe(
+                        element = element,
+                        origin = origin,
+                        includedByModule = false,
+                        dropReason = "duplicate-element",
+                    )
                 }
             }
             logPopularModuleProbe(origin, added)
@@ -1135,6 +1149,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawHref: String,
         val rawCover: String,
         val finalCover: String,
+        val selected: Boolean,
+        val dropReason: String,
+    )
+
+    private data class RawEntryProbeStats(
+        var total: Int = 0,
+        var included: Int = 0,
+        var filtered: Int = 0,
+        var withCover: Int = 0,
+        val titleNos: MutableSet<String> = linkedSetOf(),
     )
 
     private data class CoverCompareStats(
@@ -1147,7 +1171,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     )
 
     private val listCoverSnapshotsByTitleNo = mutableMapOf<String, MutableList<ListCoverSnapshot>>()
+    private val rawEntryProbeStatsByOrigin = linkedMapOf<String, RawEntryProbeStats>()
     private val coverCompareStatsByBucket = linkedMapOf<String, CoverCompareStats>()
+    private var rawEntryProbeLogCount = 0
+    private var rawEntrySummaryLogCount = 0
     private var coverListProbeLogCount = 0
     private var coverDetailProbeLogCount = 0
     private var coverCompareProbeLogCount = 0
@@ -3017,6 +3044,96 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun registerRawPopularEntryProbe(
+        element: Element,
+        origin: String,
+        includedByModule: Boolean,
+        dropReason: String,
+    ) {
+        val rawHref = element.attr("href")
+        val absHref = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(absHref)
+        val titleNo = titleNoFromUrl(cleanPath)
+            ?: titleNoFromUrl(absHref)
+            ?: titleNoFromUrl(rawHref)
+            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
+            ?: scEventParameterValue(element, "recommended_titleNo")
+        val title = mangaTitleFromElement(element)
+        val pageModel = queryParamValueFromUrlLike(absHref, "pageModel")
+            .ifBlank { queryParamValueFromUrlLike(rawHref, "pageModel") }
+        val candidate = extractElementCoverCandidate(element)
+        val finalCover = if (candidate.rawUrl.isNotBlank() && !candidate.isBanner) candidate.finalUrl else ""
+        updateRawEntryProbeStats(origin, titleNo.orEmpty(), includedByModule, candidate.rawUrl)
+        registerListCoverSnapshot(
+            element = element,
+            origin = origin,
+            titleNo = titleNo,
+            title = title,
+            rawCover = candidate.rawUrl,
+            finalCover = finalCover,
+            selected = false,
+            dropReason = dropReason,
+        )
+        if (rawEntryProbeLogCount < RAW_ENTRY_PROBE_LOG_LIMIT && shouldLogRawEntryProbe(origin, pageModel, dropReason)) {
+            rawEntryProbeLogCount += 1
+            dlog(
+                "rawEntryProbe titleNo=${titleNo.orEmpty()} origin=$origin pageModel=$pageModel " +
+                    "included=$includedByModule dropReason=$dropReason title=$title " +
+                    "coverKey=${coverCompareKey(finalCover.ifBlank { candidate.rawUrl })} " +
+                    "rawCover=${candidate.rawUrl} finalCover=$finalCover rawHref=$rawHref"
+            )
+        }
+        if (rawEntrySummaryLogCount < RAW_ENTRY_SUMMARY_LOG_LIMIT && shouldLogRawEntrySummary(origin)) {
+            rawEntrySummaryLogCount += 1
+            dlog("rawEntrySummary ${rawEntrySummaryText()}")
+        }
+    }
+
+    private fun updateRawEntryProbeStats(
+        origin: String,
+        titleNo: String,
+        includedByModule: Boolean,
+        rawCover: String,
+    ) {
+        synchronized(rawEntryProbeStatsByOrigin) {
+            val stats = rawEntryProbeStatsByOrigin.getOrPut(origin) { RawEntryProbeStats() }
+            stats.total += 1
+            if (includedByModule) {
+                stats.included += 1
+            } else {
+                stats.filtered += 1
+            }
+            if (rawCover.isNotBlank()) stats.withCover += 1
+            if (titleNo.isNotBlank()) stats.titleNos += titleNo
+        }
+    }
+
+    private fun shouldLogRawEntryProbe(origin: String, pageModel: String, dropReason: String): Boolean {
+        return origin == "popular-banner" ||
+            origin == "popular-ranking" ||
+            origin == "popular-genre-category" ||
+            origin == "popular-common-card" ||
+            pageModel.contains("新作登场") ||
+            pageModel.contains("新作登場") ||
+            dropReason != "raw-included"
+    }
+
+    private fun shouldLogRawEntrySummary(origin: String): Boolean {
+        val total = synchronized(rawEntryProbeStatsByOrigin) {
+            rawEntryProbeStatsByOrigin[origin]?.total ?: 0
+        }
+        return total == 1 || total % 20 == 0
+    }
+
+    private fun rawEntrySummaryText(): String {
+        return synchronized(rawEntryProbeStatsByOrigin) {
+            rawEntryProbeStatsByOrigin.entries.joinToString(" | ") { (origin, stats) ->
+                "$origin(total=${stats.total},included=${stats.included},filtered=${stats.filtered}," +
+                    "withCover=${stats.withCover},uniqueTitleNo=${stats.titleNos.size})"
+            }
+        }
+    }
+
     private fun registerListCoverSnapshot(
         element: Element,
         origin: String,
@@ -3024,6 +3141,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         title: String,
         rawCover: String,
         finalCover: String,
+        selected: Boolean = true,
+        dropReason: String = "selected",
     ) {
         val titleNoValue = titleNo?.takeIf { it.isNotBlank() } ?: return
         val rawHref = element.attr("href")
@@ -3037,6 +3156,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             rawHref = rawHref,
             rawCover = rawCover,
             finalCover = finalCover,
+            selected = selected,
+            dropReason = dropReason,
         )
         synchronized(listCoverSnapshotsByTitleNo) {
             val list = listCoverSnapshotsByTitleNo.getOrPut(titleNoValue) { mutableListOf() }
@@ -3060,7 +3181,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             coverListProbeLogCount += 1
             dlog(
                 "coverListProbe titleNo=$titleNoValue origin=$origin pageModel=$pageModel " +
-                    "title=$title rawCover=$rawCover finalCover=$finalCover rawHref=$rawHref"
+                    "selected=$selected dropReason=$dropReason title=$title " +
+                    "rawCover=$rawCover finalCover=$finalCover rawHref=$rawHref"
             )
         }
     }
@@ -3164,6 +3286,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 coverCompareProbeLogCount += 1
                 dlog(
                     "coverCompare titleNo=$titleNo bucket=$bucket listOrigin=${snapshot.origin} pageModel=${snapshot.pageModel} " +
+                        "selected=${snapshot.selected} dropReason=${snapshot.dropReason} " +
                         "sameTitleNormalized=$sameTitle sameCoverKey=$sameCover " +
                         "titleDiff=$titleDiff coverDiff=$coverDiff bothDiff=$bothDiff " +
                         "listTitle=${snapshot.title} detailTitle=$title " +
@@ -3386,8 +3509,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val VERBOSE_LIST_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
-        private const val COVER_PROBE_TITLE_CACHE_MAX = 500
-        private const val COVER_PROBE_LIST_LOG_LIMIT = 180
+        private const val COVER_PROBE_TITLE_CACHE_MAX = 800
+        private const val RAW_ENTRY_PROBE_LOG_LIMIT = 360
+        private const val RAW_ENTRY_SUMMARY_LOG_LIMIT = 120
+        private const val COVER_PROBE_LIST_LOG_LIMIT = 240
         private const val COVER_PROBE_DETAIL_LOG_LIMIT = 160
         private const val COVER_PROBE_COMPARE_LOG_LIMIT = 240
         private const val COVER_PROBE_SUMMARY_LOG_LIMIT = 80
