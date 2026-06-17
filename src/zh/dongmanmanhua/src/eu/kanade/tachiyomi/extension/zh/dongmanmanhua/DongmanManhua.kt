@@ -738,6 +738,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
+            ensureNewPageTitlePrefetchStarted("popular-request")
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -1164,9 +1165,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val titlesByTitleNo: Map<String, String>,
     )
 
+    private data class NewPageTitlePrefetchState(
+        val latch: CountDownLatch,
+        val startedAt: Long,
+    )
+
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
     private val newPageTitleCacheLock = Any()
     private var newPageTitleCache: NewPageTitleCache? = null
+    private var newPageTitlePrefetchState: NewPageTitlePrefetchState? = null
 
     private data class GenrePageCache(
         val genre: String,
@@ -2384,73 +2391,155 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt = System.currentTimeMillis()
         val cachedTitles = getNewPageTitleCache()
         val filledFromCache = applyNewPageOfficialTitles(targetTitleNos, cachedTitles)
-        val remainingTitleNos = targetTitleNos
+        var remainingTitleNos = targetTitleNos
             .filter { titleNo -> getOfficialMangaMeta(titleNo)?.title.isNullOrBlank() }
             .toSet()
         if (remainingTitleNos.isEmpty()) {
             dlog(
                 "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} remaining=0 " +
-                    "filled=$filledFromCache cacheFilled=$filledFromCache requestFilled=0 " +
-                    "cacheHit=${cachedTitles.isNotEmpty()} request=false requestOk=false " +
+                    "filled=$filledFromCache cacheFilled=$filledFromCache prefetchFilled=0 " +
+                    "cacheHit=${cachedTitles.isNotEmpty()} prefetch=false wait=false " +
                     "elapsed=${System.currentTimeMillis() - startedAt}ms"
             )
             return
         }
 
-        var requestOk = false
-        val fetchedTitles = runCatching {
-            requestOk = true
-            fetchNewPageOfficialTitleMap()
-        }.getOrElse { e ->
-            requestOk = false
-            wlog(
-                "popularNewWorkNewPageTitleFillFailed targets=${targetTitleNos.size} " +
-                    "remaining=${remainingTitleNos.size}",
-                e,
-            )
-            emptyMap()
-        }
-        if (fetchedTitles.isNotEmpty()) {
-            rememberNewPageTitleCache(fetchedTitles)
-        }
-        val filledFromRequest = applyNewPageOfficialTitles(remainingTitleNos, fetchedTitles)
-        val filled = filledFromCache + filledFromRequest
+        val latch = ensureNewPageTitlePrefetchStarted("popular-missing", force = true)
+        val waited = latch?.let {
+            runCatching { it.await(NEW_PAGE_TITLE_PREFETCH_WAIT_MS, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+        } ?: false
+        val refreshedTitles = getNewPageTitleCache()
+        val filledFromPrefetch = applyNewPageOfficialTitles(remainingTitleNos, refreshedTitles)
+        remainingTitleNos = targetTitleNos
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.title.isNullOrBlank() }
+            .toSet()
+        val filled = filledFromCache + filledFromPrefetch
         dlog(
             "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} remaining=${remainingTitleNos.size} " +
-                "filled=$filled cacheFilled=$filledFromCache requestFilled=$filledFromRequest " +
-                "cacheHit=${cachedTitles.isNotEmpty()} request=true requestOk=$requestOk " +
+                "filled=$filled cacheFilled=$filledFromCache prefetchFilled=$filledFromPrefetch " +
+                "cacheHit=${cachedTitles.isNotEmpty()} prefetch=${latch != null} wait=$waited " +
                 "elapsed=${System.currentTimeMillis() - startedAt}ms"
         )
     }
 
     private fun getNewPageTitleCache(): Map<String, String> {
+        return synchronized(newPageTitleCacheLock) {
+            val cache = newPageTitleCache ?: readPersistedNewPageTitleCache()?.also { newPageTitleCache = it }
+            cache?.titlesByTitleNo.orEmpty()
+        }
+    }
+
+    private fun isNewPageTitleCacheFresh(): Boolean {
         val now = System.currentTimeMillis()
-        synchronized(newPageTitleCacheLock) {
-            val cache = newPageTitleCache ?: return emptyMap()
-            if (now - cache.createdAt > NEW_PAGE_TITLE_CACHE_TTL_MS) {
-                newPageTitleCache = null
-                return emptyMap()
-            }
-            return cache.titlesByTitleNo
+        return synchronized(newPageTitleCacheLock) {
+            val cache = newPageTitleCache ?: readPersistedNewPageTitleCache()?.also { newPageTitleCache = it }
+            cache != null && now - cache.createdAt <= NEW_PAGE_TITLE_CACHE_TTL_MS
         }
     }
 
     private fun rememberNewPageTitleCache(titlesByTitleNo: Map<String, String>) {
         val cleanTitles = titlesByTitleNo
+            .mapKeys { (titleNo, _) -> titleNo.trim() }
             .mapValues { (_, title) -> title.trim() }
+            .filterKeys { it.isNotBlank() }
             .filterValues { it.isNotBlank() }
         if (cleanTitles.isEmpty()) return
         synchronized(newPageTitleCacheLock) {
-            newPageTitleCache = NewPageTitleCache(
+            val existing = newPageTitleCache ?: readPersistedNewPageTitleCache()
+            val mergedTitles = linkedMapOf<String, String>()
+            existing?.titlesByTitleNo.orEmpty().forEach { (titleNo, title) ->
+                if (titleNo.isNotBlank() && title.isNotBlank()) mergedTitles[titleNo] = title
+            }
+            cleanTitles.forEach { (titleNo, title) -> mergedTitles[titleNo] = title }
+            while (mergedTitles.size > NEW_PAGE_TITLE_CACHE_MAX_ENTRIES) {
+                val firstKey = mergedTitles.keys.firstOrNull() ?: break
+                mergedTitles.remove(firstKey)
+            }
+            val cache = NewPageTitleCache(
                 createdAt = System.currentTimeMillis(),
-                titlesByTitleNo = cleanTitles,
+                titlesByTitleNo = mergedTitles,
             )
+            newPageTitleCache = cache
+            persistNewPageTitleCache(cache)
         }
     }
 
-    private fun fetchNewPageOfficialTitleMap(): Map<String, String> {
+    private fun readPersistedNewPageTitleCache(): NewPageTitleCache? {
+        val raw = preferences.getString(PREF_NEW_PAGE_TITLE_CACHE, "").orEmpty()
+        if (raw.isBlank()) return null
+        return runCatching {
+            val obj = JSONObject(raw)
+            val createdAt = obj.optLong("createdAt", 0L)
+            val titlesObj = obj.optJSONObject("titles") ?: return@runCatching null
+            val titles = linkedMapOf<String, String>()
+            val keys = titlesObj.keys()
+            while (keys.hasNext()) {
+                val titleNo = keys.next().trim()
+                val title = titlesObj.optString(titleNo).trim()
+                if (titleNo.isNotBlank() && title.isNotBlank()) {
+                    titles[titleNo] = title
+                }
+            }
+            if (titles.isEmpty()) null else NewPageTitleCache(createdAt, titles)
+        }.getOrNull()
+    }
+
+    private fun persistNewPageTitleCache(cache: NewPageTitleCache) {
+        runCatching {
+            val titlesObj = JSONObject()
+            cache.titlesByTitleNo.forEach { (titleNo, title) ->
+                if (titleNo.isNotBlank() && title.isNotBlank()) titlesObj.put(titleNo, title)
+            }
+            val obj = JSONObject()
+                .put("createdAt", cache.createdAt)
+                .put("titles", titlesObj)
+            preferences.edit().putString(PREF_NEW_PAGE_TITLE_CACHE, obj.toString()).apply()
+        }
+    }
+
+    private fun ensureNewPageTitlePrefetchStarted(reason: String, force: Boolean = false): CountDownLatch? {
+        if (!force && isNewPageTitleCacheFresh()) return null
+        var shouldStart = false
+        val latch = synchronized(newPageTitleCacheLock) {
+            newPageTitlePrefetchState?.latch ?: CountDownLatch(1).also { createdLatch ->
+                newPageTitlePrefetchState = NewPageTitlePrefetchState(
+                    latch = createdLatch,
+                    startedAt = System.currentTimeMillis(),
+                )
+                shouldStart = true
+            }
+        }
+        if (!shouldStart) return latch
+
+        Thread({
+            val startedAt = System.currentTimeMillis()
+            var requestOk = false
+            var count = 0
+            runCatching {
+                val titles = fetchNewPageOfficialTitleMap(NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS)
+                requestOk = true
+                count = titles.size
+                rememberNewPageTitleCache(titles)
+            }.onFailure { e ->
+                wlog("popularNewPageTitlePrefetchFailed reason=$reason", e)
+            }
+            synchronized(newPageTitleCacheLock) {
+                if (newPageTitlePrefetchState?.latch === latch) {
+                    newPageTitlePrefetchState = null
+                }
+            }
+            latch.countDown()
+            dlog(
+                "popularNewPageTitlePrefetch reason=$reason requestOk=$requestOk " +
+                    "count=$count elapsed=${System.currentTimeMillis() - startedAt}ms"
+            )
+        }, "DongmanNewPageTitlePrefetch").start()
+        return latch
+    }
+
+    private fun fetchNewPageOfficialTitleMap(timeoutMs: Long = NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS): Map<String, String> {
         val timedClient = client.newBuilder()
-            .callTimeout(NEW_PAGE_TITLE_FILL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .build()
         val document = timedClient.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
             newResponse.asJsoup()
@@ -3397,8 +3486,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
-        private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 10 * 60 * 1000L
-        private const val NEW_PAGE_TITLE_FILL_TIMEOUT_MS = 650L
+        private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
+        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_500L
+        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 120L
+        private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
@@ -3418,6 +3509,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_LOGOUT_TRIGGER = "pref_logout_trigger"
         internal const val PREF_CLEAR_BACKUP = "pref_clear_backup"
         internal const val PREF_SEARCH_MODE = "pref_search_mode"
+        private const val PREF_NEW_PAGE_TITLE_CACHE = "pref_new_page_title_cache_v1"
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
