@@ -757,32 +757,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun collectPopularMangaElements(document: org.jsoup.nodes.Document): List<Element> {
         val result = mutableListOf<Element>()
         val seen = mutableSetOf<Int>()
+        var skippedMarketingNewWorks = 0
 
         fun addModule(origin: String, selector: String, includeElement: (Element) -> Boolean = { true }) {
             val items = document.select(selector)
                 .filter { it.attr("href").isNotBlank() }
+                .filter { element ->
+                    val included = includeElement(element)
+                    if (!included && origin == "popular-common-card" && isPopularCommonCardNewWork(element)) {
+                        skippedMarketingNewWorks += 1
+                    }
+                    included
+                }
             val added = mutableListOf<Element>()
             items.forEach { element ->
-                val includedByModule = includeElement(element)
-                registerRawPopularEntryProbe(
-                    element = element,
-                    origin = origin,
-                    includedByModule = includedByModule,
-                    dropReason = if (includedByModule) "raw-included" else "module-filtered",
-                )
-                if (!includedByModule) return@forEach
                 val key = System.identityHashCode(element)
                 if (seen.add(key)) {
                     element.attr("data-mihon-origin", origin)
                     result.add(element)
                     added.add(element)
-                } else {
-                    registerRawPopularEntryProbe(
-                        element = element,
-                        origin = origin,
-                        includedByModule = false,
-                        dropReason = "duplicate-element",
-                    )
                 }
             }
             logPopularModuleProbe(origin, added)
@@ -806,8 +799,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popular-common-card",
             "li[id^=title_li_] > a[href], ul.lst_type2 li a[href], ul.weekly_lst li a[href], " +
                 "a[href*=list?title_no], a[href*=episodeList?titleNo]"
-        ) { hasCleanOrKnownCanonicalIdentity(it) && !isPopularGenreCategoryElement(it) }
+        ) {
+            hasCleanOrKnownCanonicalIdentity(it) &&
+                !isPopularGenreCategoryElement(it) &&
+                !isPopularCommonCardNewWork(it)
+        }
 
+        if (skippedMarketingNewWorks > 0) {
+            dlog("popularCommonCardSkipMarketingNewWorks count=$skippedMarketingNewWorks")
+        }
         return result
     }
 
@@ -890,6 +890,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
         return styleUrl.isNotBlank() && !styleUrl.contains("/banner/")
+    }
+
+    private fun isPopularCommonCardNewWork(element: Element): Boolean {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        return rawHref.contains("新作登场") ||
+            rawHref.contains("新作登場") ||
+            href.contains("新作登场") ||
+            href.contains("新作登場")
     }
 
     private fun logPopularModuleProbe(origin: String, elements: List<Element>) {
@@ -1134,51 +1143,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val titleNo: String?,
         val hasNew: Boolean,
     )
-
-    private data class CoverCandidate(
-        val rawUrl: String,
-        val finalUrl: String,
-        val source: String,
-        val isBanner: Boolean,
-    )
-
-    private data class ListCoverSnapshot(
-        val origin: String,
-        val pageModel: String,
-        val title: String,
-        val rawHref: String,
-        val rawCover: String,
-        val finalCover: String,
-        val selected: Boolean,
-        val dropReason: String,
-    )
-
-    private data class RawEntryProbeStats(
-        var total: Int = 0,
-        var included: Int = 0,
-        var filtered: Int = 0,
-        var withCover: Int = 0,
-        val titleNos: MutableSet<String> = linkedSetOf(),
-    )
-
-    private data class CoverCompareStats(
-        var total: Int = 0,
-        var titleDiff: Int = 0,
-        var coverDiff: Int = 0,
-        var bothDiff: Int = 0,
-        var missingListCover: Int = 0,
-        var missingDetailCover: Int = 0,
-    )
-
-    private val listCoverSnapshotsByTitleNo = mutableMapOf<String, MutableList<ListCoverSnapshot>>()
-    private val rawEntryProbeStatsByOrigin = linkedMapOf<String, RawEntryProbeStats>()
-    private val coverCompareStatsByBucket = linkedMapOf<String, CoverCompareStats>()
-    private var rawEntryProbeLogCount = 0
-    private var rawEntrySummaryLogCount = 0
-    private var coverListProbeLogCount = 0
-    private var coverDetailProbeLogCount = 0
-    private var coverCompareProbeLogCount = 0
-    private var coverCompareSummaryLogCount = 0
 
     private data class GenrePageCache(
         val genre: String,
@@ -1919,7 +1883,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             author = detailDiv?.selectFirst("p.author")?.text()
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
-            val detailThumbnail = extractDetailThumbnailUrl(document, titleNo, title)
+            val detailThumbnail = extractDetailThumbnailUrl(document)
             if (detailThumbnail.isNotBlank()) {
                 thumbnail_url = detailThumbnail
             }
@@ -2241,7 +2205,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
-        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo, titleText)
+        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
@@ -2316,7 +2280,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         cacheNewTitle(titleNo, hasNew)
         url = identityPath
         title = mangaTitleFromElement(element)
-        thumbnail_url = extractThumbnailUrl(element, origin, titleNo, title)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog(
@@ -2338,7 +2302,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         url = identityPath
         title = element.selectFirst(".info .subj .ellipsis, p.subj .ellipsis")?.text() ?: ""
-        thumbnail_url = extractThumbnailUrl(element, origin, titleNo, title)
+        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (VERBOSE_LIST_LOG) {
             dlog("searchMangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url titleNo=$titleNo title=$title")
@@ -2996,240 +2960,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .substringBefore("&x-oss-process=")
     }
 
-    private fun extractThumbnailUrl(
-        element: Element,
-        origin: String = "",
-        titleNo: String? = null,
-        title: String = "",
-    ): String {
+    private fun extractThumbnailUrl(element: Element, origin: String = "", titleNo: String? = null): String {
         if (origin == "popular-banner") {
-            val candidate = extractElementCoverCandidate(element)
-            registerListCoverSnapshot(element, origin, titleNo, title, candidate.rawUrl, "")
             return ""
         }
 
-        val candidate = extractElementCoverCandidate(element)
-        val finalUrl = if (candidate.rawUrl.isNotBlank() && !candidate.isBanner) candidate.finalUrl else ""
-        registerListCoverSnapshot(element, origin, titleNo, title, candidate.rawUrl, finalUrl)
-        return finalUrl
-    }
-
-    private fun extractElementCoverCandidate(element: Element): CoverCandidate {
         val img = element.selectFirst("img")
         val rawUrl = img?.attr("data-original")
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             ?: ""
-        if (rawUrl.isNotBlank()) {
-            return CoverCandidate(
-                rawUrl = rawUrl,
-                finalUrl = buildThumbnailUrl(rawUrl, cdnBase),
-                source = "element-img",
-                isBanner = rawUrl.contains("/banner/"),
-            )
+        if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) {
+            return buildThumbnailUrl(rawUrl, cdnBase)
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
-        val match = Regex("""url\(['\"]?([^)'\"]+)['\"]?\)""").find(style)
+        val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
-        return if (styleUrl.isNotBlank()) {
-            CoverCandidate(
-                rawUrl = styleUrl,
-                finalUrl = buildThumbnailUrl(styleUrl, cdnBase),
-                source = "element-style",
-                isBanner = styleUrl.contains("/banner/"),
-            )
+        return if (styleUrl.isNotBlank() && !styleUrl.contains("/banner/")) {
+            buildThumbnailUrl(styleUrl, cdnBase)
         } else {
-            CoverCandidate("", "", "none", false)
+            ""
         }
     }
 
-    private fun registerRawPopularEntryProbe(
-        element: Element,
-        origin: String,
-        includedByModule: Boolean,
-        dropReason: String,
-    ) {
-        val rawHref = element.attr("href")
-        val absHref = element.absUrl("href").ifEmpty { rawHref }
-        val cleanPath = cleanMangaDetailPath(absHref)
-        val titleNo = titleNoFromUrl(cleanPath)
-            ?: titleNoFromUrl(absHref)
-            ?: titleNoFromUrl(rawHref)
-            ?: element.attr("data-title-no").takeIf { it.isNotBlank() }
-            ?: scEventParameterValue(element, "recommended_titleNo")
-        val title = mangaTitleFromElement(element)
-        val pageModel = queryParamValueFromUrlLike(absHref, "pageModel")
-            .ifBlank { queryParamValueFromUrlLike(rawHref, "pageModel") }
-        val candidate = extractElementCoverCandidate(element)
-        val finalCover = if (candidate.rawUrl.isNotBlank() && !candidate.isBanner) candidate.finalUrl else ""
-        updateRawEntryProbeStats(origin, titleNo.orEmpty(), includedByModule, candidate.rawUrl)
-        registerListCoverSnapshot(
-            element = element,
-            origin = origin,
-            titleNo = titleNo,
-            title = title,
-            rawCover = candidate.rawUrl,
-            finalCover = finalCover,
-            selected = false,
-            dropReason = dropReason,
-        )
-        if (rawEntryProbeLogCount < RAW_ENTRY_PROBE_LOG_LIMIT && shouldLogRawEntryProbe(origin, pageModel, dropReason)) {
-            rawEntryProbeLogCount += 1
-            dlog(
-                "rawEntryProbe titleNo=${titleNo.orEmpty()} origin=$origin pageModel=$pageModel " +
-                    "included=$includedByModule dropReason=$dropReason title=$title " +
-                    "coverKey=${coverCompareKey(finalCover.ifBlank { candidate.rawUrl })} " +
-                    "rawCover=${candidate.rawUrl} finalCover=$finalCover rawHref=$rawHref"
-            )
-        }
-        if (rawEntrySummaryLogCount < RAW_ENTRY_SUMMARY_LOG_LIMIT && shouldLogRawEntrySummary(origin)) {
-            rawEntrySummaryLogCount += 1
-            dlog("rawEntrySummary ${rawEntrySummaryText()}")
-        }
-    }
-
-    private fun updateRawEntryProbeStats(
-        origin: String,
-        titleNo: String,
-        includedByModule: Boolean,
-        rawCover: String,
-    ) {
-        synchronized(rawEntryProbeStatsByOrigin) {
-            val stats = rawEntryProbeStatsByOrigin.getOrPut(origin) { RawEntryProbeStats() }
-            stats.total += 1
-            if (includedByModule) {
-                stats.included += 1
-            } else {
-                stats.filtered += 1
-            }
-            if (rawCover.isNotBlank()) stats.withCover += 1
-            if (titleNo.isNotBlank()) stats.titleNos += titleNo
-        }
-    }
-
-    private fun shouldLogRawEntryProbe(origin: String, pageModel: String, dropReason: String): Boolean {
-        return origin == "popular-banner" ||
-            origin == "popular-ranking" ||
-            origin == "popular-genre-category" ||
-            origin == "popular-common-card" ||
-            pageModel.contains("新作登场") ||
-            pageModel.contains("新作登場") ||
-            dropReason != "raw-included"
-    }
-
-    private fun shouldLogRawEntrySummary(origin: String): Boolean {
-        val total = synchronized(rawEntryProbeStatsByOrigin) {
-            rawEntryProbeStatsByOrigin[origin]?.total ?: 0
-        }
-        return total == 1 || total % 20 == 0
-    }
-
-    private fun rawEntrySummaryText(): String {
-        return synchronized(rawEntryProbeStatsByOrigin) {
-            rawEntryProbeStatsByOrigin.entries.joinToString(" | ") { (origin, stats) ->
-                "$origin(total=${stats.total},included=${stats.included},filtered=${stats.filtered}," +
-                    "withCover=${stats.withCover},uniqueTitleNo=${stats.titleNos.size})"
-            }
-        }
-    }
-
-    private fun registerListCoverSnapshot(
-        element: Element,
-        origin: String,
-        titleNo: String?,
-        title: String,
-        rawCover: String,
-        finalCover: String,
-        selected: Boolean = true,
-        dropReason: String = "selected",
-    ) {
-        val titleNoValue = titleNo?.takeIf { it.isNotBlank() } ?: return
-        val rawHref = element.attr("href")
-        val absHref = element.absUrl("href").ifEmpty { rawHref }
-        val pageModel = queryParamValueFromUrlLike(absHref, "pageModel")
-            .ifBlank { queryParamValueFromUrlLike(rawHref, "pageModel") }
-        val snapshot = ListCoverSnapshot(
-            origin = origin,
-            pageModel = pageModel,
-            title = title,
-            rawHref = rawHref,
-            rawCover = rawCover,
-            finalCover = finalCover,
-            selected = selected,
-            dropReason = dropReason,
-        )
-        synchronized(listCoverSnapshotsByTitleNo) {
-            val list = listCoverSnapshotsByTitleNo.getOrPut(titleNoValue) { mutableListOf() }
-            val exists = list.any {
-                it.origin == snapshot.origin &&
-                    it.pageModel == snapshot.pageModel &&
-                    it.title == snapshot.title &&
-                    it.rawCover == snapshot.rawCover &&
-                    it.finalCover == snapshot.finalCover
-            }
-            if (!exists) {
-                list += snapshot
-                if (list.size > 8) list.removeAt(0)
-            }
-            if (listCoverSnapshotsByTitleNo.size > COVER_PROBE_TITLE_CACHE_MAX) {
-                val firstKey = listCoverSnapshotsByTitleNo.keys.firstOrNull()
-                if (firstKey != null) listCoverSnapshotsByTitleNo.remove(firstKey)
-            }
-        }
-        if (coverListProbeLogCount < COVER_PROBE_LIST_LOG_LIMIT && shouldLogCoverListProbe(origin, pageModel)) {
-            coverListProbeLogCount += 1
-            dlog(
-                "coverListProbe titleNo=$titleNoValue origin=$origin pageModel=$pageModel " +
-                    "selected=$selected dropReason=$dropReason title=$title " +
-                    "rawCover=$rawCover finalCover=$finalCover rawHref=$rawHref"
-            )
-        }
-    }
-
-    private fun shouldLogCoverListProbe(origin: String, pageModel: String): Boolean {
-        return origin == "popular-common-card" ||
-            origin == "popular-ranking" ||
-            origin == "popular-genre-category" ||
-            origin.startsWith("dailySchedule") ||
-            pageModel.contains("新作登场") ||
-            pageModel.contains("新作登場")
-    }
-
-    private fun queryParamValueFromUrlLike(raw: String, key: String): String {
-        if (raw.isBlank()) return ""
-        return Regex("""(?:[?&])${Regex.escape(key)}=([^&#]*)""")
-            .find(raw)
-            ?.groupValues
-            ?.getOrNull(1)
-            .orEmpty()
-    }
-
-    private fun extractDetailThumbnailUrl(
-        document: org.jsoup.nodes.Document,
-        titleNo: String?,
-        title: String,
-    ): String {
-        val candidate = extractDetailCoverCandidate(document)
-        val titleNoValue = titleNo?.takeIf { it.isNotBlank() }
-        if (titleNoValue != null) {
-            logDetailCoverProbe(titleNoValue, title, candidate)
-        }
-        return candidate.finalUrl
-    }
-
-    private fun extractDetailCoverCandidate(document: org.jsoup.nodes.Document): CoverCandidate {
+    private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
         val metaUrl = document.selectFirst("meta[property=og:image]")?.attr("content")
             ?.ifBlank { document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty() }
             .orEmpty()
-        if (metaUrl.isNotBlank()) {
-            return CoverCandidate(
-                rawUrl = metaUrl,
-                finalUrl = buildThumbnailUrl(metaUrl, cdnBase),
-                source = "detail-meta",
-                isBanner = metaUrl.contains("/banner/"),
-            )
-        }
+        if (metaUrl.isNotBlank()) return buildThumbnailUrl(metaUrl, cdnBase)
 
         val img = document.selectFirst(
             "div.detail_info img, .detail_info img, .detail_header img, .detail_img img, " +
@@ -3239,144 +2998,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.ifEmpty { img.attr("data-src") }
             ?.ifEmpty { img.attr("src") }
             .orEmpty()
-        return if (rawUrl.isNotBlank()) {
-            CoverCandidate(
-                rawUrl = rawUrl,
-                finalUrl = buildThumbnailUrl(rawUrl, cdnBase),
-                source = "detail-img",
-                isBanner = rawUrl.contains("/banner/"),
-            )
-        } else {
-            CoverCandidate("", "", "detail-none", false)
-        }
+        return buildThumbnailUrl(rawUrl, cdnBase)
     }
 
-    private fun logDetailCoverProbe(titleNo: String, title: String, candidate: CoverCandidate) {
-        if (coverDetailProbeLogCount < COVER_PROBE_DETAIL_LOG_LIMIT) {
-            coverDetailProbeLogCount += 1
-            dlog(
-                "coverDetailProbe titleNo=$titleNo title=$title source=${candidate.source} " +
-                    "rawCover=${candidate.rawUrl} finalCover=${candidate.finalUrl} " +
-                    "coverKey=${coverCompareKey(candidate.finalUrl.ifBlank { candidate.rawUrl })} isBanner=${candidate.isBanner}"
-            )
-        }
-        val snapshots = synchronized(listCoverSnapshotsByTitleNo) {
-            listCoverSnapshotsByTitleNo[titleNo]?.toList().orEmpty()
-        }
-        snapshots.forEach { snapshot ->
-            val bucket = coverCompareBucket(snapshot.origin, snapshot.pageModel)
-            val listCoverKey = coverCompareKey(snapshot.finalCover.ifBlank { snapshot.rawCover })
-            val detailCoverKey = coverCompareKey(candidate.finalUrl.ifBlank { candidate.rawUrl })
-            val listTitleKey = titleCompareKey(snapshot.title)
-            val detailTitleKey = titleCompareKey(title)
-            val sameTitle = listTitleKey.isNotBlank() && listTitleKey == detailTitleKey
-            val sameCover = listCoverKey.isNotBlank() && listCoverKey == detailCoverKey
-            val titleDiff = !sameTitle
-            val coverDiff = !sameCover
-            val bothDiff = titleDiff && coverDiff
-            val statsText = updateCoverCompareStats(
-                bucket = bucket,
-                titleDiff = titleDiff,
-                coverDiff = coverDiff,
-                bothDiff = bothDiff,
-                listCoverKey = listCoverKey,
-                detailCoverKey = detailCoverKey,
-            )
-            if (coverCompareProbeLogCount < COVER_PROBE_COMPARE_LOG_LIMIT) {
-                coverCompareProbeLogCount += 1
-                dlog(
-                    "coverCompare titleNo=$titleNo bucket=$bucket listOrigin=${snapshot.origin} pageModel=${snapshot.pageModel} " +
-                        "selected=${snapshot.selected} dropReason=${snapshot.dropReason} " +
-                        "sameTitleNormalized=$sameTitle sameCoverKey=$sameCover " +
-                        "titleDiff=$titleDiff coverDiff=$coverDiff bothDiff=$bothDiff " +
-                        "listTitle=${snapshot.title} detailTitle=$title " +
-                        "listCoverKey=$listCoverKey detailCoverKey=$detailCoverKey " +
-                        "listCover=${snapshot.finalCover} detailCover=${candidate.finalUrl} " +
-                        "listRawCover=${snapshot.rawCover} detailRawCover=${candidate.rawUrl} stats=$statsText"
-                )
-            }
-            if (bothDiff || coverCompareSummaryLogCount < COVER_PROBE_SUMMARY_LOG_LIMIT) {
-                if (bothDiff || shouldLogCoverCompareSummary(bucket)) {
-                    coverCompareSummaryLogCount += 1
-                    dlog("coverCompareSummary ${coverCompareSummaryText()}")
-                }
-            }
-        }
-    }
-
-    private fun coverCompareBucket(origin: String, pageModel: String): String {
-        val isNewWork = pageModel.contains("新作登场") || pageModel.contains("新作登場")
-        return when {
-            origin == "popular-common-card" && isNewWork -> "popular-common-card-new"
-            origin == "popular-common-card" -> "popular-common-card-other"
-            origin == "popular-banner" -> "popular-banner"
-            origin == "popular-ranking" -> "popular-ranking"
-            origin == "popular-genre-category" -> "popular-genre-category"
-            origin == "new" -> "new-page"
-            origin.startsWith("dailySchedule") -> "dailySchedule"
-            origin.startsWith("mangaList") -> "mangaList"
-            origin.startsWith("genreBulk") -> "genreBulk"
-            else -> origin.ifBlank { "unknown" }
-        }
-    }
-
-    private fun titleCompareKey(value: String): String {
-        return value.trim().replace(Regex("""\s+"""), "").lowercase()
-    }
-
-    private fun coverCompareKey(rawUrl: String): String {
-        val clean = stripImageProcessParams(rawUrl.trim())
-            .substringBefore('#')
-            .substringBefore('?')
-        if (clean.isBlank()) return ""
-        val withoutScheme = clean
-            .removePrefix("https://")
-            .removePrefix("http://")
-            .removePrefix("//")
-        val path = withoutScheme.substringAfter('/', withoutScheme)
-        val uuid = Regex(
-            """[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"""
-        ).find(path)?.value?.lowercase()
-        if (!uuid.isNullOrBlank()) return "uuid:$uuid"
-        val fileName = path.substringAfterLast('/').lowercase()
-        return if (fileName.isNotBlank()) "file:$fileName" else ""
-    }
-
-    private fun updateCoverCompareStats(
-        bucket: String,
-        titleDiff: Boolean,
-        coverDiff: Boolean,
-        bothDiff: Boolean,
-        listCoverKey: String,
-        detailCoverKey: String,
-    ): String {
-        return synchronized(coverCompareStatsByBucket) {
-            val stats = coverCompareStatsByBucket.getOrPut(bucket) { CoverCompareStats() }
-            stats.total += 1
-            if (titleDiff) stats.titleDiff += 1
-            if (coverDiff) stats.coverDiff += 1
-            if (bothDiff) stats.bothDiff += 1
-            if (listCoverKey.isBlank()) stats.missingListCover += 1
-            if (detailCoverKey.isBlank()) stats.missingDetailCover += 1
-            "total=${stats.total},titleDiff=${stats.titleDiff},coverDiff=${stats.coverDiff},bothDiff=${stats.bothDiff}"
-        }
-    }
-
-    private fun shouldLogCoverCompareSummary(bucket: String): Boolean {
-        val total = synchronized(coverCompareStatsByBucket) {
-            coverCompareStatsByBucket[bucket]?.total ?: 0
-        }
-        return total == 1 || total % 10 == 0
-    }
-
-    private fun coverCompareSummaryText(): String {
-        return synchronized(coverCompareStatsByBucket) {
-            coverCompareStatsByBucket.entries.joinToString(" | ") { (bucket, stats) ->
-                "$bucket(total=${stats.total},titleDiff=${stats.titleDiff},coverDiff=${stats.coverDiff}," +
-                    "bothDiff=${stats.bothDiff},missingList=${stats.missingListCover},missingDetail=${stats.missingDetailCover})"
-            }
-        }
-    }
 
     private fun hasNewBadge(element: Element): Boolean {
         // 只认卡片自己的 class / 图标，不因为页面文字包含 NEW 就误判。
@@ -3509,13 +3133,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val VERBOSE_LIST_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
-        private const val COVER_PROBE_TITLE_CACHE_MAX = 800
-        private const val RAW_ENTRY_PROBE_LOG_LIMIT = 360
-        private const val RAW_ENTRY_SUMMARY_LOG_LIMIT = 120
-        private const val COVER_PROBE_LIST_LOG_LIMIT = 240
-        private const val COVER_PROBE_DETAIL_LOG_LIMIT = 160
-        private const val COVER_PROBE_COMPARE_LOG_LIMIT = 240
-        private const val COVER_PROBE_SUMMARY_LOG_LIMIT = 80
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
