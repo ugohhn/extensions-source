@@ -1137,10 +1137,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val finalCover: String,
     )
 
+    private data class CoverCompareStats(
+        var total: Int = 0,
+        var titleDiff: Int = 0,
+        var coverDiff: Int = 0,
+        var bothDiff: Int = 0,
+        var missingListCover: Int = 0,
+        var missingDetailCover: Int = 0,
+    )
+
     private val listCoverSnapshotsByTitleNo = mutableMapOf<String, MutableList<ListCoverSnapshot>>()
+    private val coverCompareStatsByBucket = linkedMapOf<String, CoverCompareStats>()
     private var coverListProbeLogCount = 0
     private var coverDetailProbeLogCount = 0
     private var coverCompareProbeLogCount = 0
+    private var coverCompareSummaryLogCount = 0
 
     private data class GenrePageCache(
         val genre: String,
@@ -3056,6 +3067,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun shouldLogCoverListProbe(origin: String, pageModel: String): Boolean {
         return origin == "popular-common-card" ||
+            origin == "popular-ranking" ||
+            origin == "popular-genre-category" ||
+            origin.startsWith("dailySchedule") ||
             pageModel.contains("新作登场") ||
             pageModel.contains("新作登場")
     }
@@ -3120,22 +3134,124 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             coverDetailProbeLogCount += 1
             dlog(
                 "coverDetailProbe titleNo=$titleNo title=$title source=${candidate.source} " +
-                    "rawCover=${candidate.rawUrl} finalCover=${candidate.finalUrl} isBanner=${candidate.isBanner}"
+                    "rawCover=${candidate.rawUrl} finalCover=${candidate.finalUrl} " +
+                    "coverKey=${coverCompareKey(candidate.finalUrl.ifBlank { candidate.rawUrl })} isBanner=${candidate.isBanner}"
             )
         }
         val snapshots = synchronized(listCoverSnapshotsByTitleNo) {
             listCoverSnapshotsByTitleNo[titleNo]?.toList().orEmpty()
         }
         snapshots.forEach { snapshot ->
-            if (coverCompareProbeLogCount >= COVER_PROBE_COMPARE_LOG_LIMIT) return@forEach
-            coverCompareProbeLogCount += 1
-            dlog(
-                "coverCompare titleNo=$titleNo listOrigin=${snapshot.origin} pageModel=${snapshot.pageModel} " +
-                    "sameTitle=${snapshot.title == title} sameCover=${snapshot.finalCover == candidate.finalUrl} " +
-                    "listTitle=${snapshot.title} detailTitle=$title " +
-                    "listCover=${snapshot.finalCover} detailCover=${candidate.finalUrl} " +
-                    "listRawCover=${snapshot.rawCover} detailRawCover=${candidate.rawUrl}"
+            val bucket = coverCompareBucket(snapshot.origin, snapshot.pageModel)
+            val listCoverKey = coverCompareKey(snapshot.finalCover.ifBlank { snapshot.rawCover })
+            val detailCoverKey = coverCompareKey(candidate.finalUrl.ifBlank { candidate.rawUrl })
+            val listTitleKey = titleCompareKey(snapshot.title)
+            val detailTitleKey = titleCompareKey(title)
+            val sameTitle = listTitleKey.isNotBlank() && listTitleKey == detailTitleKey
+            val sameCover = listCoverKey.isNotBlank() && listCoverKey == detailCoverKey
+            val titleDiff = !sameTitle
+            val coverDiff = !sameCover
+            val bothDiff = titleDiff && coverDiff
+            val statsText = updateCoverCompareStats(
+                bucket = bucket,
+                titleDiff = titleDiff,
+                coverDiff = coverDiff,
+                bothDiff = bothDiff,
+                listCoverKey = listCoverKey,
+                detailCoverKey = detailCoverKey,
             )
+            if (coverCompareProbeLogCount < COVER_PROBE_COMPARE_LOG_LIMIT) {
+                coverCompareProbeLogCount += 1
+                dlog(
+                    "coverCompare titleNo=$titleNo bucket=$bucket listOrigin=${snapshot.origin} pageModel=${snapshot.pageModel} " +
+                        "sameTitleNormalized=$sameTitle sameCoverKey=$sameCover " +
+                        "titleDiff=$titleDiff coverDiff=$coverDiff bothDiff=$bothDiff " +
+                        "listTitle=${snapshot.title} detailTitle=$title " +
+                        "listCoverKey=$listCoverKey detailCoverKey=$detailCoverKey " +
+                        "listCover=${snapshot.finalCover} detailCover=${candidate.finalUrl} " +
+                        "listRawCover=${snapshot.rawCover} detailRawCover=${candidate.rawUrl} stats=$statsText"
+                )
+            }
+            if (bothDiff || coverCompareSummaryLogCount < COVER_PROBE_SUMMARY_LOG_LIMIT) {
+                if (bothDiff || shouldLogCoverCompareSummary(bucket)) {
+                    coverCompareSummaryLogCount += 1
+                    dlog("coverCompareSummary ${coverCompareSummaryText()}")
+                }
+            }
+        }
+    }
+
+    private fun coverCompareBucket(origin: String, pageModel: String): String {
+        val isNewWork = pageModel.contains("新作登场") || pageModel.contains("新作登場")
+        return when {
+            origin == "popular-common-card" && isNewWork -> "popular-common-card-new"
+            origin == "popular-common-card" -> "popular-common-card-other"
+            origin == "popular-banner" -> "popular-banner"
+            origin == "popular-ranking" -> "popular-ranking"
+            origin == "popular-genre-category" -> "popular-genre-category"
+            origin == "new" -> "new-page"
+            origin.startsWith("dailySchedule") -> "dailySchedule"
+            origin.startsWith("mangaList") -> "mangaList"
+            origin.startsWith("genreBulk") -> "genreBulk"
+            else -> origin.ifBlank { "unknown" }
+        }
+    }
+
+    private fun titleCompareKey(value: String): String {
+        return value.trim().replace(Regex("""\s+"""), "").lowercase()
+    }
+
+    private fun coverCompareKey(rawUrl: String): String {
+        val clean = stripImageProcessParams(rawUrl.trim())
+            .substringBefore('#')
+            .substringBefore('?')
+        if (clean.isBlank()) return ""
+        val withoutScheme = clean
+            .removePrefix("https://")
+            .removePrefix("http://")
+            .removePrefix("//")
+        val path = withoutScheme.substringAfter('/', withoutScheme)
+        val uuid = Regex(
+            """[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"""
+        ).find(path)?.value?.lowercase()
+        if (!uuid.isNullOrBlank()) return "uuid:$uuid"
+        val fileName = path.substringAfterLast('/').lowercase()
+        return if (fileName.isNotBlank()) "file:$fileName" else ""
+    }
+
+    private fun updateCoverCompareStats(
+        bucket: String,
+        titleDiff: Boolean,
+        coverDiff: Boolean,
+        bothDiff: Boolean,
+        listCoverKey: String,
+        detailCoverKey: String,
+    ): String {
+        return synchronized(coverCompareStatsByBucket) {
+            val stats = coverCompareStatsByBucket.getOrPut(bucket) { CoverCompareStats() }
+            stats.total += 1
+            if (titleDiff) stats.titleDiff += 1
+            if (coverDiff) stats.coverDiff += 1
+            if (bothDiff) stats.bothDiff += 1
+            if (listCoverKey.isBlank()) stats.missingListCover += 1
+            if (detailCoverKey.isBlank()) stats.missingDetailCover += 1
+            "total=${stats.total},titleDiff=${stats.titleDiff},coverDiff=${stats.coverDiff},bothDiff=${stats.bothDiff}"
+        }
+    }
+
+    private fun shouldLogCoverCompareSummary(bucket: String): Boolean {
+        val total = synchronized(coverCompareStatsByBucket) {
+            coverCompareStatsByBucket[bucket]?.total ?: 0
+        }
+        return total == 1 || total % 10 == 0
+    }
+
+    private fun coverCompareSummaryText(): String {
+        return synchronized(coverCompareStatsByBucket) {
+            coverCompareStatsByBucket.entries.joinToString(" | ") { (bucket, stats) ->
+                "$bucket(total=${stats.total},titleDiff=${stats.titleDiff},coverDiff=${stats.coverDiff}," +
+                    "bothDiff=${stats.bothDiff},missingList=${stats.missingListCover},missingDetail=${stats.missingDetailCover})"
+            }
         }
     }
 
@@ -3271,9 +3387,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
         private const val COVER_PROBE_TITLE_CACHE_MAX = 500
-        private const val COVER_PROBE_LIST_LOG_LIMIT = 80
-        private const val COVER_PROBE_DETAIL_LOG_LIMIT = 120
-        private const val COVER_PROBE_COMPARE_LOG_LIMIT = 160
+        private const val COVER_PROBE_LIST_LOG_LIMIT = 180
+        private const val COVER_PROBE_DETAIL_LOG_LIMIT = 160
+        private const val COVER_PROBE_COMPARE_LOG_LIMIT = 240
+        private const val COVER_PROBE_SUMMARY_LOG_LIMIT = 80
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
