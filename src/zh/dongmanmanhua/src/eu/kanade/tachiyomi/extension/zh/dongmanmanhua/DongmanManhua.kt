@@ -747,6 +747,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawElements = collectPopularMangaElements(document)
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
         preseedOfficialMetaFromPopularRawElements(rawElements)
+        preseedOfficialTitlesFromNewPageForMarketingNewWorks(rawElements)
         val elements = selectPopularMangaElements(rawElements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -2361,6 +2362,45 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (count > 0) dlog("popularOfficialMetaPreseed count=$count")
     }
 
+    private fun preseedOfficialTitlesFromNewPageForMarketingNewWorks(rawElements: List<Element>) {
+        val targetTitleNos = rawElements.asSequence()
+            .filter { element ->
+                element.attr("data-mihon-origin") == "popular-common-card" &&
+                    isPopularCommonCardNewWork(element)
+            }
+            .mapNotNull { titleNoFromElementIdentity(it) }
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.title.isNullOrBlank() }
+            .distinct()
+            .toSet()
+        if (targetTitleNos.isEmpty()) return
+
+        val startedAt = System.currentTimeMillis()
+        val filled = runCatching {
+            val document = client.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
+                newResponse.asJsoup()
+            }
+            document.select(".new_works_items")
+                .asSequence()
+                .mapNotNull { item ->
+                    val titleNo = titleNoFromElementIdentity(item) ?: return@mapNotNull null
+                    if (titleNo !in targetTitleNos) return@mapNotNull null
+                    val title = mangaTitleFromElement(item).trim()
+                    if (title.isBlank()) return@mapNotNull null
+                    cacheNewTitle(titleNo, true, "new-page-title")
+                    rememberOfficialMangaMeta(titleNo, title, "", "new-page-title")
+                }
+                .map { it.title }
+                .count()
+        }.getOrElse { e ->
+            wlog("popularNewWorkNewPageTitleFillFailed targets=${targetTitleNos.size}", e)
+            0
+        }
+        dlog(
+            "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} filled=$filled " +
+                "elapsed=${System.currentTimeMillis() - startedAt}ms"
+        )
+    }
+
     private fun rememberOfficialMangaMetaFromList(titleNo: String?, title: String, thumbnailUrl: String, source: String): OfficialMangaMeta? {
         if (titleNo.isNullOrBlank()) return null
         if (!isTrustedOfficialMetaSource(source)) return null
@@ -2402,6 +2442,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             source == "popular-ranking" ||
             source == "popular-genre-category" ||
             source == "popular-banner-title" ||
+            source == "new-page-title" ||
             source.startsWith("dailySchedule") ||
             source.startsWith("mangaList") ||
             source.startsWith("genreBulk") ||
@@ -2416,6 +2457,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             source.startsWith("genreBulk") -> 825
             source == "popular-ranking" -> 780
             source == "popular-genre-category" -> 760
+            source == "new-page-title" -> 755
             source == "popular-banner-title" -> 740
             source.startsWith("search") -> 700
             else -> 0
