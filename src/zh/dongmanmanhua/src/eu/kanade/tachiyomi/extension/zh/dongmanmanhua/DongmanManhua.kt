@@ -1543,16 +1543,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.toIntOrNull()
             ?.coerceAtLeast(1)
             ?: 1
-        val startIndex = if (latestCombined) (latestPage - 1) * UPDATE_PAGE_SIZE else 0
-        val entries = pageItems.drop(startIndex).take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
-        val hasNextPage = pageItems.size > startIndex + UPDATE_PAGE_SIZE
+        val startIndex = if (latestCombined) 0 else (latestPage - 1) * UPDATE_PAGE_SIZE
+        val entries = if (latestCombined) {
+            pageItems.map(::mangaFromCachedItem)
+        } else {
+            pageItems.drop(startIndex).take(UPDATE_PAGE_SIZE).map(::mangaFromCachedItem)
+        }
+        val hasNextPage = if (latestCombined) false else pageItems.size > startIndex + UPDATE_PAGE_SIZE
         val weekCounts = groupedElements.entries.joinToString(",") { "${it.key}=${it.value.size}" }
         val newCount = pageItems.count { it.hasNew }
         dlog(
             "parseDailyScheduleHtml url=${response.request.url} weekday=$weekday sort=$sort " +
                 "selector=$selector grouped=${groupedElements.size} weekCounts=$weekCounts " +
                 "combinedLatest=$latestCombined page=$latestPage start=$startIndex raw=${pageItems.size} entries=${entries.size} " +
-                "newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true"
+                "newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true onePageLatest=$latestCombined"
         )
         return MangasPage(entries, hasNextPage)
     }
