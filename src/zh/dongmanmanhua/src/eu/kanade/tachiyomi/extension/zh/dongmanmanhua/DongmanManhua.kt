@@ -729,6 +729,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         .build()
 
+    private val marketingDetailClient by lazy {
+        client.newBuilder()
+            .callTimeout(MARKETING_DETAIL_FETCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // 首页（触发探针）
     // ══════════════════════════════════════════════════════════════════════
@@ -757,18 +763,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun collectPopularMangaElements(document: org.jsoup.nodes.Document): List<Element> {
         val result = mutableListOf<Element>()
         val seen = mutableSetOf<Int>()
-        var skippedMarketingNewWorks = 0
-
         fun addModule(origin: String, selector: String, includeElement: (Element) -> Boolean = { true }) {
             val items = document.select(selector)
                 .filter { it.attr("href").isNotBlank() }
-                .filter { element ->
-                    val included = includeElement(element)
-                    if (!included && origin == "popular-common-card" && isPopularCommonCardNewWork(element)) {
-                        skippedMarketingNewWorks += 1
-                    }
-                    included
-                }
+                .filter { includeElement(it) }
             val added = mutableListOf<Element>()
             items.forEach { element ->
                 val key = System.identityHashCode(element)
@@ -801,13 +799,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "a[href*=list?title_no], a[href*=episodeList?titleNo]"
         ) {
             hasCleanOrKnownCanonicalIdentity(it) &&
-                !isPopularGenreCategoryElement(it) &&
-                !isPopularCommonCardNewWork(it)
+                !isPopularGenreCategoryElement(it)
         }
 
-        if (skippedMarketingNewWorks > 0) {
-            dlog("popularCommonCardSkipMarketingNewWorks count=$skippedMarketingNewWorks")
-        }
         return result
     }
 
@@ -871,7 +865,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (hasUsableNonBannerThumbnail(element)) score += 500
         score += when (origin) {
             "popular-ranking" -> 90
-            "popular-common-card" -> 80
+            "popular-common-card" -> if (isPopularCommonCardNewWork(element)) 60 else 80
             "popular-genre-category" -> 70
             "popular-banner" -> 10
             else -> 10
@@ -1143,6 +1137,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val titleNo: String?,
         val hasNew: Boolean,
     )
+
+    private data class OfficialMangaMeta(
+        val title: String,
+        val thumbnailUrl: String,
+        val source: String,
+        val priority: Int,
+        val createdAt: Long,
+    )
+
+    private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
 
     private data class GenrePageCache(
         val genre: String,
@@ -1870,6 +1874,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return GET(finalUrl, reqHeaders)
     }
 
+    private fun detailTitleFromDocument(document: org.jsoup.nodes.Document): String {
+        val detailDiv = document.selectFirst("div.detail_info")
+        return detailDiv?.selectFirst("p.subj")?.text()
+            ?: document.selectFirst("h1.subj, h3.subj")?.text()
+            ?: document.title().substringBefore("_")
+    }
+
     override fun mangaDetailsParse(response: Response): SManga {
         val parseStartedAt = System.currentTimeMillis()
         val networkMs = response.receivedResponseAtMillis - response.sentRequestAtMillis
@@ -1877,9 +1888,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val detailDiv = document.selectFirst("div.detail_info")
         val titleNo = titleNoFromUrl(response.request.url.toString())
         return SManga.create().apply {
-            title = detailDiv?.selectFirst("p.subj")?.text()
-                ?: document.selectFirst("h1.subj, h3.subj")?.text()
-                ?: document.title().substringBefore("_")
+            title = detailTitleFromDocument(document)
             author = detailDiv?.selectFirst("p.author")?.text()
                 ?: document.selectFirst("meta[property=com-dongman:webtoon:author]")?.attr("content")
             artist = author
@@ -1887,6 +1896,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (detailThumbnail.isNotBlank()) {
                 thumbnail_url = detailThumbnail
             }
+            rememberOfficialMangaMeta(titleNo, title, detailThumbnail, "detail")
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
             val updateTag = extractUpdateTag(html, titleNo)
@@ -2206,6 +2216,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
         val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
+        rememberOfficialMangaMetaFromList(titleNo, titleText, thumbnailUrl, origin)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
@@ -2278,15 +2289,146 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val hasNew = hasNewBadge(element)
         cacheNewTitle(titleNo, hasNew)
+        val parsedTitle = mangaTitleFromElement(element)
+        val parsedThumbnail = extractThumbnailUrl(element, origin, titleNo)
+        val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
+        val officialMeta = if (isMarketingNewWork) {
+            resolveOfficialMetaForMarketingNewWork(titleNo, identityPath, parsedTitle, parsedThumbnail)
+        } else {
+            rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
+            null
+        }
         url = identityPath
-        title = mangaTitleFromElement(element)
-        thumbnail_url = extractThumbnailUrl(element, origin, titleNo)
+        title = if (isMarketingNewWork) {
+            officialMeta?.title?.takeIf { it.isNotBlank() } ?: titleNo?.let { "作品 $it" }.orEmpty()
+        } else {
+            parsedTitle
+        }
+        thumbnail_url = if (isMarketingNewWork) {
+            officialMeta?.thumbnailUrl.orEmpty()
+        } else {
+            parsedThumbnail
+        }
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
+        if (isMarketingNewWork) {
+            dlog(
+                "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
+                    "officialTitle=$title marketingThumbUsed=${thumbnail_url.isNotBlank()} " +
+                    "officialSource=${officialMeta?.source ?: "none"}"
+            )
+        }
         if (VERBOSE_LIST_LOG) {
             dlog(
                 "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
                     "titleNo=$titleNo hasNew=$hasNew title=$title"
             )
+        }
+    }
+
+    private fun rememberOfficialMangaMetaFromList(titleNo: String?, title: String, thumbnailUrl: String, source: String): OfficialMangaMeta? {
+        if (titleNo.isNullOrBlank()) return null
+        if (!isTrustedOfficialMetaSource(source)) return null
+        return rememberOfficialMangaMeta(titleNo, title, thumbnailUrl, source)
+    }
+
+    private fun rememberOfficialMangaMeta(titleNo: String?, title: String, thumbnailUrl: String, source: String): OfficialMangaMeta? {
+        val key = titleNo?.trim().orEmpty()
+        if (key.isBlank()) return null
+        val normalizedTitle = title.trim()
+        val normalizedThumbnail = thumbnailUrl.trim()
+        if (normalizedTitle.isBlank() && normalizedThumbnail.isBlank()) return null
+        val priority = officialMetaSourcePriority(source)
+        if (priority <= 0) return null
+        synchronized(officialMangaMetaByTitleNo) {
+            val existing = officialMangaMetaByTitleNo[key]
+            if (existing != null && existing.priority > priority) return existing
+            val merged = OfficialMangaMeta(
+                title = normalizedTitle.ifBlank { existing?.title.orEmpty() },
+                thumbnailUrl = normalizedThumbnail.ifBlank { existing?.thumbnailUrl.orEmpty() },
+                source = source,
+                priority = priority,
+                createdAt = System.currentTimeMillis(),
+            )
+            officialMangaMetaByTitleNo[key] = merged
+            return merged
+        }
+    }
+
+    private fun getOfficialMangaMeta(titleNo: String?): OfficialMangaMeta? {
+        val key = titleNo?.trim().orEmpty()
+        if (key.isBlank()) return null
+        return synchronized(officialMangaMetaByTitleNo) { officialMangaMetaByTitleNo[key] }
+    }
+
+    private fun isTrustedOfficialMetaSource(source: String): Boolean {
+        return source == "detail" ||
+            source == "detail-marketing" ||
+            source == "popular-ranking" ||
+            source == "popular-genre-category" ||
+            source.startsWith("dailySchedule") ||
+            source.startsWith("mangaList") ||
+            source.startsWith("genreBulk") ||
+            source.startsWith("search")
+    }
+
+    private fun officialMetaSourcePriority(source: String): Int {
+        return when {
+            source == "detail" || source == "detail-marketing" -> 1000
+            source.startsWith("dailySchedule") -> 900
+            source.startsWith("mangaList") -> 850
+            source.startsWith("genreBulk") -> 825
+            source == "popular-ranking" -> 780
+            source == "popular-genre-category" -> 760
+            source.startsWith("search") -> 700
+            else -> 0
+        }
+    }
+
+    private fun resolveOfficialMetaForMarketingNewWork(
+        titleNo: String?,
+        identityPath: String,
+        marketingTitle: String,
+        marketingThumbnail: String,
+    ): OfficialMangaMeta? {
+        getOfficialMangaMeta(titleNo)?.let { existing ->
+            if (existing.title.isNotBlank() && existing.thumbnailUrl.isNotBlank()) return existing
+        }
+        val fetched = fetchOfficialMangaMetaFromDetail(titleNo, identityPath)
+        if (fetched != null && (fetched.title.isNotBlank() || fetched.thumbnailUrl.isNotBlank())) return fetched
+        val cached = getOfficialMangaMeta(titleNo)
+        if (cached != null && (cached.title.isNotBlank() || cached.thumbnailUrl.isNotBlank())) return cached
+        dlog(
+            "popularCommonCardNewWorkOfficialMissing titleNo=$titleNo " +
+                "marketingTitle=$marketingTitle marketingThumb=${marketingThumbnail.isNotBlank()}"
+        )
+        return null
+    }
+
+    private fun fetchOfficialMangaMetaFromDetail(titleNo: String?, identityPath: String): OfficialMangaMeta? {
+        val key = titleNo?.trim().orEmpty()
+        if (key.isBlank()) return null
+        val requestPath = canonicalDetailRequestPath(identityPath.ifBlank { "/episodeList?titleNo=$key" })
+        val finalUrl = baseUrl + requestPath
+        return try {
+            val startedAt = System.currentTimeMillis()
+            marketingDetailClient.newCall(GET(finalUrl, headersBuilder().build())).execute().use { response ->
+                if (!response.isSuccessful) {
+                    dlog("popularCommonCardNewWorkOfficialFetchFailed titleNo=$key code=${response.code} url=$finalUrl")
+                    return null
+                }
+                val document = response.asJsoup()
+                val title = detailTitleFromDocument(document)
+                val thumbnail = extractDetailThumbnailUrl(document)
+                val meta = rememberOfficialMangaMeta(key, title, thumbnail, "detail-marketing")
+                dlog(
+                    "popularCommonCardNewWorkOfficialFetched titleNo=$key title=$title " +
+                        "thumb=${thumbnail.isNotBlank()} elapsed=${System.currentTimeMillis() - startedAt}ms"
+                )
+                meta
+            }
+        } catch (e: Exception) {
+            wlog("popularCommonCardNewWorkOfficialFetchError titleNo=$key url=$finalUrl", e)
+            null
         }
     }
 
@@ -3129,6 +3271,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
+        private const val MARKETING_DETAIL_FETCH_TIMEOUT_MS = 6_000L
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
