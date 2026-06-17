@@ -1241,6 +1241,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
+    private val newWorkCoverLoadProbeRunId = System.currentTimeMillis().toString(36)
+    private val newWorkCoverLoadProbeSeq = java.util.concurrent.atomic.AtomicInteger(0)
+    private val newWorkCoverLoadProbeStarted = java.util.concurrent.atomic.AtomicInteger(0)
 
     @Volatile
     private var legacyNewWorkPersistentCacheCleared = false
@@ -2404,23 +2407,102 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             parsedTitle
         }
+        val rawOfficialThumbnail = if (isMarketingNewWork) officialMeta?.thumbnailUrl.orEmpty() else parsedThumbnail
         thumbnail_url = if (isMarketingNewWork) {
-            officialMeta?.thumbnailUrl.orEmpty()
+            decorateNewWorkCoverThumbnailForProbe(titleNo, officialMeta?.source ?: "none", rawOfficialThumbnail)
         } else {
             parsedThumbnail
         }
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (isMarketingNewWork) {
+            val finalThumb = thumbnail_url.orEmpty()
             dlog(
                 "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
-                    "officialTitle=$title officialThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
-                    "officialSource=${officialMeta?.source ?: "none"}"
+                    "officialTitle=$title officialThumbUsed=${finalThumb.isNotBlank()} " +
+                    "officialSource=${officialMeta?.source ?: "none"} " +
+                    "thumbRaw=${shortThumbUrlForLog(rawOfficialThumbnail)} " +
+                    "thumbUi=${shortThumbUrlForLog(finalThumb)} " +
+                    "cacheBust=${rawOfficialThumbnail.isNotBlank() && rawOfficialThumbnail != finalThumb}"
             )
+            probeNewWorkCoverImageAsync(titleNo, officialMeta?.source ?: "none", finalThumb, "ui-thumbnail")
         }
         if (VERBOSE_LIST_LOG) {
             dlog(
                 "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
                     "titleNo=$titleNo hasNew=$hasNew title=$title"
+            )
+        }
+    }
+
+    private fun decorateNewWorkCoverThumbnailForProbe(titleNo: String?, source: String, thumbnailUrl: String): String {
+        val cleanUrl = thumbnailUrl.trim()
+        if (!DEBUG_NEW_WORK_COVER_CACHE_BUST || cleanUrl.isBlank()) return cleanUrl
+        val separator = if (cleanUrl.contains("?")) "&" else "?"
+        val cleanTitleNo = titleNo?.trim()?.takeIf { it.isNotBlank() } ?: "unknown"
+        val seq = newWorkCoverLoadProbeSeq.incrementAndGet()
+        return cleanUrl + separator + "dm_cover_probe=" + newWorkCoverLoadProbeRunId + "_" + cleanTitleNo + "_" + seq
+    }
+
+    private fun shortThumbUrlForLog(url: String): String {
+        if (url.isBlank()) return "none"
+        val normalized = url
+            .replace(cdnBase, "cdn:")
+            .replace(baseUrl, "base:")
+        return if (normalized.length <= 220) normalized else normalized.take(220) + "…"
+    }
+
+    private fun probeNewWorkCoverImageAsync(titleNo: String?, source: String, thumbnailUrl: String, stage: String) {
+        if (!DEBUG_NEW_WORK_COVER_LOAD_PROBE || thumbnailUrl.isBlank()) return
+        val started = newWorkCoverLoadProbeStarted.incrementAndGet()
+        if (started > NEW_WORK_COVER_LOAD_PROBE_MAX_REQUESTS) return
+        Thread({
+            probeNewWorkCoverImageOnce(titleNo, source, thumbnailUrl, stage, withSourceHeaders = true)
+            probeNewWorkCoverImageOnce(titleNo, source, thumbnailUrl, stage, withSourceHeaders = false)
+        }, "DongmanCoverImageProbe").start()
+    }
+
+    private fun probeNewWorkCoverImageOnce(
+        titleNo: String?,
+        source: String,
+        thumbnailUrl: String,
+        stage: String,
+        withSourceHeaders: Boolean,
+    ) {
+        val startedAt = System.currentTimeMillis()
+        val mode = if (withSourceHeaders) "source-headers" else "plain"
+        try {
+            val timedClient = client.newBuilder()
+                .callTimeout(NEW_WORK_COVER_LOAD_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .build()
+            val builder = Request.Builder()
+                .url(thumbnailUrl)
+                .get()
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Range", "bytes=0-0")
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache")
+            if (withSourceHeaders) {
+                builder.headers(headersBuilder().build())
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .header("Range", "bytes=0-0")
+                    .header("Cache-Control", "no-cache")
+                    .header("Pragma", "no-cache")
+            }
+            timedClient.newCall(builder.build()).execute().use { response ->
+                val elapsed = System.currentTimeMillis() - startedAt
+                dlog(
+                    "newWorkCoverImageProbe titleNo=$titleNo stage=$stage source=$source mode=$mode " +
+                        "code=${response.code} type=${response.header("Content-Type").orEmpty()} " +
+                        "len=${response.header("Content-Length").orEmpty()} " +
+                        "range=${response.header("Content-Range").orEmpty()} " +
+                        "elapsed=${elapsed}ms url=${shortThumbUrlForLog(thumbnailUrl)}"
+                )
+            }
+        } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - startedAt
+            dlog(
+                "newWorkCoverImageProbeFailed titleNo=$titleNo stage=$stage source=$source mode=$mode " +
+                    "reason=${e.javaClass.simpleName} elapsed=${elapsed}ms url=${shortThumbUrlForLog(thumbnailUrl)}"
             )
         }
     }
@@ -2832,6 +2914,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val title = detailTitleFromDocument(document).trim()
         val thumbnail = extractDetailThumbnailUrl(document).trim()
+        dlog(
+            "newWorkCoverDetailCandidate titleNo=$titleNo title=${title.ifBlank { "none" }} " +
+                "thumb=${shortThumbUrlForLog(thumbnail)} detailUrl=${shortThumbUrlForLog(requestUrl)}"
+        )
+        if (thumbnail.isNotBlank()) {
+            probeNewWorkCoverImageAsync(titleNo, "detail-candidate", thumbnail, "detail-candidate")
+        }
         if (title.isBlank() && thumbnail.isBlank()) return null
         return OfficialCoverCandidate(title, thumbnail)
     }
@@ -3775,6 +3864,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
         private const val NEW_WORK_COVER_FAILURE_COOLDOWN_MS = 3 * 60 * 1000L
         private const val NEW_WORK_COVER_FAILURE_MAX_ENTRIES = 120
+        private const val DEBUG_NEW_WORK_COVER_CACHE_BUST = true
+        private const val DEBUG_NEW_WORK_COVER_LOAD_PROBE = true
+        private const val NEW_WORK_COVER_LOAD_PROBE_TIMEOUT_MS = 1_800L
+        private const val NEW_WORK_COVER_LOAD_PROBE_MAX_REQUESTS = 80
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
