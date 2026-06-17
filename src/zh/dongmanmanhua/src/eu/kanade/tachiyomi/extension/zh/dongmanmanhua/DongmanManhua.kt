@@ -1159,7 +1159,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val createdAt: Long,
     )
 
+    private data class NewPageTitleCache(
+        val createdAt: Long,
+        val titlesByTitleNo: Map<String, String>,
+    )
+
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
+    private val newPageTitleCacheLock = Any()
+    private var newPageTitleCache: NewPageTitleCache? = null
 
     private data class GenrePageCache(
         val genre: String,
@@ -2375,30 +2382,104 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (targetTitleNos.isEmpty()) return
 
         val startedAt = System.currentTimeMillis()
-        val filled = runCatching {
-            val document = client.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
-                newResponse.asJsoup()
-            }
-            document.select(".new_works_items")
-                .asSequence()
-                .mapNotNull { item ->
-                    val titleNo = titleNoFromElementIdentity(item) ?: return@mapNotNull null
-                    if (titleNo !in targetTitleNos) return@mapNotNull null
-                    val title = mangaTitleFromElement(item).trim()
-                    if (title.isBlank()) return@mapNotNull null
-                    cacheNewTitle(titleNo, true, "new-page-title")
-                    rememberOfficialMangaMeta(titleNo, title, "", "new-page-title")
-                }
-                .map { it.title }
-                .count()
-        }.getOrElse { e ->
-            wlog("popularNewWorkNewPageTitleFillFailed targets=${targetTitleNos.size}", e)
-            0
+        val cachedTitles = getNewPageTitleCache()
+        val filledFromCache = applyNewPageOfficialTitles(targetTitleNos, cachedTitles)
+        val remainingTitleNos = targetTitleNos
+            .filter { titleNo -> getOfficialMangaMeta(titleNo)?.title.isNullOrBlank() }
+            .toSet()
+        if (remainingTitleNos.isEmpty()) {
+            dlog(
+                "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} remaining=0 " +
+                    "filled=$filledFromCache cacheFilled=$filledFromCache requestFilled=0 " +
+                    "cacheHit=${cachedTitles.isNotEmpty()} request=false requestOk=false " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms"
+            )
+            return
         }
+
+        var requestOk = false
+        val fetchedTitles = runCatching {
+            requestOk = true
+            fetchNewPageOfficialTitleMap()
+        }.getOrElse { e ->
+            requestOk = false
+            wlog(
+                "popularNewWorkNewPageTitleFillFailed targets=${targetTitleNos.size} " +
+                    "remaining=${remainingTitleNos.size}",
+                e,
+            )
+            emptyMap()
+        }
+        if (fetchedTitles.isNotEmpty()) {
+            rememberNewPageTitleCache(fetchedTitles)
+        }
+        val filledFromRequest = applyNewPageOfficialTitles(remainingTitleNos, fetchedTitles)
+        val filled = filledFromCache + filledFromRequest
         dlog(
-            "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} filled=$filled " +
+            "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} remaining=${remainingTitleNos.size} " +
+                "filled=$filled cacheFilled=$filledFromCache requestFilled=$filledFromRequest " +
+                "cacheHit=${cachedTitles.isNotEmpty()} request=true requestOk=$requestOk " +
                 "elapsed=${System.currentTimeMillis() - startedAt}ms"
         )
+    }
+
+    private fun getNewPageTitleCache(): Map<String, String> {
+        val now = System.currentTimeMillis()
+        synchronized(newPageTitleCacheLock) {
+            val cache = newPageTitleCache ?: return emptyMap()
+            if (now - cache.createdAt > NEW_PAGE_TITLE_CACHE_TTL_MS) {
+                newPageTitleCache = null
+                return emptyMap()
+            }
+            return cache.titlesByTitleNo
+        }
+    }
+
+    private fun rememberNewPageTitleCache(titlesByTitleNo: Map<String, String>) {
+        val cleanTitles = titlesByTitleNo
+            .mapValues { (_, title) -> title.trim() }
+            .filterValues { it.isNotBlank() }
+        if (cleanTitles.isEmpty()) return
+        synchronized(newPageTitleCacheLock) {
+            newPageTitleCache = NewPageTitleCache(
+                createdAt = System.currentTimeMillis(),
+                titlesByTitleNo = cleanTitles,
+            )
+        }
+    }
+
+    private fun fetchNewPageOfficialTitleMap(): Map<String, String> {
+        val timedClient = client.newBuilder()
+            .callTimeout(NEW_PAGE_TITLE_FILL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .build()
+        val document = timedClient.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
+            newResponse.asJsoup()
+        }
+        return document.select(".new_works_items")
+            .asSequence()
+            .mapNotNull { item ->
+                val titleNo = titleNoFromElementIdentity(item)?.trim().orEmpty()
+                if (titleNo.isBlank()) return@mapNotNull null
+                val title = mangaTitleFromElement(item).trim()
+                if (title.isBlank()) return@mapNotNull null
+                titleNo to title
+            }
+            .toMap()
+    }
+
+    private fun applyNewPageOfficialTitles(targetTitleNos: Set<String>, titlesByTitleNo: Map<String, String>): Int {
+        if (targetTitleNos.isEmpty() || titlesByTitleNo.isEmpty()) return 0
+        var filled = 0
+        targetTitleNos.forEach { titleNo ->
+            if (!getOfficialMangaMeta(titleNo)?.title.isNullOrBlank()) return@forEach
+            val title = titlesByTitleNo[titleNo]?.trim().orEmpty()
+            if (title.isBlank()) return@forEach
+            cacheNewTitle(titleNo, true, "new-page-title")
+            if (rememberOfficialMangaMeta(titleNo, title, "", "new-page-title") != null) {
+                filled += 1
+            }
+        }
+        return filled
     }
 
     private fun rememberOfficialMangaMetaFromList(titleNo: String?, title: String, thumbnailUrl: String, source: String): OfficialMangaMeta? {
@@ -3316,6 +3397,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
+        private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val NEW_PAGE_TITLE_FILL_TIMEOUT_MS = 650L
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
