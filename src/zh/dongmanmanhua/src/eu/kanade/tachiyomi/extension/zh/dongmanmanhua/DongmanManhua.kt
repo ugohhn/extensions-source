@@ -2745,7 +2745,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             if (!prefetchIdle) {
                 dlog(
-                    "popularNewPageCoverWarmupSkipped reason=current-prefetch-active " +
+                    "popularNewPageCoverWarmupSkipped reason=prefetch-busy " +
                         "targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms"
                 )
                 return@Thread
@@ -2755,7 +2755,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 targetTitleNos = warmupTargets,
             )
         }, "DongmanNewPageCoverWarmup").start()
-        dlog("popularNewPageCoverWarmupScheduled targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms generation=$scheduledGeneration")
+        dlog("popularNewPageCoverWarmupScheduled targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms")
     }
 
     private fun marketingNewWorkTitleNos(rawElements: List<Element>): Set<String> {
@@ -3894,8 +3894,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
-        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 180L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 260L
+        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
         private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
@@ -3908,9 +3908,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
         private const val NEW_WORK_COVER_FAILURE_COOLDOWN_MS = 3 * 60 * 1000L
         private const val NEW_WORK_COVER_FAILURE_MAX_ENTRIES = 120
-        private const val NEW_PAGE_COVER_WARMUP_DELAY_MS = 5_500L
+        private const val NEW_PAGE_COVER_WARMUP_DELAY_MS = 4_000L
         private const val NEW_PAGE_COVER_WARMUP_COOLDOWN_MS = 60_000L
-        private const val NEW_PAGE_COVER_WARMUP_MAX_TARGETS = 4
+        private const val NEW_PAGE_COVER_WARMUP_MAX_TARGETS = 5
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
