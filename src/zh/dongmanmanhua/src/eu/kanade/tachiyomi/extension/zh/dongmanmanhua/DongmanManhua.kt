@@ -766,7 +766,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         scheduleOfficialCoverPrefetchForMarketingNewWorks(rawElements)
-        scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements)
+        // v71: speed first. Do not warm up extra /new-page covers during normal list parsing.
+        // Current-page cover prefetch still runs after parse; off-page warmup caused network contention.
         return MangasPage(entries, false)
     }
 
@@ -1234,6 +1235,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt: Long,
         val targetTitleNos: Set<String>,
     )
+
 
     private data class OfficialCoverCandidate(
         val title: String,
@@ -2673,11 +2675,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { titleNo -> getOfficialMangaMeta(titleNo)?.thumbnailUrl.isNullOrBlank() }
             .toSet()
         if (targetTitleNos.isEmpty()) return
-        ensureNewWorkCoverPrefetchStarted(
-            reason = "popular-after-parse-missing-cover",
-            targetTitleNos = targetTitleNos,
-            force = false,
-        )
+        val scheduledGeneration = synchronized(newWorkCoverCacheLock) { popularPageGeneration }
+        Thread({
+            runCatching { Thread.sleep(CURRENT_PAGE_COVER_PREFETCH_DELAY_MS) }
+            val stillCurrent = synchronized(newWorkCoverCacheLock) { scheduledGeneration == popularPageGeneration }
+            if (!stillCurrent) {
+                dlog(
+                    "popularNewWorkCoverPrefetchSkipped reason=session-changed " +
+                        "targets=${targetTitleNos.size} delay=${CURRENT_PAGE_COVER_PREFETCH_DELAY_MS}ms"
+                )
+                return@Thread
+            }
+            ensureNewWorkCoverPrefetchStarted(
+                reason = "popular-after-parse-missing-cover",
+                targetTitleNos = targetTitleNos,
+                force = false,
+            )
+        }, "DongmanCurrentCoverPrefetchDelay").start()
     }
 
     private fun scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements: List<Element>) {
@@ -3834,15 +3848,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
-        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
+        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_150L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
-        private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 220L
+        private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 0L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 0L
-        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 3_000L
-        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 4_500L
+        private const val CURRENT_PAGE_COVER_PREFETCH_DELAY_MS = 350L
+        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 2_600L
+        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 3_600L
         private const val NEW_WORK_COVER_PREFETCH_CONCURRENCY = 2
         private const val NEW_WORK_COVER_PREFETCH_MAX_TARGETS = 5
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
