@@ -743,7 +743,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             synchronized(newWorkCoverCacheLock) {
                 popularPageGeneration += 1
             }
-            clearLegacyNewWorkPersistentCaches()
+            scheduleCanonicalMangaIdentityStoreLoadAsync()
+            scheduleLegacyNewWorkPersistentCachesClear()
             ensureNewPageTitlePrefetchStarted(
                 reason = "popular-request",
                 startDelayMs = NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS,
@@ -1142,6 +1143,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
     private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
+    private var canonicalMangaUrlStoreLoadScheduled = false
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
     private var identityProbeConflictLogCount = 0
@@ -1251,6 +1253,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
     private var newPageCoverWarmupLastStartedAt = 0L
     private var popularPageGeneration = 0L
+    private var canonicalMangaUrlStorePersistScheduled = false
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
 
@@ -2571,6 +2574,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun scheduleLegacyNewWorkPersistentCachesClear() {
+        if (legacyNewWorkPersistentCacheCleared) return
+        Thread({
+            clearLegacyNewWorkPersistentCaches()
+        }, "DongmanLegacyNewWorkCacheClear").start()
+    }
+
     private fun ensureNewPageTitlePrefetchStarted(
         reason: String,
         force: Boolean = false,
@@ -3348,6 +3358,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun scheduleCanonicalMangaIdentityStoreLoadAsync() {
+        synchronized(canonicalMangaUrlByTitleNo) {
+            if (canonicalMangaUrlStoreLoaded || canonicalMangaUrlStoreLoadScheduled) return
+            canonicalMangaUrlStoreLoadScheduled = true
+        }
+        Thread({
+            synchronized(canonicalMangaUrlByTitleNo) {
+                ensureCanonicalMangaIdentityStoreLoadedLocked()
+                canonicalMangaUrlStoreLoadScheduled = false
+            }
+        }, "DongmanCanonicalIdentityLoad").start()
+    }
+
     private fun persistCanonicalMangaIdentityStoreLocked() {
         try {
             val obj = JSONObject()
@@ -3362,6 +3385,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun scheduleCanonicalMangaIdentityStorePersistLocked() {
+        if (canonicalMangaUrlStorePersistScheduled) return
+        canonicalMangaUrlStorePersistScheduled = true
+        Thread({
+            runCatching { Thread.sleep(CANONICAL_IDENTITY_STORE_PERSIST_DELAY_MS) }
+            synchronized(canonicalMangaUrlByTitleNo) {
+                persistCanonicalMangaIdentityStoreLocked()
+                canonicalMangaUrlStorePersistScheduled = false
+            }
+        }, "DongmanCanonicalIdentityPersist").start()
+    }
+
     private fun rememberCanonicalMangaIdentity(titleNo: String, path: String): String {
         if (titleNo.isBlank() || !isCleanWorkPagePath(path)) return path
         synchronized(canonicalMangaUrlByTitleNo) {
@@ -3370,7 +3405,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val shouldWrite = existing.isNullOrBlank() || existing.startsWith("/episodeList")
             if (shouldWrite) {
                 canonicalMangaUrlByTitleNo[titleNo] = path
-                persistCanonicalMangaIdentityStoreLocked()
+                scheduleCanonicalMangaIdentityStorePersistLocked()
             }
             return canonicalMangaUrlByTitleNo[titleNo].orEmpty().ifBlank { path }
         }
@@ -3849,8 +3884,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_150L
-        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 220L
+        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 0L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 0L
         private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 0L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
@@ -3896,6 +3931,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
+        private const val CANONICAL_IDENTITY_STORE_PERSIST_DELAY_MS = 1_200L
         internal const val PREF_FILTER_WEEKDAY = "pref_filter_weekday"
         internal const val PREF_FILTER_SORT = "pref_filter_sort"
         internal const val PREF_FILTER_THEME = "pref_filter_theme"
