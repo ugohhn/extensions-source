@@ -88,16 +88,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         passwordLoginInProgress
     }
 
-    // “新”标签只使用详情页专用的短时 /dailySchedule 快照：
-    // 不接受首页、列表或 /new 入口写入，也不持久化到磁盘或 SharedPreferences。
-    private data class DetailNewScheduleSnapshot(
-        val statesByTitleNo: Map<String, Boolean>,
+    // 详情页“新”只以真实 /new 响应中的当前 titleNo 集合为准。
+    // 这是内存短快照：不写入 SP / 文件，也不接收普通列表、JSON 或首页卡片的历史 true。
+    private data class DetailNewPageSnapshot(
+        val titleNos: Set<String>,
         val fetchedAtMs: Long,
+        val source: String,
     )
 
     @Volatile
-    private var detailNewScheduleSnapshot: DetailNewScheduleSnapshot? = null
-    private val detailNewScheduleSnapshotLock = Any()
+    private var detailNewPageSnapshot: DetailNewPageSnapshot? = null
+    private val detailNewPageSnapshotLock = Any()
 
     private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
     private val autoUnlockLocksGuard = Any()
@@ -1108,6 +1109,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     override fun latestUpdatesParse(response: Response): MangasPage {
         if (response.request.url.encodedPath == "/new") {
             val document = response.asJsoup()
+            rememberDetailNewPageSnapshot(
+                titleNos = newPageTitleNosFromDocument(document),
+                source = "new-page-list",
+            )
             val cachedItems = document.select(".new_works_items")
                 .mapNotNull { item ->
                     val cached = cachedMangaItemFromElement(item, "new")
@@ -1124,14 +1129,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 "class=${item.className()} href=$href cleanPath=${cached.url}"
                         )
                     }
-                    val marked = cached.copy(hasNew = true)
-                    marked
+                    // /new 的真实响应本身就是当前新作集合；列表展示仍保持 hasNew=true。
+                    cached.copy(hasNew = true)
                 }
                 .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             putUpdatePageCache(updateCacheKey("NEW", ""), cachedItems)
             val entries = cachedItems.map(::mangaFromCachedItem)
             val newCount = cachedItems.count { it.hasNew }
-            dlog("latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount cacheWrite=true source=new-page")
+            dlog(
+                "latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount " +
+                    "cacheWrite=true detailSnapshot=true source=new-page"
+            )
             return MangasPage(entries, false)
         }
 
@@ -1143,6 +1151,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
+
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
     private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
@@ -1703,7 +1712,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun mangaFromJsonTitle(item: org.json.JSONObject): SManga {
-        // 保留 JSON 字段用于 canonical URL 与诊断日志；不再把 newTitle 写入任何详情页历史缓存。
         val titleNo = item.optInt("titleNo", 0)
         val titleNoText = if (titleNo > 0) titleNo.toString() else item.optString("titleNo", "")
         val newTitle = item.optBoolean("newTitle", false)
@@ -2635,6 +2643,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val document = timedClient.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
             newResponse.asJsoup()
         }
+        rememberDetailNewPageSnapshot(
+            titleNos = newPageTitleNosFromDocument(document),
+            source = "new-page-title-prefetch",
+        )
         return document.select(".new_works_items")
             .asSequence()
             .mapNotNull { item ->
@@ -3808,84 +3820,100 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: Regex("""/title/([0-9]+)""").find(url)?.groupValues?.getOrNull(1)
     }
 
-    private fun isNewTitleDetail(url: String, updateTag: String): Boolean {
-        val titleNo = titleNoFromUrl(url) ?: run {
-            dlog("isNewTitleDetail noTitleNo url=$url")
-            return false
-        }
+    private fun newPageTitleNosFromDocument(document: org.jsoup.nodes.Document): Set<String> {
+        return document.select(".new_works_items")
+            .asSequence()
+            .mapNotNull { item -> titleNoFromElementIdentity(item)?.trim()?.takeIf { it.isNotBlank() } }
+            .toSet()
+    }
 
-        val state = fetchNewTitleFromDailySchedule(titleNo)
-        val value = state == true
-        dlog(
-            "isNewTitleDetail titleNo=$titleNo source=detail-dailySchedule-snapshot " +
-                "value=$value updateTag=$updateTag"
+    private fun rememberDetailNewPageSnapshot(titleNos: Set<String>, source: String): DetailNewPageSnapshot? {
+        if (titleNos.isEmpty()) {
+            dlog("detailNewPageSnapshot source=$source ignored=empty")
+            return null
+        }
+        val snapshot = DetailNewPageSnapshot(
+            titleNos = titleNos.toSet(),
+            fetchedAtMs = System.currentTimeMillis(),
+            source = source,
         )
-        return value
-    }
-
-    private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
-        val snapshot = getDetailNewScheduleSnapshot() ?: return null
-        val isNew = snapshot.statesByTitleNo[titleNo]
-        if (isNew == null) {
-            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false completed-or-not-in-schedule")
-            return false
+        synchronized(detailNewPageSnapshotLock) {
+            detailNewPageSnapshot = snapshot
         }
-
-        dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=true isNew=$isNew")
-        return isNew
+        dlog(
+            "detailNewPageSnapshot source=$source titles=${snapshot.titleNos.size} " +
+                "ttl=${DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS}ms"
+        )
+        return snapshot
     }
 
-    private fun getDetailNewScheduleSnapshot(): DetailNewScheduleSnapshot? {
+    private fun detailNewPageSnapshotIfFresh(now: Long): DetailNewPageSnapshot? {
+        return detailNewPageSnapshot?.takeIf { now - it.fetchedAtMs < DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS }
+    }
+
+    private fun getDetailNewPageSnapshot(): DetailNewPageSnapshot? {
         val now = System.currentTimeMillis()
-        detailNewScheduleSnapshot?.takeIf { now - it.fetchedAtMs < DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS }?.let { snapshot ->
+        detailNewPageSnapshotIfFresh(now)?.let { snapshot ->
             dlog(
-                "detailNewScheduleSnapshot source=ttl-cache age=${now - snapshot.fetchedAtMs}ms " +
-                    "titles=${snapshot.statesByTitleNo.size}"
+                "detailNewPageSnapshot source=ttl-cache age=${now - snapshot.fetchedAtMs}ms " +
+                    "titles=${snapshot.titleNos.size} origin=${snapshot.source}"
             )
             return snapshot
         }
 
         val lockWaitStartedAt = System.currentTimeMillis()
-        return synchronized(detailNewScheduleSnapshotLock) {
+        return synchronized(detailNewPageSnapshotLock) {
             val lockedNow = System.currentTimeMillis()
-            detailNewScheduleSnapshot
-                ?.takeIf { lockedNow - it.fetchedAtMs < DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS }
-                ?.let { snapshot ->
-                    dlog(
-                        "detailNewScheduleSnapshot source=ttl-cache-after-wait " +
-                            "wait=${lockedNow - lockWaitStartedAt}ms " +
-                            "age=${lockedNow - snapshot.fetchedAtMs}ms titles=${snapshot.statesByTitleNo.size}"
-                    )
-                    return@synchronized snapshot
-                }
+            detailNewPageSnapshotIfFresh(lockedNow)?.let { snapshot ->
+                dlog(
+                    "detailNewPageSnapshot source=ttl-cache-after-wait wait=${lockedNow - lockWaitStartedAt}ms " +
+                        "age=${lockedNow - snapshot.fetchedAtMs}ms titles=${snapshot.titleNos.size} " +
+                        "origin=${snapshot.source}"
+                )
+                return@synchronized snapshot
+            }
 
             runCatching {
                 val startedAt = System.currentTimeMillis()
-                val document = client.newCall(GET("$baseUrl/dailySchedule", headersBuilder().build())).execute().use { dailyResponse ->
-                    dailyResponse.asJsoup()
+                val document = client.newCall(GET("$baseUrl/new", headersBuilder().build())).execute().use { newResponse ->
+                    newResponse.asJsoup()
                 }
-                val statesByTitleNo = mutableMapOf<String, Boolean>()
-                document.select("li[id^=title_li_], li[data-title-no]").forEach { element ->
-                    val titleNo = element.attr("data-title-no").trim()
-                        .ifBlank { element.id().removePrefix("title_li_").trim() }
-                        .takeIf { it.all(Char::isDigit) }
-                        ?: return@forEach
-                    val isNew = hasNewBadge(element)
-                    statesByTitleNo[titleNo] = (statesByTitleNo[titleNo] == true) || isNew
+                val titleNos = newPageTitleNosFromDocument(document)
+                if (titleNos.isEmpty()) {
+                    dlog("detailNewPageSnapshot source=fresh ignored=empty")
+                    return@runCatching null
                 }
-                DetailNewScheduleSnapshot(statesByTitleNo.toMap(), System.currentTimeMillis()).also { snapshot ->
-                    detailNewScheduleSnapshot = snapshot
+                DetailNewPageSnapshot(
+                    titleNos = titleNos,
+                    fetchedAtMs = System.currentTimeMillis(),
+                    source = "detail-new-page-fresh",
+                ).also { snapshot ->
+                    detailNewPageSnapshot = snapshot
                     dlog(
-                        "detailNewScheduleSnapshot source=fresh titles=${snapshot.statesByTitleNo.size} " +
+                        "detailNewPageSnapshot source=fresh titles=${snapshot.titleNos.size} " +
                             "elapsed=${snapshot.fetchedAtMs - startedAt}ms " +
-                            "ttl=${DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS}ms"
+                            "ttl=${DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS}ms"
                     )
                 }
             }.getOrElse { e ->
-                wlog("detailNewScheduleSnapshot failed", e)
+                wlog("detailNewPageSnapshot failed", e)
                 null
             }
         }
+    }
+
+    private fun isNewTitleDetail(url: String, updateTag: String): Boolean {
+        val titleNo = titleNoFromUrl(url) ?: run {
+            dlog("isNewTitleDetail noTitleNo url=$url")
+            return false
+        }
+        val snapshot = getDetailNewPageSnapshot()
+        val value = snapshot?.titleNos?.contains(titleNo) == true
+        dlog(
+            "isNewTitleDetail titleNo=$titleNo source=detail-new-page-snapshot value=$value " +
+                "updateTag=$updateTag snapshotOrigin=${snapshot?.source ?: "none"}"
+        )
+        return value
     }
 
     private fun joinNonBlank(vararg parts: String): String {
@@ -3904,7 +3932,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
-        private const val DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
+        private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 180L
