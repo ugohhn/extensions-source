@@ -767,7 +767,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         scheduleOfficialCoverPrefetchForMarketingNewWorks(rawElements)
-        scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements)
+        // v71: speed first. Do not warm up extra /new-page covers during normal list parsing.
+        // Current-page cover prefetch still runs after parse; off-page warmup caused network contention.
         return MangasPage(entries, false)
     }
 
@@ -1143,7 +1144,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
     private var canonicalMangaUrlStoreLoadScheduled = false
-    private var canonicalMangaUrlStorePersistScheduled = false
     private val identityProbeUrlsByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var identityProbeSeenLogCount = 0
     private var identityProbeConflictLogCount = 0
@@ -1238,6 +1238,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val targetTitleNos: Set<String>,
     )
 
+
     private data class OfficialCoverCandidate(
         val title: String,
         val thumbnailUrl: String,
@@ -1252,6 +1253,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
     private var newPageCoverWarmupLastStartedAt = 0L
     private var popularPageGeneration = 0L
+    private var canonicalMangaUrlStorePersistScheduled = false
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
 
@@ -2708,7 +2710,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (titleCache.isEmpty()) return
         val now = System.currentTimeMillis()
         synchronized(newWorkCoverCacheLock) {
-            if (newWorkCoverPrefetchState != null) return
             if (now - newPageCoverWarmupLastStartedAt < NEW_PAGE_COVER_WARMUP_COOLDOWN_MS) return
         }
         val coverCache = getNewWorkCoverCache()
@@ -2723,7 +2724,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (warmupTargets.isEmpty()) return
         val scheduledGeneration = synchronized(newWorkCoverCacheLock) {
             val freshNow = System.currentTimeMillis()
-            if (newWorkCoverPrefetchState != null) return
             if (freshNow - newPageCoverWarmupLastStartedAt < NEW_PAGE_COVER_WARMUP_COOLDOWN_MS) return
             newPageCoverWarmupLastStartedAt = freshNow
             popularPageGeneration
@@ -2736,16 +2736,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!isStillSamePopularPage) {
                 dlog(
                     "popularNewPageCoverWarmupSkipped reason=session-changed " +
-                        "targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms"
-                )
-                return@Thread
-            }
-            val prefetchIdle = synchronized(newWorkCoverCacheLock) {
-                newWorkCoverPrefetchState == null
-            }
-            if (!prefetchIdle) {
-                dlog(
-                    "popularNewPageCoverWarmupSkipped reason=prefetch-busy " +
                         "targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms"
                 )
                 return@Thread
@@ -3893,16 +3883,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
-        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
-        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
-        private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
+        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_150L
+        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 0L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 0L
+        private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 0L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 0L
-        private const val CURRENT_PAGE_COVER_PREFETCH_DELAY_MS = 250L
-        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 3_000L
-        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 4_500L
+        private const val CURRENT_PAGE_COVER_PREFETCH_DELAY_MS = 350L
+        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 2_600L
+        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 3_600L
         private const val NEW_WORK_COVER_PREFETCH_CONCURRENCY = 2
         private const val NEW_WORK_COVER_PREFETCH_MAX_TARGETS = 5
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
