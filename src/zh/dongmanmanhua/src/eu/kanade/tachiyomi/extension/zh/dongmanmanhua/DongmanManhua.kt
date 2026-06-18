@@ -88,6 +88,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         passwordLoginInProgress
     }
 
+    // “新”标签只使用详情页专用的短时 /dailySchedule 快照：
+    // 不接受首页、列表或 /new 入口写入，也不持久化到磁盘或 SharedPreferences。
+    private data class DetailNewScheduleSnapshot(
+        val statesByTitleNo: Map<String, Boolean>,
+        val fetchedAtMs: Long,
+    )
+
+    @Volatile
+    private var detailNewScheduleSnapshot: DetailNewScheduleSnapshot? = null
+    private val detailNewScheduleSnapshotLock = Any()
+
     private val autoUnlockLocks = mutableMapOf<String, ReentrantLock>()
     private val autoUnlockLocksGuard = Any()
     private val autoUnlockRecentSuccess = mutableMapOf<String, Long>()
@@ -1692,6 +1703,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun mangaFromJsonTitle(item: org.json.JSONObject): SManga {
+        // 保留 JSON 字段用于 canonical URL 与诊断日志；不再把 newTitle 写入任何详情页历史缓存。
+        val titleNo = item.optInt("titleNo", 0)
+        val titleNoText = if (titleNo > 0) titleNo.toString() else item.optString("titleNo", "")
+        val newTitle = item.optBoolean("newTitle", false)
         return SManga.create().apply {
             val genreSeo = firstNonBlankJsonString(
                 item,
@@ -3799,41 +3814,77 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return false
         }
 
-        // “新”是详情页当前状态：项目中不保留任何历史 new 标签缓存。
-        // 每次进入详情页都以当次 /dailySchedule 为准，禁止按列表入口、旧内存状态或文档缓存回退。
-        val fresh = fetchNewTitleFromDailySchedule(titleNo)
-        val value = fresh == true
+        val state = fetchNewTitleFromDailySchedule(titleNo)
+        val value = state == true
         dlog(
-            "isNewTitleDetail titleNo=$titleNo source=dailySchedule-fresh " +
+            "isNewTitleDetail titleNo=$titleNo source=detail-dailySchedule-snapshot " +
                 "value=$value updateTag=$updateTag"
         )
         return value
     }
 
     private fun fetchNewTitleFromDailySchedule(titleNo: String): Boolean? {
-        return runCatching {
-            val url = "$baseUrl/dailySchedule"
-            val startedAt = System.currentTimeMillis()
-            val document = client.newCall(GET(url, headersBuilder().build())).execute().use { dailyResponse ->
-                dailyResponse.asJsoup()
-            }
+        val snapshot = getDetailNewScheduleSnapshot() ?: return null
+        val isNew = snapshot.statesByTitleNo[titleNo]
+        if (isNew == null) {
+            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false completed-or-not-in-schedule")
+            return false
+        }
+
+        dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=true isNew=$isNew")
+        return isNew
+    }
+
+    private fun getDetailNewScheduleSnapshot(): DetailNewScheduleSnapshot? {
+        val now = System.currentTimeMillis()
+        detailNewScheduleSnapshot?.takeIf { now - it.fetchedAtMs < DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS }?.let { snapshot ->
             dlog(
-                "fetchNewTitleFromDailySchedule titleNo=$titleNo source=fresh " +
-                    "elapsed=${System.currentTimeMillis() - startedAt}ms"
+                "detailNewScheduleSnapshot source=ttl-cache age=${now - snapshot.fetchedAtMs}ms " +
+                    "titles=${snapshot.statesByTitleNo.size}"
             )
+            return snapshot
+        }
 
-            val element = document.selectFirst("li#title_li_$titleNo, li[data-title-no=$titleNo]")
-            if (element == null) {
-                dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=false completed-or-not-in-schedule")
-                return@runCatching false
+        val lockWaitStartedAt = System.currentTimeMillis()
+        return synchronized(detailNewScheduleSnapshotLock) {
+            val lockedNow = System.currentTimeMillis()
+            detailNewScheduleSnapshot
+                ?.takeIf { lockedNow - it.fetchedAtMs < DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS }
+                ?.let { snapshot ->
+                    dlog(
+                        "detailNewScheduleSnapshot source=ttl-cache-after-wait " +
+                            "wait=${lockedNow - lockWaitStartedAt}ms " +
+                            "age=${lockedNow - snapshot.fetchedAtMs}ms titles=${snapshot.statesByTitleNo.size}"
+                    )
+                    return@synchronized snapshot
+                }
+
+            runCatching {
+                val startedAt = System.currentTimeMillis()
+                val document = client.newCall(GET("$baseUrl/dailySchedule", headersBuilder().build())).execute().use { dailyResponse ->
+                    dailyResponse.asJsoup()
+                }
+                val statesByTitleNo = mutableMapOf<String, Boolean>()
+                document.select("li[id^=title_li_], li[data-title-no]").forEach { element ->
+                    val titleNo = element.attr("data-title-no").trim()
+                        .ifBlank { element.id().removePrefix("title_li_").trim() }
+                        .takeIf { it.all(Char::isDigit) }
+                        ?: return@forEach
+                    val isNew = hasNewBadge(element)
+                    statesByTitleNo[titleNo] = (statesByTitleNo[titleNo] == true) || isNew
+                }
+                DetailNewScheduleSnapshot(statesByTitleNo.toMap(), System.currentTimeMillis()).also { snapshot ->
+                    detailNewScheduleSnapshot = snapshot
+                    dlog(
+                        "detailNewScheduleSnapshot source=fresh titles=${snapshot.statesByTitleNo.size} " +
+                            "elapsed=${snapshot.fetchedAtMs - startedAt}ms " +
+                            "ttl=${DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS}ms"
+                    )
+                }
+            }.getOrElse { e ->
+                wlog("detailNewScheduleSnapshot failed", e)
+                null
             }
-
-            val isNew = hasNewBadge(element)
-            dlog("fetchNewTitleFromDailySchedule titleNo=$titleNo found=true isNew=$isNew")
-            isNew
-        }.getOrElse { e ->
-            wlog("fetchNewTitleFromDailySchedule failed titleNo=$titleNo", e)
-            null
         }
     }
 
@@ -3853,6 +3904,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val GENRE_PAGE_CACHE_MAX_ENTRIES = 16
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
+        private const val DETAIL_NEW_SCHEDULE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 180L
