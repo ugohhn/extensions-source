@@ -740,6 +740,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
+            synchronized(newWorkCoverCacheLock) {
+                popularPageGeneration += 1
+            }
             clearLegacyNewWorkPersistentCaches()
             ensureNewPageTitlePrefetchStarted(
                 reason = "popular-request",
@@ -1245,6 +1248,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var newWorkCoverCache: NewWorkCoverCache? = null
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
     private var newPageCoverWarmupLastStartedAt = 0L
+    private var popularPageGeneration = 0L
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
 
@@ -2694,13 +2698,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .take(NEW_PAGE_COVER_WARMUP_MAX_TARGETS)
             .toSet()
         if (warmupTargets.isEmpty()) return
-        synchronized(newWorkCoverCacheLock) {
+        val scheduledGeneration = synchronized(newWorkCoverCacheLock) {
             val freshNow = System.currentTimeMillis()
             if (freshNow - newPageCoverWarmupLastStartedAt < NEW_PAGE_COVER_WARMUP_COOLDOWN_MS) return
             newPageCoverWarmupLastStartedAt = freshNow
+            popularPageGeneration
         }
         Thread({
             runCatching { Thread.sleep(NEW_PAGE_COVER_WARMUP_DELAY_MS) }
+            val isStillSamePopularPage = synchronized(newWorkCoverCacheLock) {
+                scheduledGeneration == popularPageGeneration
+            }
+            if (!isStillSamePopularPage) {
+                dlog(
+                    "popularNewPageCoverWarmupSkipped reason=session-changed " +
+                        "targets=${warmupTargets.size} delay=${NEW_PAGE_COVER_WARMUP_DELAY_MS}ms"
+                )
+                return@Thread
+            }
             ensureNewWorkCoverPrefetchStarted(
                 reason = "new-page-cover-warmup",
                 targetTitleNos = warmupTargets,
@@ -3833,9 +3848,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
         private const val NEW_WORK_COVER_FAILURE_COOLDOWN_MS = 3 * 60 * 1000L
         private const val NEW_WORK_COVER_FAILURE_MAX_ENTRIES = 120
-        private const val NEW_PAGE_COVER_WARMUP_DELAY_MS = 2_600L
+        private const val NEW_PAGE_COVER_WARMUP_DELAY_MS = 4_000L
         private const val NEW_PAGE_COVER_WARMUP_COOLDOWN_MS = 60_000L
-        private const val NEW_PAGE_COVER_WARMUP_MAX_TARGETS = 6
+        private const val NEW_PAGE_COVER_WARMUP_MAX_TARGETS = 5
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
