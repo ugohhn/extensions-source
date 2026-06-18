@@ -1114,7 +1114,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         )
                     }
                     val marked = cached.copy(hasNew = true)
-                    cacheNewTitle(marked.titleNo, true, "new-page")
                     marked
                 }
                 .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
@@ -1133,12 +1132,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     private val nextStartMap = mutableMapOf<String, Int>()
-    private val newTitleCache = mutableMapOf<String, Boolean>()
-    private val dailyScheduleNewCache = mutableMapOf<String, Boolean>()
-    private var dailyScheduleDocCache: org.jsoup.nodes.Document? = null
-    private var dailyScheduleDocCacheTime: Long = 0L
-    private val dailyScheduleDocCacheTtlMs = 30 * 60 * 1000L
-
     private val canonicalMangaUrlByTitleNo = mutableMapOf<String, String>()
     private val updateWeekdaysByTitleNo = mutableMapOf<String, MutableSet<String>>()
     private var canonicalMangaUrlStoreLoaded = false
@@ -1699,10 +1692,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun mangaFromJsonTitle(item: org.json.JSONObject): SManga {
-        val titleNo = item.optInt("titleNo", 0)
-        val titleNoText = if (titleNo > 0) titleNo.toString() else item.optString("titleNo", "")
-        val newTitle = item.optBoolean("newTitle", false)
-        cacheNewTitle(titleNoText, newTitle)
         return SManga.create().apply {
             val genreSeo = firstNonBlankJsonString(
                 item,
@@ -2331,7 +2320,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
         rememberOfficialMangaMetaFromList(titleNo, titleText, thumbnailUrl, origin)
         val hasNew = hasNewBadge(element)
-        cacheNewTitle(titleNo, hasNew)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
         return CachedMangaItem(
             url = identityPath,
@@ -2401,7 +2389,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val hasNew = hasNewBadge(element)
-        cacheNewTitle(titleNo, hasNew)
         val parsedTitle = mangaTitleFromElement(element)
         val parsedThumbnail = extractThumbnailUrl(element, origin, titleNo)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
@@ -2652,7 +2639,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (!getOfficialMangaMeta(titleNo)?.title.isNullOrBlank()) return@forEach
             val title = titlesByTitleNo[titleNo]?.trim().orEmpty()
             if (title.isBlank()) return@forEach
-            cacheNewTitle(titleNo, true, "new-page-title")
             if (rememberOfficialMangaMeta(titleNo, title, "", "new-page-title") != null) {
                 filled += 1
             }
@@ -3807,26 +3793,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: Regex("""/title/([0-9]+)""").find(url)?.groupValues?.getOrNull(1)
     }
 
-    private fun cacheNewTitle(titleNo: String?, isNew: Boolean, source: String = "list-or-json") {
-        if (titleNo.isNullOrBlank()) return
-        if (isNew) {
-            newTitleCache[titleNo] = true
-            if (VERBOSE_LIST_LOG) {
-                dlog("cacheNewTitle titleNo=$titleNo source=$source isNew=true")
-            }
-        } else if (VERBOSE_LIST_LOG) {
-            dlog("cacheNewTitle titleNo=$titleNo source=$source isNew=false ignored")
-        }
-    }
-
     private fun isNewTitleDetail(url: String, updateTag: String): Boolean {
         val titleNo = titleNoFromUrl(url) ?: run {
             dlog("isNewTitleDetail noTitleNo url=$url")
             return false
         }
 
-        // “新”是详情页当前状态：不读取 newTitleCache、dailyScheduleNewCache，
-        // 也不复用 dailySchedule 文档缓存。每次进入详情页都以当次 /dailySchedule 为准。
+        // “新”是详情页当前状态：项目中不保留任何历史 new 标签缓存。
+        // 每次进入详情页都以当次 /dailySchedule 为准，禁止按列表入口、旧内存状态或文档缓存回退。
         val fresh = fetchNewTitleFromDailySchedule(titleNo)
         val value = fresh == true
         dlog(
