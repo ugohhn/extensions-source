@@ -3936,7 +3936,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 180L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 260L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
         private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
