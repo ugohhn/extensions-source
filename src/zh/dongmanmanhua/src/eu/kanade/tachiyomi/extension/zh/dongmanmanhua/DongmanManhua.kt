@@ -2404,9 +2404,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) {
-            // 新作登场不再回退到营销标题，也不再显示“作品 xxxx”。
-            // 如果 /new 或详情预取暂时没给出正式标题，当前轮先过滤掉，后台补到后下一轮再显示。
-            officialMeta?.title?.takeIf { it.isNotBlank() }.orEmpty()
+            officialMeta?.title?.takeIf { it.isNotBlank() } ?: titleNo?.let { "作品 $it" }.orEmpty()
         } else {
             parsedTitle
         }
@@ -2484,13 +2482,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
 
         val latch = ensureNewPageTitlePrefetchStarted("popular-missing", force = true)
-        val waitMs = if (cachedTitles.isEmpty() && filledFromCache == 0) {
-            NEW_PAGE_TITLE_COLD_WAIT_MS
-        } else {
-            NEW_PAGE_TITLE_PREFETCH_WAIT_MS
-        }
         val waited = latch?.let {
-            runCatching { it.await(waitMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
+            runCatching { it.await(NEW_PAGE_TITLE_PREFETCH_WAIT_MS, TimeUnit.MILLISECONDS) }.getOrDefault(false)
         } ?: false
         val refreshedTitles = getNewPageTitleCache()
         val filledFromPrefetch = applyNewPageOfficialTitles(remainingTitleNos, refreshedTitles)
@@ -2502,7 +2495,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popularNewWorkNewPageTitleFill targets=${targetTitleNos.size} remaining=${remainingTitleNos.size} " +
                 "filled=$filled cacheFilled=$filledFromCache prefetchFilled=$filledFromPrefetch " +
                 "cacheHit=${cachedTitles.isNotEmpty()} prefetch=${latch != null} wait=$waited " +
-                "waitMs=$waitMs elapsed=${System.currentTimeMillis() - startedAt}ms"
+                "elapsed=${System.currentTimeMillis() - startedAt}ms"
         )
     }
 
@@ -2787,15 +2780,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     var success = false
                     try {
                         val candidate = fetchOfficialCoverCandidateFromDetail(titleNo, NEW_WORK_COVER_PREFETCH_TIMEOUT_MS)
-                        if (candidate != null) {
-                            if (candidate.title.isNotBlank()) {
-                                rememberOfficialMangaMeta(titleNo, candidate.title, "", "detail-memory")
-                            }
-                            if (candidate.thumbnailUrl.isNotBlank()) {
-                                covers[titleNo] = candidate.thumbnailUrl
-                                rememberOfficialMangaMeta(titleNo, candidate.title, candidate.thumbnailUrl, "detail-memory")
-                                success = true
-                            }
+                        if (candidate != null && candidate.thumbnailUrl.isNotBlank()) {
+                            covers[titleNo] = candidate.thumbnailUrl
+                            rememberOfficialMangaMeta(titleNo, candidate.title, candidate.thumbnailUrl, "detail-memory")
+                            success = true
                         }
                     } catch (e: Exception) {
                         if (e !is InterruptedIOException) {
@@ -3786,7 +3774,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
         private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
