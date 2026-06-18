@@ -37,7 +37,7 @@ import org.json.JSONObject
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
-import java.io.InterruptedIOException
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -679,17 +679,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         .cookieJar(CookieJar.NO_COOKIES)
         .addInterceptor { chain ->
             val request = chain.request()
-            if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH) {
-                Response.Builder()
-                    .request(request)
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
-                    .body("".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
-                    .build()
-            } else {
-                chain.proceed(request)
+            when {
+                request.url.encodedPath == LOCAL_COVER_PROXY_PATH -> executeCoverProxyRequest(request, chain)
+                request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH -> {
+                    Response.Builder()
+                        .request(request)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
+                        .body("".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
+                        .build()
+                }
+                else -> chain.proceed(request)
             }
         }
         .addInterceptor { chain ->
@@ -741,10 +743,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (page == 1) {
             resetFilterSessionState("popular-page1")
             clearLegacyNewWorkPersistentCaches()
-            ensureNewPageTitlePrefetchStarted(
-                reason = "popular-request",
-                startDelayMs = NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS,
-            )
+            ensureNewPageTitlePrefetchStarted("popular-request")
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -1245,6 +1244,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var newWorkCoverPrefetchState: NewWorkCoverPrefetchState? = null
     private val newWorkCoverFailureByTitleNo = mutableMapOf<String, Long>()
     private val suppressDetailNetworkFailureLog = ThreadLocal<Boolean>()
+    private val coverProxySeq = java.util.concurrent.atomic.AtomicInteger(0)
 
     @Volatile
     private var legacyNewWorkPersistentCacheCleared = false
@@ -2408,17 +2408,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             parsedTitle
         }
+        val rawOfficialThumbnail = if (isMarketingNewWork) officialMeta?.thumbnailUrl.orEmpty() else parsedThumbnail
         thumbnail_url = if (isMarketingNewWork) {
-            officialMeta?.thumbnailUrl.orEmpty()
+            buildCoverProxyUrl(titleNo, rawOfficialThumbnail)
         } else {
             parsedThumbnail
         }
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (isMarketingNewWork) {
+            val finalThumb = thumbnail_url.orEmpty()
             dlog(
                 "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
-                    "officialTitle=$title officialThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
-                    "officialSource=${officialMeta?.source ?: "none"}"
+                    "officialTitle=$title officialThumbUsed=${rawOfficialThumbnail.isNotBlank()} " +
+                    "officialSource=${officialMeta?.source ?: "none"} " +
+                    "thumbRaw=${shortCoverUrlForLog(rawOfficialThumbnail)} " +
+                    "thumbUi=${shortCoverUrlForLog(finalThumb)} " +
+                    "coverProxy=${rawOfficialThumbnail.isNotBlank() && finalThumb != rawOfficialThumbnail}"
             )
         }
         if (VERBOSE_LIST_LOG) {
@@ -2427,6 +2432,77 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "titleNo=$titleNo hasNew=$hasNew title=$title"
             )
         }
+    }
+
+
+    private fun buildCoverProxyUrl(titleNo: String?, thumbnailUrl: String): String {
+        val raw = thumbnailUrl.trim()
+        if (!DEBUG_NEW_WORK_COVER_PROXY || raw.isBlank()) return raw
+        val encodedUrl = URLEncoder.encode(raw, "UTF-8")
+        val encodedTitleNo = URLEncoder.encode(titleNo.orEmpty(), "UTF-8")
+        val seq = coverProxySeq.incrementAndGet()
+        return "$baseUrl$LOCAL_COVER_PROXY_PATH?titleNo=$encodedTitleNo&seq=$seq&u=$encodedUrl"
+    }
+
+    private fun executeCoverProxyRequest(request: Request, chain: okhttp3.Interceptor.Chain): Response {
+        val titleNo = request.url.queryParameter("titleNo").orEmpty()
+        val rawUrl = request.url.queryParameter("u").orEmpty().trim()
+        val seq = request.url.queryParameter("seq").orEmpty()
+        if (rawUrl.isBlank()) {
+            dlog("coverProxyBadRequest titleNo=$titleNo seq=$seq reason=empty-url")
+            return Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(400)
+                .message("Bad Request")
+                .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
+                .body("empty cover url".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
+                .build()
+        }
+        val startedAt = System.currentTimeMillis()
+        dlog("coverProxyHit titleNo=$titleNo seq=$seq raw=${shortCoverUrlForLog(rawUrl)}")
+        return try {
+            val proxyHeaders = headersBuilder()
+                .set("Referer", "$baseUrl/")
+                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .build()
+            val upstreamRequest = Request.Builder()
+                .url(rawUrl)
+                .headers(proxyHeaders)
+                .get()
+                .build()
+            val upstream = chain.proceed(upstreamRequest)
+            val elapsed = System.currentTimeMillis() - startedAt
+            dlog(
+                "coverProxyFetch titleNo=$titleNo seq=$seq code=${upstream.code} " +
+                    "type=${upstream.header("Content-Type").orEmpty().ifBlank { "none" }} " +
+                    "len=${upstream.header("Content-Length").orEmpty().ifBlank { "none" }} " +
+                    "elapsed=${elapsed}ms raw=${shortCoverUrlForLog(rawUrl)}"
+            )
+            upstream.newBuilder()
+                .request(request)
+                .header("Cache-Control", "no-store")
+                .build()
+        } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - startedAt
+            dlog("coverProxyFailed titleNo=$titleNo seq=$seq reason=${e.javaClass.simpleName} elapsed=${elapsed}ms raw=${shortCoverUrlForLog(rawUrl)}")
+            Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(502)
+                .message("Bad Gateway")
+                .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
+                .body("cover proxy failed: ${e.javaClass.simpleName}".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
+                .build()
+        }
+    }
+
+    private fun shortCoverUrlForLog(url: String): String {
+        if (url.isBlank()) return "none"
+        val normalized = url
+            .replace(cdnBase, "cdn:")
+            .replace(baseUrl, "base:")
+        return if (normalized.length <= 220) normalized else normalized.take(220) + "…"
     }
 
     private fun preseedOfficialMetaFromPopularRawElements(rawElements: List<Element>) {
@@ -2556,11 +2632,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun ensureNewPageTitlePrefetchStarted(
-        reason: String,
-        force: Boolean = false,
-        startDelayMs: Long = 0L,
-    ): CountDownLatch? {
+    private fun ensureNewPageTitlePrefetchStarted(reason: String, force: Boolean = false): CountDownLatch? {
         if (!force && isNewPageTitleCacheFresh()) return null
         var shouldStart = false
         val latch = synchronized(newPageTitleCacheLock) {
@@ -2575,9 +2647,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (!shouldStart) return latch
 
         Thread({
-            if (startDelayMs > 0L) {
-                runCatching { Thread.sleep(startDelayMs) }
-            }
             val startedAt = System.currentTimeMillis()
             var requestOk = false
             var count = 0
@@ -2587,7 +2656,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 count = titles.size
                 rememberNewPageTitleCache(titles)
             }.onFailure { e ->
-                dlog("popularNewPageTitlePrefetchFailed reason=$reason error=${e.javaClass.simpleName}")
+                wlog("popularNewPageTitlePrefetchFailed reason=$reason", e)
             }
             synchronized(newPageTitleCacheLock) {
                 if (newPageTitlePrefetchState?.latch === latch) {
@@ -2786,9 +2855,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             success = true
                         }
                     } catch (e: Exception) {
-                        if (e !is InterruptedIOException) {
-                            dlog("popularNewWorkCoverPrefetchItemFailed titleNo=$titleNo reason=${e.javaClass.simpleName}")
-                        }
+                        dlog("popularNewWorkCoverPrefetchItemFailed titleNo=$titleNo reason=${e.javaClass.simpleName}")
                     } finally {
                         if (!success) {
                             synchronized(newWorkCoverCacheLock) {
@@ -2932,6 +2999,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         getOfficialMangaMeta(titleNo)?.let { existing ->
             if (existing.title.isNotBlank() || existing.thumbnailUrl.isNotBlank()) return existing
         }
+        dlog(
+            "popularCommonCardNewWorkOfficialFastMissing titleNo=$titleNo identityPath=$identityPath " +
+                "marketingTitle=$marketingTitle marketingThumb=${marketingThumbnail.isNotBlank()}"
+        )
         return null
     }
 
@@ -3772,22 +3843,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
-        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
-        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 90L
-        private const val NEW_PAGE_TITLE_PREFETCH_START_DELAY_MS = 180L
+        private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_500L
+        private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 120L
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 0L
-        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 3_000L
-        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 4_500L
+        private const val NEW_WORK_COVER_PREFETCH_TIMEOUT_MS = 3_500L
+        private const val NEW_WORK_COVER_PREFETCH_TOTAL_TIMEOUT_MS = 5_500L
         private const val NEW_WORK_COVER_PREFETCH_CONCURRENCY = 2
         private const val NEW_WORK_COVER_PREFETCH_MAX_TARGETS = 5
         private const val NEW_WORK_COVER_CACHE_MAX_ENTRIES = 120
         private const val NEW_WORK_COVER_FAILURE_COOLDOWN_MS = 3 * 60 * 1000L
         private const val NEW_WORK_COVER_FAILURE_MAX_ENTRIES = 120
+        private const val DEBUG_NEW_WORK_COVER_PROXY = true
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
+        private const val LOCAL_COVER_PROXY_PATH = "/__dongman_cover_proxy"
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
