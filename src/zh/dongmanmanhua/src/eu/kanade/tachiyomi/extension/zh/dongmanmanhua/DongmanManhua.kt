@@ -39,7 +39,6 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
 import java.io.InterruptedIOException
-import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -1263,6 +1262,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 只接收详情页 HTML 社交元数据明确声明的 cdn-sns 正式封面。
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
+
+    // v97：虚拟封面 URL 对外保持稳定，只带 titleNo。
+    // detailUrl 仅存在进程内，供虚拟加载器解析官方 cdn-sns 封面时使用；不写持久化、不缓存图片 bytes。
+    private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
         val titleNo: String,
@@ -2604,16 +2607,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun buildOfficialCoverVirtualUrl(titleNo: String?, detailUrl: String): String {
         val key = titleNo?.trim().orEmpty()
-        val normalizedDetailUrl = detailUrl.trim()
+        val normalizedDetailUrl = rememberOfficialCoverDetailUrl(key, detailUrl)
         if (key.isBlank() || normalizedDetailUrl.isBlank()) return ""
-        val encodedDetail = URLEncoder.encode(normalizedDetailUrl, Charsets.UTF_8.name())
-        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key&detail=$encodedDetail"
+        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key"
     }
 
     private fun executeOfficialCoverVirtualRequest(request: Request, chain: Interceptor.Chain): Response {
         val startedAt = System.currentTimeMillis()
         val titleNo = request.url.queryParameter("titleNo")?.trim().orEmpty()
-        val detailUrl = request.url.queryParameter("detail")?.trim().orEmpty()
+        val detailUrl = request.url.queryParameter("detail")
+            ?.trim()
+            .orEmpty()
+            .ifBlank { officialCoverDetailUrlForTitleNo(titleNo) }
+            .ifBlank { titleNo.takeIf { it.isNotBlank() }?.let { "$baseUrl/episodeList?titleNo=$it" }.orEmpty() }
         val cachedDetailCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
         val trustedRuntimeCover = if (cachedDetailCover.isBlank()) trustedRuntimeOfficialCoverForTitleNo(titleNo) else ""
         val resolved = when {
@@ -3128,6 +3134,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (key.isBlank()) return ""
         return synchronized(verifiedDetailOfficialCoverByTitleNo) {
             verifiedDetailOfficialCoverByTitleNo[key].orEmpty()
+        }
+    }
+
+    private fun rememberOfficialCoverDetailUrl(titleNo: String?, detailUrl: String): String {
+        val key = titleNo?.trim().orEmpty()
+        val normalized = detailUrl.trim()
+        if (key.isBlank() || normalized.isBlank()) return ""
+        synchronized(officialCoverDetailUrlByTitleNo) {
+            officialCoverDetailUrlByTitleNo[key] = normalized
+        }
+        return normalized
+    }
+
+    private fun officialCoverDetailUrlForTitleNo(titleNo: String?): String {
+        val key = titleNo?.trim().orEmpty()
+        if (key.isBlank()) return ""
+        return synchronized(officialCoverDetailUrlByTitleNo) {
+            officialCoverDetailUrlByTitleNo[key].orEmpty()
         }
     }
 
