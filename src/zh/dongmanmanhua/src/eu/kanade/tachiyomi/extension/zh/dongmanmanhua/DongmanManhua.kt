@@ -766,8 +766,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             resetFilterSessionState("popular-page1")
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v95：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
-            // 新作封面不在 popularMangaParse 阶段等待；改由虚拟封面 URL 在图片加载阶段解析正式 cdn-sns 封面。
+            // v96：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // 新作封面不在 popularMangaParse 阶段等待；列表返回后立即后台预解析首屏官方封面，图片加载器复用同一个 in-flight 结果。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -784,6 +784,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
+        val warmupStats = prewarmOfficialNewWorkCoversForPopularAsync(elements)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -797,9 +798,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
                 "officialCoverWait=0ms " +
                 "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
-                "extraRequests=0 " +
-                "officialDetailRequests=0 " +
-                "coverMode=virtual-official-loader " +
+                "mainpathExtraRequests=0 " +
+                "mainpathOfficialDetailRequests=0 " +
+                "warmupTargets=${warmupStats.titleNos} " +
+                "warmupAlreadyReady=${warmupStats.alreadyReady} " +
+                "warmupTrusted=${warmupStats.trustedReady} " +
+                "warmupScheduled=${warmupStats.scheduled} " +
+                "coverMode=virtual-official-loader-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1282,6 +1287,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private data class OfficialCoverWaitStats(
         val titleNos: Int = 0,
         val alreadyReady: Int = 0,
+        val trustedReady: Int = 0,
         val scheduled: Int = 0,
         val success: Int = 0,
         val missing: Int = 0,
@@ -2613,7 +2619,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val resolved = when {
             cachedDetailCover.isNotBlank() -> OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
             trustedRuntimeCover.isNotBlank() -> OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
-            else -> resolveOfficialCoverForVirtualRequest(titleNo, detailUrl, chain, startedAt)
+            else -> resolveOfficialCoverForVirtualRequestViaInflight(titleNo, detailUrl, startedAt)
         }
         if (resolved.coverUrl.isBlank()) {
             dlog(
@@ -2644,6 +2650,46 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
         )
         return imageResponse
+    }
+
+    private fun resolveOfficialCoverForVirtualRequestViaInflight(
+        titleNo: String,
+        detailUrl: String,
+        overallStartedAt: Long,
+    ): OfficialCoverResolveResult {
+        if (titleNo.isBlank() || detailUrl.isBlank()) return OfficialCoverResolveResult("", "missing-title-or-detail")
+        val state = ensureOfficialNewWorkCoverFetchStarted(titleNo, detailUrl)
+            ?: return verifiedDetailOfficialCoverForTitleNo(titleNo)
+                .takeIf { it.isNotBlank() }
+                ?.let { OfficialCoverResolveResult(it, "detail-official-runtime-cache") }
+                ?: OfficialCoverResolveResult("", "inflight-not-started")
+
+        val waitStartedAt = System.currentTimeMillis()
+        if (!state.completed) {
+            runCatching { state.latch.await(OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS, TimeUnit.MILLISECONDS) }
+        }
+        val waitedMs = System.currentTimeMillis() - waitStartedAt
+        val remembered = verifiedDetailOfficialCoverForTitleNo(titleNo)
+        if (remembered.isNotBlank()) {
+            dlog(
+                "officialCoverVirtualResolveJoin titleNo=$titleNo coverPresent=true " +
+                    "source=virtual-inflight-official-cover completed=${state.completed} failed=${state.failed} " +
+                    "waited=${waitedMs}ms overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms " +
+                    "detailUrl=$detailUrl marketingRequests=0"
+            )
+            return OfficialCoverResolveResult(remembered, "virtual-inflight-official-cover")
+        }
+
+        dlog(
+            "officialCoverVirtualResolveJoin titleNo=$titleNo coverPresent=false " +
+                "source=${if (state.completed) "virtual-inflight-failed" else "virtual-inflight-pending"} " +
+                "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
+                "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms detailUrl=$detailUrl marketingRequests=0"
+        )
+        return OfficialCoverResolveResult(
+            "",
+            if (state.completed) "virtual-inflight-failed" else "virtual-inflight-pending",
+        )
     }
 
     private fun resolveOfficialCoverForVirtualRequest(
@@ -2720,6 +2766,41 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+    private fun prewarmOfficialNewWorkCoversForPopularAsync(elements: List<Element>): OfficialCoverWaitStats {
+        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT)
+        if (targets.isEmpty()) return OfficialCoverWaitStats()
+        var alreadyReady = 0
+        var trustedReady = 0
+        var scheduled = 0
+        val scheduledTitleNos = mutableListOf<String>()
+        targets.forEach { target ->
+            when {
+                verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
+                trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
+                else -> {
+                    val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl)
+                    if (state != null) {
+                        scheduled += 1
+                        scheduledTitleNos += target.titleNo
+                    }
+                }
+            }
+        }
+        dlog(
+            "officialCoverWarmupSchedule titleNos=${targets.joinToString("|") { it.titleNo }} " +
+                "alreadyReady=$alreadyReady trustedReady=$trustedReady scheduled=$scheduled " +
+                "scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
+                "limit=$OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
+                "mode=virtual-prefetch-inflight wait=0ms marketingRequests=0"
+        )
+        return OfficialCoverWaitStats(
+            titleNos = targets.size,
+            alreadyReady = alreadyReady,
+            trustedReady = trustedReady,
+            scheduled = scheduled,
+        )
+    }
+
     private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements)
         if (targets.isEmpty()) return OfficialCoverWaitStats()
@@ -2783,7 +2864,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val state = synchronized(officialNewWorkCoverFetchStates) {
             pruneOfficialNewWorkCoverFetchStatesLocked(now)
             val existing = officialNewWorkCoverFetchStates[key]
-            if (existing != null && (!existing.completed || now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS)) {
+            if (existing != null && (!existing.completed || (!existing.failed && now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS))) {
                 existing
             } else {
                 OfficialNewWorkCoverFetchState(key, detailUrl).also { officialNewWorkCoverFetchStates[key] = it }
@@ -2834,7 +2915,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     state.coverUrl = remembered
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
-                            "source=${scan.source} code=${response.code} requestedUrl=$requestUrl " +
+                            "source=${scan.source} fetchKind=warmup-inflight code=${response.code} requestedUrl=$requestUrl " +
                             "finalUrl=${response.request.url} ttfb=${responseAt - startedAt}ms " +
                             "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - startedAt}ms " +
                             "bytesScanned=${scan.bytesScanned} earlyClose=${scan.earlyClose} " +
@@ -3940,13 +4021,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 3
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 5
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
+        private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 64
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 96
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
