@@ -26,6 +26,7 @@ import org.jsoup.nodes.Element
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.tryParse
 import okhttp3.CookieJar
+import okhttp3.Interceptor
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
@@ -38,6 +39,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
 import java.io.InterruptedIOException
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -692,7 +694,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         .cookieJar(CookieJar.NO_COOKIES)
         .addInterceptor { chain ->
             val request = chain.request()
-            if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH) {
+            if (request.url.encodedPath == OFFICIAL_COVER_VIRTUAL_PATH) {
+                executeOfficialCoverVirtualRequest(request, chain)
+            } else if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH) {
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
@@ -762,8 +766,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             resetFilterSessionState("popular-page1")
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v94：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
-            // 新作封面禁止首页营销图，使用轻量详情页 meta 抓取正式 cdn-sns 封面。
+            // v95：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // 新作封面不在 popularMangaParse 阶段等待；改由虚拟封面 URL 在图片加载阶段解析正式 cdn-sns 封面。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -780,7 +784,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
-        val coverWaitStats = prepareOfficialNewWorkCoversForPopular(elements)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -792,10 +795,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
                 "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
-                "officialCoverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
+                "officialCoverWait=0ms " +
                 "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
-                "extraRequests=${coverWaitStats.scheduled} " +
-                "officialDetailRequests=${coverWaitStats.scheduled} " +
+                "extraRequests=0 " +
+                "officialDetailRequests=0 " +
+                "coverMode=virtual-official-loader " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -2475,17 +2479,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             ""
         }
-        val officialCoverMissing = isMarketingNewWork && verifiedOfficialCover.isBlank()
+        val trustedRuntimeOfficialCover = if (isMarketingNewWork && verifiedOfficialCover.isBlank()) {
+            trustedRuntimeOfficialCoverForTitleNo(titleNo)
+        } else {
+            ""
+        }
+        val virtualOfficialCover = if (isMarketingNewWork && verifiedOfficialCover.isBlank() && trustedRuntimeOfficialCover.isBlank()) {
+            val detailUrl = titleNo?.let { officialNewWorkDetailUrlForElement(element, it) }.orEmpty()
+            buildOfficialCoverVirtualUrl(titleNo, detailUrl)
+        } else {
+            ""
+        }
+        val selectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
+        val officialCoverMissing = isMarketingNewWork && selectedOfficialCover.isBlank()
 
         if (!isMarketingNewWork) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v94：新作封面只允许详情页 HTML meta 的 cdn-sns 正式封面。
-        // 不使用 data URI 空白占位；不读取、不回退首页营销图。
+        // v95：新作卡不等待详情页封面。thumbnail_url 塞内部虚拟官方封面 URL，
+        // 图片加载阶段再解析详情页 meta 并返回真实 cdn-sns 图片；不使用营销图、不使用空白图。
         thumbnail_url = if (isMarketingNewWork) {
-            verifiedOfficialCover
+            selectedOfficialCover
         } else {
             parsedThumbnail
         }
@@ -2498,13 +2514,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "popularCommonCardNewWorkOfficialCover titleNo=${titleNo.orEmpty()} " +
                     "eventTitleNo=$eventTitleNo eventTitle=$eventTitle " +
                     "titleValid=$titleValid marketingTitle=$parsedTitle " +
-                    "officialCoverPresent=${verifiedOfficialCover.isNotBlank()} " +
+                    "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
+                    "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
                     "marketingThumbnailSuppressed=true " +
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
-                    "uiCoverMode=${if (verifiedOfficialCover.isNotBlank()) "official-cover" else "missing-official-cover"} " +
-                    "coverClass=${if (verifiedOfficialCover.isNotBlank()) "detail-official-runtime" else "official-cover-missing"}"
+                    "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
+                    "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
         }
         if (VERBOSE_LIST_LOG) {
@@ -2522,8 +2539,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val titleNo = titleNoFromElementIdentity(element)
             val title = mangaTitleFromElement(element)
             if (origin == "popular-banner") {
-                // 轮播图本身是宣传横幅，不能作为封面；但标题在 v53 诊断里没有发现宣传标题污染，
-                // 可以作为新作登场的快速标题来源，避免首页首屏再同步请求详情。
+                // 轮播图只作为标题/身份线索预种；是否能当竖封面必须另行验证，不能直接作为新作封面。
                 if (rememberOfficialMangaMeta(titleNo, title, "", "popular-banner-title") != null) {
                     count += 1
                 }
@@ -2539,7 +2555,138 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (count > 0) dlog("popularOfficialMetaPreseed count=$count")
     }
 
-    // 只清理历史版本可能遗留的持久化标题/封面键；v94 不再读写这些键，也不保留旧 /new 或营销封面预取实现。
+    private data class OfficialCoverResolveResult(
+        val coverUrl: String,
+        val source: String,
+    )
+
+    private fun trustedRuntimeOfficialCoverForTitleNo(titleNo: String?): String {
+        val meta = getOfficialMangaMeta(titleNo) ?: return ""
+        val cover = stripImageProcessParams(meta.thumbnailUrl)
+        if (cover.isBlank()) return ""
+        if (meta.source == "popular-banner-title") return ""
+        if (cover.contains("/banner/", ignoreCase = true)) return ""
+        if (!isTrustedOfficialMetaSource(meta.source)) return ""
+        return cover
+    }
+
+    private fun popularNewWorkCoverMode(
+        verifiedOfficialCover: String,
+        trustedRuntimeOfficialCover: String,
+        virtualOfficialCover: String,
+    ): String {
+        return when {
+            verifiedOfficialCover.isNotBlank() -> "official-cover"
+            trustedRuntimeOfficialCover.isNotBlank() -> "trusted-runtime-official-cover"
+            virtualOfficialCover.isNotBlank() -> "virtual-official-cover"
+            else -> "missing-official-cover"
+        }
+    }
+
+    private fun popularNewWorkCoverClass(
+        verifiedOfficialCover: String,
+        trustedRuntimeOfficialCover: String,
+        virtualOfficialCover: String,
+    ): String {
+        return when {
+            verifiedOfficialCover.isNotBlank() -> "detail-official-runtime"
+            trustedRuntimeOfficialCover.isNotBlank() -> "trusted-runtime-official"
+            virtualOfficialCover.isNotBlank() -> "virtual-official-loader"
+            else -> "official-cover-missing"
+        }
+    }
+
+    private fun buildOfficialCoverVirtualUrl(titleNo: String?, detailUrl: String): String {
+        val key = titleNo?.trim().orEmpty()
+        val normalizedDetailUrl = detailUrl.trim()
+        if (key.isBlank() || normalizedDetailUrl.isBlank()) return ""
+        val encodedDetail = URLEncoder.encode(normalizedDetailUrl, Charsets.UTF_8.name())
+        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key&detail=$encodedDetail"
+    }
+
+    private fun executeOfficialCoverVirtualRequest(request: Request, chain: Interceptor.Chain): Response {
+        val startedAt = System.currentTimeMillis()
+        val titleNo = request.url.queryParameter("titleNo")?.trim().orEmpty()
+        val detailUrl = request.url.queryParameter("detail")?.trim().orEmpty()
+        val cachedDetailCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
+        val trustedRuntimeCover = if (cachedDetailCover.isBlank()) trustedRuntimeOfficialCoverForTitleNo(titleNo) else ""
+        val resolved = when {
+            cachedDetailCover.isNotBlank() -> OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
+            trustedRuntimeCover.isNotBlank() -> OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
+            else -> resolveOfficialCoverForVirtualRequest(titleNo, detailUrl, chain, startedAt)
+        }
+        if (resolved.coverUrl.isBlank()) {
+            dlog(
+                "officialCoverVirtualImage titleNo=$titleNo coverResolved=false source=${resolved.source.ifBlank { "unresolved" }} " +
+                    "detailUrl=$detailUrl elapsed=${System.currentTimeMillis() - startedAt}ms marketingRequests=0"
+            )
+            return Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(404)
+                .message("Official cover not resolved")
+                .headers(Headers.Builder().set("Content-Type", "text/plain; charset=UTF-8").build())
+                .body("official cover not resolved".toResponseBody("text/plain; charset=UTF-8".toMediaType()))
+                .build()
+        }
+
+        val imageStartedAt = System.currentTimeMillis()
+        val imageHeaders = headersBuilder()
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
+            .build()
+        val imageRequest = GET(resolved.coverUrl, imageHeaders)
+        val imageResponse = chain.proceed(imageRequest)
+        dlog(
+            "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
+                "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
+                "imageElapsed=${System.currentTimeMillis() - imageStartedAt}ms " +
+                "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
+        )
+        return imageResponse
+    }
+
+    private fun resolveOfficialCoverForVirtualRequest(
+        titleNo: String,
+        detailUrl: String,
+        chain: Interceptor.Chain,
+        overallStartedAt: Long,
+    ): OfficialCoverResolveResult {
+        if (titleNo.isBlank() || detailUrl.isBlank()) return OfficialCoverResolveResult("", "missing-title-or-detail")
+        return try {
+            val requestHeaders = headersBuilder()
+                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .set("X-Mihon-Official-Cover-Meta-Only", "1")
+                .build()
+            val detailRequest = GET(detailUrl, requestHeaders)
+            val detailStartedAt = System.currentTimeMillis()
+            chain.proceed(detailRequest).use { response ->
+                val responseAt = System.currentTimeMillis()
+                val scan = scanOfficialCoverMetaFast(response, titleNo)
+                val scanEndedAt = System.currentTimeMillis()
+                val remembered = if (scan.coverUrl.isNotBlank()) rememberVerifiedDetailOfficialCover(titleNo, scan.coverUrl) else ""
+                dlog(
+                    "officialCoverVirtualResolve titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
+                        "source=${scan.source} code=${response.code} requestedUrl=$detailUrl " +
+                        "finalUrl=${response.request.url} ttfb=${responseAt - detailStartedAt}ms " +
+                        "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - detailStartedAt}ms " +
+                        "overallElapsed=${scanEndedAt - overallStartedAt}ms bytesScanned=${scan.bytesScanned} " +
+                        "earlyClose=${scan.earlyClose} fullJsoup=false cacheWrite=false " +
+                        "directDetail=${!detailUrl.contains("/episodeList")} marketingRequests=0"
+                )
+                OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "virtual-detail-meta-fast" else scan.source)
+            }
+        } catch (e: Exception) {
+            wlog(
+                "officialCoverVirtualResolveFailed titleNo=$titleNo detailUrl=$detailUrl " +
+                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName}",
+                e,
+            )
+            OfficialCoverResolveResult("", "virtual-detail-meta-failed")
+        }
+    }
+
+    // 只清理历史版本可能遗留的持久化标题/封面键；v95 不再读写这些键，也不保留旧 /new 或营销封面预取实现。
     private fun selectedOfficialNewWorkTargets(elements: List<Element>): List<OfficialNewWorkCoverTarget> {
         val targets = linkedMapOf<String, OfficialNewWorkCoverTarget>()
         elements
@@ -2603,7 +2750,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "waited=${waitedMs}ms primaryWait=${primaryWaitMs}ms tailWait=${tailWaitMs}ms " +
                 "primaryTimeoutMs=$OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS " +
                 "tailTimeoutMs=$OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS " +
-                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM mode=fast-meta marketingRequests=0"
+                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM mode=legacy-fast-meta-unused marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -3794,8 +3941,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 3
-        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 1_500L
-        private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 500L
+        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
+        private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
@@ -3803,6 +3950,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
+        private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
