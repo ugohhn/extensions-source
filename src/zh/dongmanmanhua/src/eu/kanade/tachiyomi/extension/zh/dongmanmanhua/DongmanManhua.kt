@@ -762,8 +762,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             resetFilterSessionState("popular-page1")
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v91：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
-            // 新作封面只读取此前用户正常打开详情页时登记的正式 cdn-sns 图；首页不触发 /new、详情页、封面预取或 warmup。
+            // v94：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // 新作封面禁止首页营销图，使用轻量详情页 meta 抓取正式 cdn-sns 封面。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -1252,11 +1252,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
 
     // 只接收详情页 HTML 社交元数据明确声明的 cdn-sns 正式封面。
-    // v93 允许首页新作受控请求详情页 HTML 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
+    // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
         val titleNo: String,
+        val detailUrl: String,
         val createdAt: Long = System.currentTimeMillis(),
     ) {
         @Volatile
@@ -1281,6 +1282,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val success: Int = 0,
         val missing: Int = 0,
         val waitedMs: Long = 0L,
+    )
+
+    private data class OfficialNewWorkCoverTarget(
+        val titleNo: String,
+        val detailUrl: String,
+    )
+
+    private data class FastOfficialCoverScanResult(
+        val coverUrl: String,
+        val bytesScanned: Int,
+        val earlyClose: Boolean,
+        val source: String,
     )
 
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
@@ -2469,8 +2482,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v93：新作封面只允许详情页 HTML 的 cdn-sns 正式封面。
-        // 不再使用 data URI 空白占位；不读取、不回退首页营销图。
+        // v94：新作封面只允许详情页 HTML meta 的 cdn-sns 正式封面。
+        // 不使用 data URI 空白占位；不读取、不回退首页营销图。
         thumbnail_url = if (isMarketingNewWork) {
             verifiedOfficialCover
         } else {
@@ -2526,50 +2539,74 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (count > 0) dlog("popularOfficialMetaPreseed count=$count")
     }
 
-    // 只清理历史版本可能遗留的持久化标题/封面键；v91 不再读写这些键，也不保留任何预取实现。
-    private fun selectedOfficialNewWorkTitleNos(elements: List<Element>): List<String> {
-        return elements
+    // 只清理历史版本可能遗留的持久化标题/封面键；v94 不再读写这些键，也不保留旧 /new 或营销封面预取实现。
+    private fun selectedOfficialNewWorkTargets(elements: List<Element>): List<OfficialNewWorkCoverTarget> {
+        val targets = linkedMapOf<String, OfficialNewWorkCoverTarget>()
+        elements
             .asSequence()
             .filter { element ->
                 element.attr("data-mihon-origin") == "popular-common-card" && isPopularCommonCardNewWork(element)
             }
-            .mapNotNull { element -> titleNoFromElementIdentity(element)?.trim()?.takeIf { it.isNotBlank() } }
-            .distinct()
-            .toList()
+            .forEach { element ->
+                val titleNo = titleNoFromElementIdentity(element)?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
+                val detailUrl = officialNewWorkDetailUrlForElement(element, titleNo)
+                targets.putIfAbsent(titleNo, OfficialNewWorkCoverTarget(titleNo, detailUrl))
+            }
+        return targets.values.toList()
+    }
+
+    private fun officialNewWorkDetailUrlForElement(element: Element, titleNo: String): String {
+        val rawHref = element.attr("href")
+        val href = element.absUrl("href").ifEmpty { rawHref }
+        val cleanPath = cleanMangaDetailPath(href)
+        val knownPath = knownCanonicalMangaIdentity(titleNo)
+        val selectedPath = when {
+            isCleanWorkPagePath(cleanPath) -> cleanPath
+            isCleanWorkPagePath(knownPath) -> knownPath
+            cleanPath.isNotBlank() -> cleanPath
+            else -> "/episodeList?titleNo=$titleNo"
+        }
+        return if (selectedPath.startsWith("http://") || selectedPath.startsWith("https://")) {
+            selectedPath
+        } else {
+            baseUrl + selectedPath
+        }
     }
 
     private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
-        val titleNos = selectedOfficialNewWorkTitleNos(elements)
-        if (titleNos.isEmpty()) return OfficialCoverWaitStats()
+        val targets = selectedOfficialNewWorkTargets(elements)
+        if (targets.isEmpty()) return OfficialCoverWaitStats()
         var alreadyReady = 0
         val states = mutableListOf<OfficialNewWorkCoverFetchState>()
-        titleNos.forEach { titleNo ->
-            if (verifiedDetailOfficialCoverForTitleNo(titleNo).isNotBlank()) {
+        targets.forEach { target ->
+            if (verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank()) {
                 alreadyReady += 1
             } else {
-                ensureOfficialNewWorkCoverFetchStarted(titleNo)?.let { states.add(it) }
+                ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl)?.let { states.add(it) }
             }
         }
 
         val waitStartedAt = System.currentTimeMillis()
-        states.forEach { state ->
-            val elapsed = System.currentTimeMillis() - waitStartedAt
-            val remaining = OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS - elapsed
-            if (remaining > 0 && !state.completed) {
-                runCatching { state.latch.await(remaining, TimeUnit.MILLISECONDS) }
-            }
+        val primaryWaitMs = awaitOfficialNewWorkCoverStates(states, OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS)
+        val incompleteAfterPrimary = states.count { !it.completed }
+        val tailWaitMs = if (incompleteAfterPrimary > 0) {
+            awaitOfficialNewWorkCoverStates(states.filter { !it.completed }, OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS)
+        } else {
+            0L
         }
         val waitedMs = System.currentTimeMillis() - waitStartedAt
-        val success = titleNos.count { verifiedDetailOfficialCoverForTitleNo(it).isNotBlank() }
-        val missing = titleNos.size - success
+        val success = targets.count { verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() }
+        val missing = targets.size - success
         dlog(
-            "officialNewWorkCoverWait titleNos=${titleNos.joinToString("|")} " +
+            "officialNewWorkCoverWait titleNos=${targets.joinToString("|") { it.titleNo }} " +
                 "alreadyReady=$alreadyReady scheduled=${states.size} success=$success missing=$missing " +
-                "waited=${waitedMs}ms timeoutMs=$OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS " +
-                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM marketingRequests=0"
+                "waited=${waitedMs}ms primaryWait=${primaryWaitMs}ms tailWait=${tailWaitMs}ms " +
+                "primaryTimeoutMs=$OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS " +
+                "tailTimeoutMs=$OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS " +
+                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM mode=fast-meta marketingRequests=0"
         )
         return OfficialCoverWaitStats(
-            titleNos = titleNos.size,
+            titleNos = targets.size,
             alreadyReady = alreadyReady,
             scheduled = states.size,
             success = success,
@@ -2578,7 +2615,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
-    private fun ensureOfficialNewWorkCoverFetchStarted(titleNo: String): OfficialNewWorkCoverFetchState? {
+    private fun awaitOfficialNewWorkCoverStates(states: List<OfficialNewWorkCoverFetchState>, timeoutMs: Long): Long {
+        if (states.isEmpty() || timeoutMs <= 0L) return 0L
+        val startedAt = System.currentTimeMillis()
+        states.forEach { state ->
+            val elapsed = System.currentTimeMillis() - startedAt
+            val remaining = timeoutMs - elapsed
+            if (remaining > 0 && !state.completed) {
+                runCatching { state.latch.await(remaining, TimeUnit.MILLISECONDS) }
+            }
+        }
+        return System.currentTimeMillis() - startedAt
+    }
+
+    private fun ensureOfficialNewWorkCoverFetchStarted(titleNo: String, detailUrl: String): OfficialNewWorkCoverFetchState? {
         val key = titleNo.trim()
         if (key.isBlank()) return null
         if (verifiedDetailOfficialCoverForTitleNo(key).isNotBlank()) return null
@@ -2589,7 +2639,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (existing != null && (!existing.completed || now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS)) {
                 existing
             } else {
-                OfficialNewWorkCoverFetchState(key).also { officialNewWorkCoverFetchStates[key] = it }
+                OfficialNewWorkCoverFetchState(key, detailUrl).also { officialNewWorkCoverFetchStates[key] = it }
             }
         }
         synchronized(state) {
@@ -2619,18 +2669,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun fetchOfficialNewWorkCoverFromDetail(titleNo: String, state: OfficialNewWorkCoverFetchState) {
         val startedAt = System.currentTimeMillis()
         var failed = false
+        val requestUrl = state.detailUrl.ifBlank { "$baseUrl/episodeList?titleNo=$titleNo" }
         try {
-            val request = GET("$baseUrl/episodeList?titleNo=$titleNo", headersBuilder().build())
-            client.newCall(request).execute().use { response ->
-                val document = response.asJsoup()
-                val cover = verifiedDetailOfficialCoverFromDocument(document)
-                if (cover.isNotBlank()) {
-                    val remembered = rememberVerifiedDetailOfficialCover(titleNo, cover)
+            val requestHeaders = headersBuilder()
+                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .set("X-Mihon-Official-Cover-Meta-Only", "1")
+                .build()
+            val request = GET(requestUrl, requestHeaders)
+            val call = client.newCall(request)
+            call.timeout().timeout(OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
+                val responseAt = System.currentTimeMillis()
+                val scan = scanOfficialCoverMetaFast(response, titleNo)
+                val scanEndedAt = System.currentTimeMillis()
+                if (scan.coverUrl.isNotBlank()) {
+                    val remembered = rememberVerifiedDetailOfficialCover(titleNo, scan.coverUrl)
                     state.coverUrl = remembered
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
-                            "source=detail-og-twitter-cdn-sns code=${response.code} " +
-                            "finalUrl=${response.request.url} elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                            "source=${scan.source} code=${response.code} requestedUrl=$requestUrl " +
+                            "finalUrl=${response.request.url} ttfb=${responseAt - startedAt}ms " +
+                            "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - startedAt}ms " +
+                            "bytesScanned=${scan.bytesScanned} earlyClose=${scan.earlyClose} " +
+                            "fullJsoup=false cacheWrite=false directDetail=${!requestUrl.contains("/episodeList")} " +
                             "marketingRequests=0"
                     )
                     failed = remembered.isBlank()
@@ -2638,8 +2699,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     failed = true
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=false " +
-                            "source=detail-unverified code=${response.code} finalUrl=${response.request.url} " +
-                            "elapsed=${System.currentTimeMillis() - startedAt}ms marketingRequests=0"
+                            "source=${scan.source.ifBlank { "detail-meta-fast-unverified" }} code=${response.code} " +
+                            "requestedUrl=$requestUrl finalUrl=${response.request.url} " +
+                            "ttfb=${responseAt - startedAt}ms readMeta=${scanEndedAt - responseAt}ms " +
+                            "elapsed=${scanEndedAt - startedAt}ms bytesScanned=${scan.bytesScanned} " +
+                            "earlyClose=${scan.earlyClose} fullJsoup=false cacheWrite=false marketingRequests=0"
                     )
                 }
             }
@@ -2647,7 +2711,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             failed = true
             wlog(
                 "officialNewWorkCoverFetchFailed titleNo=$titleNo " +
-                    "elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
+                    "requestedUrl=$requestUrl elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
                 e,
             )
         } finally {
@@ -2655,6 +2719,63 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             state.completed = true
             state.latch.countDown()
         }
+    }
+
+    private fun scanOfficialCoverMetaFast(response: Response, titleNo: String): FastOfficialCoverScanResult {
+        val body = response.body ?: return FastOfficialCoverScanResult("", 0, false, "detail-meta-fast-no-body")
+        val input = body.byteStream()
+        val buffer = ByteArray(8 * 1024)
+        val html = StringBuilder()
+        var bytesScanned = 0
+        while (bytesScanned < OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES) {
+            val maxRead = minOf(buffer.size, OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES - bytesScanned)
+            val read = input.read(buffer, 0, maxRead)
+            if (read <= 0) break
+            bytesScanned += read
+            html.append(String(buffer, 0, read, Charsets.UTF_8))
+            val cover = verifiedDetailOfficialCoverFromHtmlSnippet(html.toString())
+            if (cover.isNotBlank()) {
+                return FastOfficialCoverScanResult(cover, bytesScanned, true, "detail-meta-fast-og-twitter-cdn-sns")
+            }
+            if (html.contains("</head>", ignoreCase = true)) break
+        }
+        val cover = verifiedDetailOfficialCoverFromHtmlSnippet(html.toString())
+        return FastOfficialCoverScanResult(
+            cover,
+            bytesScanned,
+            cover.isNotBlank(),
+            if (cover.isNotBlank()) "detail-meta-fast-og-twitter-cdn-sns" else "detail-meta-fast-unverified",
+        )
+    }
+
+    private fun verifiedDetailOfficialCoverFromHtmlSnippet(html: String): String {
+        if (html.isBlank()) return ""
+        var ogImage = ""
+        var twitterImage = ""
+        Regex("""<meta\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
+            val tag = match.value
+            val property = htmlAttributeValue(tag, "property").lowercase(Locale.ROOT)
+            val name = htmlAttributeValue(tag, "name").lowercase(Locale.ROOT)
+            val content = htmlAttributeValue(tag, "content")
+            if (content.isBlank()) return@forEach
+            when {
+                property == "og:image" -> ogImage = buildThumbnailUrl(content, cdnBase)
+                name == "twitter:image" -> twitterImage = buildThumbnailUrl(content, cdnBase)
+            }
+        }
+        val normalizedOg = stripImageProcessParams(ogImage)
+        val normalizedTwitter = stripImageProcessParams(twitterImage)
+        return normalizedOg.takeIf {
+            it.isNotBlank() &&
+                it == normalizedTwitter &&
+                isVerifiedDetailOfficialCoverUrl(it)
+        }.orEmpty()
+    }
+
+    private fun htmlAttributeValue(tag: String, name: String): String {
+        val regex = Regex("""\b${Regex.escape(name)}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", RegexOption.IGNORE_CASE)
+        val match = regex.find(tag) ?: return ""
+        return match.groupValues.drop(1).firstOrNull { it.isNotEmpty() }.orEmpty()
     }
 
     private fun clearLegacyNewWorkPersistentCaches() {
@@ -2951,6 +3072,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun detailHtmlCacheKey(request: Request): String? {
+        if (request.header("X-Mihon-Official-Cover-Meta-Only") == "1") return null
         val url = request.url
         if (url.encodedPath != "/episodeList") return null
         val titleNo = url.queryParameter("titleNo")?.trim().orEmpty()
@@ -3671,8 +3793,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 2
-        private const val OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS = 3_500L
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 3
+        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 1_500L
+        private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 500L
+        private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
+        private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 64
         private const val SLOW_NETWORK_LOG_MS = 10_000L
