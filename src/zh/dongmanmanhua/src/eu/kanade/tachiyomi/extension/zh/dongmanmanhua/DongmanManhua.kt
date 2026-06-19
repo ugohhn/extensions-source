@@ -765,7 +765,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
             // 冷启动时不再与首页 HTML 并发请求 /new。等首页解析确认确有正式标题缺口后，
-            // 由 preseedOfficialTitlesFromNewPageForMarketingNewWorks() 统一走 popular-missing + 650ms 保障。
+            // 由 preseedOfficialTitlesFromNewPageForMarketingNewWorks() 统一走 popular-missing + /new timeout 保障。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -3955,7 +3955,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val NEW_PAGE_TITLE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS = 1_300L
         private const val NEW_PAGE_TITLE_PREFETCH_WAIT_MS = 180L
-        private const val NEW_PAGE_TITLE_COLD_WAIT_MS = 650L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_EXTRA_MS = 100L
+        private const val NEW_PAGE_TITLE_COLD_WAIT_MS =
+            NEW_PAGE_TITLE_PREFETCH_TIMEOUT_MS + NEW_PAGE_TITLE_COLD_WAIT_EXTRA_MS
         private const val NEW_PAGE_TITLE_CACHE_MAX_ENTRIES = 300
         private const val NEW_WORK_COVER_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val NEW_WORK_COVER_PREFETCH_WAIT_MS = 0L
