@@ -759,13 +759,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
-            synchronized(newWorkCoverCacheLock) {
-                popularPageGeneration += 1
-            }
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // 冷启动时不再与首页 HTML 并发请求 /new。等首页解析确认确有正式标题缺口后，
-            // 由 preseedOfficialTitlesFromNewPageForMarketingNewWorks() 统一走 popular-missing + /new timeout 保障。
+            // v87：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // 首页不再为“新作登场”触发 /new、详情页、封面预取或 warmup。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -776,17 +773,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val afterDocumentAt = System.currentTimeMillis()
         val rawElements = collectPopularMangaElements(document)
         val afterCollectAt = System.currentTimeMillis()
-        // v86-A：只读取本次首页 HTML，审计“新作登场”是否已经存在可证明的原生正式资料。
-        // 它不读写首页标题/封面缓存，不发额外请求，也不改变当前 v84 冻结路径的结果。
-        auditHomeNativeEvidence(document, rawElements)
-        val afterNativeAuditAt = System.currentTimeMillis()
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
+        // 这里只整理同一次 home HTML 中普通模块本来就有的资料；
+        // “新作登场”不会读取该内存资料，而是直接验证自己的事件字段。
         preseedOfficialMetaFromPopularRawElements(rawElements)
-        val afterMetaAt = System.currentTimeMillis()
-        preseedOfficialTitlesFromNewPageForMarketingNewWorks(rawElements)
-        val afterTitlesAt = System.currentTimeMillis()
-        preseedOfficialCoversForMarketingNewWorks(rawElements)
-        val afterCoversAt = System.currentTimeMillis()
+        val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -794,19 +785,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         val afterEntriesAt = System.currentTimeMillis()
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
-        scheduleOfficialCoverPrefetchForMarketingNewWorks(rawElements)
-        scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements)
-        val finishedAt = System.currentTimeMillis()
         dlog(
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
-                "nativeAudit=${afterNativeAuditAt - afterCollectAt}ms " +
-                "meta=${afterMetaAt - afterNativeAuditAt}ms " +
-                "titles=${afterTitlesAt - afterMetaAt}ms " +
-                "covers=${afterCoversAt - afterTitlesAt}ms " +
-                "selectBuild=${afterEntriesAt - afterCoversAt}ms " +
-                "schedule=${finishedAt - afterEntriesAt}ms " +
-                "total=${finishedAt - parseStartedAt}ms"
+                "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
+                "nativeBuild=${afterEntriesAt - afterHomeMetaAt}ms " +
+                "extraRequests=0 " +
+                "total=${afterEntriesAt - parseStartedAt}ms"
         )
         return MangasPage(entries, false)
     }
@@ -998,191 +983,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             rawHref.contains("新作登場") ||
             href.contains("新作登场") ||
             href.contains("新作登場")
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // v86-A：首页原生证据审计（只读）
-    // ══════════════════════════════════════════════════════════════════════
-
-    /**
-     * 目的：验证“新作登场”的正式标题/封面是否已经藏在同一次首页 HTML 中。
-     *
-     * 本函数只读取 document 和 rawElements：
-     * - 不调用 /new、详情页或图片请求；
-     * - 不读取/写入 officialMangaMeta、newPageTitleCache、newWorkCoverCache；
-     * - 不改变最终 Manga 结果。
-     *
-     * 当前 v84 冻结逻辑会在本函数之后继续运行，保证 audit 期间用户可见结果不退化。
-     */
-    private fun auditHomeNativeEvidence(document: org.jsoup.nodes.Document, rawElements: List<Element>) {
-        val marketingElements = rawElements.asSequence()
-            .filter { element ->
-                element.attr("data-mihon-origin") == "popular-common-card" &&
-                    isPopularCommonCardNewWork(element)
-            }
-            .mapNotNull { element ->
-                titleNoFromElementIdentity(element)?.trim()?.takeIf { titleNo -> titleNo.isNotBlank() }
-                    ?.let { titleNo -> titleNo to element }
-            }
-            .distinctBy { (titleNo, _) -> titleNo }
-            .take(HOME_NATIVE_EVIDENCE_MAX_WORKS)
-            .toList()
-        if (marketingElements.isEmpty()) return
-
-        val targetTitleNos = marketingElements.map { (titleNo, _) -> titleNo }.toSet()
-        val rawOriginsByTitleNo = rawElements.asSequence()
-            .mapNotNull { element ->
-                titleNoFromElementIdentity(element)?.trim()?.takeIf { it in targetTitleNos }
-                    ?.let { titleNo -> titleNo to element.attr("data-mihon-origin").ifBlank { "raw-unclassified" } }
-            }
-            .groupBy({ (titleNo, _) -> titleNo }, { (_, origin) -> origin })
-            .mapValues { (_, origins) -> origins.distinct() }
-
-        val allHomeNodesByTitleNo = document
-            .select("a[href], [data-title-no], [data-sc-event-parameter]")
-            .asSequence()
-            .mapNotNull { element ->
-                titleNoFromElementIdentity(element)?.trim()?.takeIf { it in targetTitleNos }
-                    ?.let { titleNo -> titleNo to element }
-            }
-            .distinctBy { (_, element) -> System.identityHashCode(element) }
-            .groupBy({ (titleNo, _) -> titleNo }, { (_, element) -> element })
-
-        marketingElements.forEach { (titleNo, marketingElement) ->
-            val marketingTitle = mangaTitleFromElement(marketingElement)
-            val marketingThumbnail = extractThumbnailUrl(marketingElement, "popular-common-card", titleNo)
-            val rawOrigins = rawOriginsByTitleNo[titleNo].orEmpty()
-            val candidates = allHomeNodesByTitleNo[titleNo].orEmpty()
-                .map { element -> homeNativeEvidenceCandidate(element) }
-                .distinctBy { candidate ->
-                    listOf(
-                        candidate.origin,
-                        candidate.titleField,
-                        candidate.title,
-                        candidate.thumbnailUrl,
-                        candidate.href,
-                        candidate.eventParameter,
-                    ).joinToString("\\u0001")
-                }
-                .take(HOME_NATIVE_EVIDENCE_MAX_CANDIDATES)
-
-            val trustedTitleCandidate = candidates.firstOrNull { candidate ->
-                candidate.origin in HOME_NATIVE_EVIDENCE_TRUSTED_ORIGINS && candidate.title.isNotBlank()
-            }
-            val trustedCoverCandidate = candidates.firstOrNull { candidate ->
-                candidate.origin in HOME_NATIVE_EVIDENCE_TRUSTED_ORIGINS && candidate.thumbnailUrl.isNotBlank()
-            }
-            val decision = when {
-                trustedTitleCandidate != null -> "native-same-response-candidate"
-                candidates.any { candidate ->
-                    candidate.origin == "popular-banner" && candidate.title.isNotBlank()
-                } -> "banner-only-unverified"
-                candidates.any { candidate -> candidate.title.isNotBlank() } -> "title-unclassified"
-                else -> "unresolved"
-            }
-            val scriptSnippets = homeNativeEvidenceScriptSnippets(document, titleNo)
-
-            dlog(
-                "homeNativeEvidence titleNo=$titleNo marketingTitle=${homeNativeEvidenceText(marketingTitle)} " +
-                    "marketingThumb=${marketingThumbnail.isNotBlank()} rawOrigins=${rawOrigins.joinToString(",")} " +
-                    "documentNodes=${allHomeNodesByTitleNo[titleNo].orEmpty().size} " +
-                    "trustedTitle=${homeNativeEvidenceText(trustedTitleCandidate?.title.orEmpty())} " +
-                    "trustedTitleSource=${trustedTitleCandidate?.origin ?: "none"} " +
-                    "trustedCover=${trustedCoverCandidate?.thumbnailUrl?.isNotBlank() == true} " +
-                    "trustedCoverSource=${trustedCoverCandidate?.origin ?: "none"} " +
-                    "decision=$decision scriptHits=${scriptSnippets.size}"
-            )
-            candidates.forEachIndexed { index, candidate ->
-                dlog(
-                    "homeNativeEvidenceCandidate titleNo=$titleNo index=$index origin=${candidate.origin} " +
-                        "titleField=${candidate.titleField} title=${homeNativeEvidenceText(candidate.title)} " +
-                        "thumb=${candidate.thumbnailUrl.isNotBlank()} href=${homeNativeEvidenceText(candidate.href)} " +
-                        "attrTitle=${homeNativeEvidenceText(candidate.attrTitle)} " +
-                        "aria=${homeNativeEvidenceText(candidate.ariaLabel)} " +
-                        "imgAlt=${homeNativeEvidenceText(candidate.imageAlt)} " +
-                        "event=${homeNativeEvidenceText(candidate.eventParameter)}"
-                )
-            }
-            scriptSnippets.forEachIndexed { index, snippet ->
-                dlog("homeNativeEvidenceScript titleNo=$titleNo index=$index value=${homeNativeEvidenceText(snippet, HOME_NATIVE_EVIDENCE_SCRIPT_TEXT_MAX)}")
-            }
-        }
-    }
-
-    private data class HomeNativeEvidenceCandidate(
-        val origin: String,
-        val titleField: String,
-        val title: String,
-        val thumbnailUrl: String,
-        val href: String,
-        val attrTitle: String,
-        val ariaLabel: String,
-        val imageAlt: String,
-        val eventParameter: String,
-    )
-
-    private fun homeNativeEvidenceCandidate(element: Element): HomeNativeEvidenceCandidate {
-        val selectorTitle = element.selectFirst(
-            "p.subj, .subj .ellipsis, ._items_name_t, .home_genre_t, .works_tit, " +
-                "p.chapter-title-02, .chapter-title-01, .tit_content"
-        )?.text()?.trim().orEmpty()
-        val eventTitle = scEventParameterValue(element, "recommend_title_title").orEmpty()
-        val attrTitle = element.attr("title").trim()
-        val ariaLabel = element.attr("aria-label").trim()
-        val imageAlt = element.selectFirst("img")?.attr("alt")?.trim().orEmpty()
-        val titleField = when {
-            selectorTitle.isNotBlank() -> "selector"
-            eventTitle.isNotBlank() -> "event:recommend_title_title"
-            attrTitle.isNotBlank() -> "attr:title"
-            imageAlt.isNotBlank() -> "img:alt"
-            else -> "none"
-        }
-        val title = selectorTitle
-            .ifBlank { eventTitle }
-            .ifBlank { attrTitle }
-            .ifBlank { imageAlt }
-        val rawHref = element.attr("href")
-        val href = element.absUrl("href").ifEmpty { rawHref }
-        val origin = element.attr("data-mihon-origin").ifBlank { "home-unclassified" }
-        val titleNo = titleNoFromElementIdentity(element)
-        return HomeNativeEvidenceCandidate(
-            origin = origin,
-            titleField = titleField,
-            title = title,
-            thumbnailUrl = extractThumbnailUrl(element, origin, titleNo),
-            href = cleanMangaDetailPath(href),
-            attrTitle = attrTitle,
-            ariaLabel = ariaLabel,
-            imageAlt = imageAlt,
-            eventParameter = element.attr("data-sc-event-parameter").trim(),
-        )
-    }
-
-    private fun homeNativeEvidenceScriptSnippets(
-        document: org.jsoup.nodes.Document,
-        titleNo: String,
-    ): List<String> {
-        return document.select("script:not([src])")
-            .asSequence()
-            .map { script -> script.data().trim() }
-            .filter { script -> script.contains(titleNo) }
-            .map { script ->
-                val index = script.indexOf(titleNo).coerceAtLeast(0)
-                val start = (index - HOME_NATIVE_EVIDENCE_SCRIPT_CONTEXT_CHARS).coerceAtLeast(0)
-                val end = (index + titleNo.length + HOME_NATIVE_EVIDENCE_SCRIPT_CONTEXT_CHARS).coerceAtMost(script.length)
-                script.substring(start, end)
-            }
-            .distinct()
-            .take(HOME_NATIVE_EVIDENCE_MAX_SCRIPT_HITS)
-            .toList()
-    }
-
-    private fun homeNativeEvidenceText(value: String, maxLength: Int = HOME_NATIVE_EVIDENCE_TEXT_MAX): String {
-        return value
-            .replace(Regex("\\s+"), " ")
-            .replace("|", "¦")
-            .trim()
-            .take(maxLength)
     }
 
     private fun logPopularModuleProbe(origin: String, elements: List<Element>) {
@@ -2614,6 +2414,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return true
     }
 
+    private fun nativeEventTitleForMarketingNewWork(element: Element, titleNo: String?): String {
+        val normalizedTitleNo = titleNo?.trim().orEmpty()
+        val eventTitleNo = scEventParameterValue(element, "recommended_titleNo")?.trim().orEmpty()
+        val eventTitle = scEventParameterValue(element, "recommend_title_title")?.trim().orEmpty()
+        return eventTitle.takeIf {
+            normalizedTitleNo.isNotBlank() &&
+                eventTitleNo == normalizedTitleNo &&
+                it.isNotBlank()
+        }.orEmpty()
+    }
+
     private fun mangaFromElement(element: Element, origin: String = "manga-element"): SManga = SManga.create().apply {
         val rawHref = element.attr("href")
         val href = element.absUrl("href").ifEmpty { rawHref }
@@ -2628,31 +2439,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val parsedTitle = mangaTitleFromElement(element)
         val parsedThumbnail = extractThumbnailUrl(element, origin, titleNo)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
-        val officialMeta = if (isMarketingNewWork) {
-            resolveOfficialMetaForMarketingNewWork(titleNo, identityPath, parsedTitle, parsedThumbnail)
+        val nativeEventTitle = if (isMarketingNewWork) {
+            nativeEventTitleForMarketingNewWork(element, titleNo)
         } else {
+            ""
+        }
+
+        if (!isMarketingNewWork) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
-            null
         }
         url = identityPath
-        title = if (isMarketingNewWork) {
-            // 新作登场不再回退到营销标题，也不再显示“作品 xxxx”。
-            // 如果 /new 或详情预取暂时没给出正式标题，当前轮先过滤掉，后台补到后下一轮再显示。
-            officialMeta?.title?.takeIf { it.isNotBlank() }.orEmpty()
-        } else {
-            parsedTitle
-        }
-        thumbnail_url = if (isMarketingNewWork) {
-            officialMeta?.thumbnailUrl.orEmpty()
-        } else {
-            parsedThumbnail
-        }
+        title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
+        // v87 实验仅展示当前新作卡自身图片；它不是“真实封面”结论，也不触发补图请求。
+        thumbnail_url = parsedThumbnail
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (isMarketingNewWork) {
+            val eventTitleNo = scEventParameterValue(element, "recommended_titleNo")?.trim().orEmpty()
+            val eventTitle = scEventParameterValue(element, "recommend_title_title")?.trim().orEmpty()
+            val titleValid = title.isNotBlank()
             dlog(
-                "popularCommonCardNewWorkOfficial titleNo=$titleNo marketingTitle=$parsedTitle " +
-                    "officialTitle=$title officialThumbUsed=${thumbnail_url.orEmpty().isNotBlank()} " +
-                    "officialSource=${officialMeta?.source ?: "none"}"
+                "popularCommonCardNewWorkNative titleNo=${titleNo.orEmpty()} " +
+                    "eventTitleNo=$eventTitleNo eventTitle=$eventTitle " +
+                    "titleValid=$titleValid marketingTitle=$parsedTitle " +
+                    "marketingThumbUsed=${parsedThumbnail.isNotBlank()} coverClass=marketing-card"
             )
         }
         if (VERBOSE_LIST_LOG) {
@@ -4166,16 +3975,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val NEW_PROBE_LOG_LIMIT = 5
-        private const val HOME_NATIVE_EVIDENCE_MAX_WORKS = 12
-        private const val HOME_NATIVE_EVIDENCE_MAX_CANDIDATES = 12
-        private const val HOME_NATIVE_EVIDENCE_MAX_SCRIPT_HITS = 3
-        private const val HOME_NATIVE_EVIDENCE_TEXT_MAX = 220
-        private const val HOME_NATIVE_EVIDENCE_SCRIPT_TEXT_MAX = 420
-        private const val HOME_NATIVE_EVIDENCE_SCRIPT_CONTEXT_CHARS = 180
-        private val HOME_NATIVE_EVIDENCE_TRUSTED_ORIGINS = setOf(
-            "popular-ranking",
-            "popular-genre-category",
-        )
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
         private const val DEBUG_POPULAR_GENRE_FILTER_LOG = false
