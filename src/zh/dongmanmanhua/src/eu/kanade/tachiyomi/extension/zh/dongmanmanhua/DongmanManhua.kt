@@ -780,6 +780,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
+        val coverWaitStats = prepareOfficialNewWorkCoversForPopular(elements)
+        val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
             .filter { it.title.isNotEmpty() }
@@ -790,8 +792,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
                 "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
-                "nativeBuild=${afterEntriesAt - afterHomeMetaAt}ms " +
-                "extraRequests=0 " +
+                "officialCoverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
+                "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
+                "extraRequests=${coverWaitStats.scheduled} " +
+                "officialDetailRequests=${coverWaitStats.scheduled} " +
+                "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
         return MangasPage(entries, false)
@@ -1246,9 +1251,40 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val officialMangaMetaByTitleNo = mutableMapOf<String, OfficialMangaMeta>()
 
-    // 只接收用户正常打开详情页时，HTML 社交元数据明确声明的 cdn-sns 正式封面。
-    // 仅进程内保存：不写 SP / 文件，不触发首页请求，也不使用首页营销卡图补位。
+    // 只接收详情页 HTML 社交元数据明确声明的 cdn-sns 正式封面。
+    // v93 允许首页新作受控请求详情页 HTML 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
+
+    private class OfficialNewWorkCoverFetchState(
+        val titleNo: String,
+        val createdAt: Long = System.currentTimeMillis(),
+    ) {
+        @Volatile
+        var completed: Boolean = false
+
+        @Volatile
+        var failed: Boolean = false
+
+        @Volatile
+        var coverUrl: String = ""
+
+        @Volatile
+        var submitted: Boolean = false
+
+        val latch = CountDownLatch(1)
+    }
+
+    private data class OfficialCoverWaitStats(
+        val titleNos: Int = 0,
+        val alreadyReady: Int = 0,
+        val scheduled: Int = 0,
+        val success: Int = 0,
+        val missing: Int = 0,
+        val waitedMs: Long = 0L,
+    )
+
+    private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
+    private val officialNewWorkCoverExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM)
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -2426,17 +2462,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             ""
         }
-        val forcedBlankPlaceholderApplied = isMarketingNewWork && verifiedOfficialCover.isBlank()
+        val officialCoverMissing = isMarketingNewWork && verifiedOfficialCover.isBlank()
 
         if (!isMarketingNewWork) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v92：新作只允许已由正常详情页证实的 cdn-sns 正式封面；
-        // 未验证时写入本地 data URI 透明占位，强制覆盖旧版本遗留的营销封面缓存。
+        // v93：新作封面只允许详情页 HTML 的 cdn-sns 正式封面。
+        // 不再使用 data URI 空白占位；不读取、不回退首页营销图。
         thumbnail_url = if (isMarketingNewWork) {
-            verifiedOfficialCover.ifBlank { STRICT_OFFICIAL_COVER_BLANK_PLACEHOLDER_URI }
+            verifiedOfficialCover
         } else {
             parsedThumbnail
         }
@@ -2451,9 +2487,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "titleValid=$titleValid marketingTitle=$parsedTitle " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank()} " +
                     "marketingThumbnailSuppressed=true " +
-                    "forcedBlankPlaceholderApplied=$forcedBlankPlaceholderApplied " +
-                    "uiClearMode=${if (forcedBlankPlaceholderApplied) "forced-data-placeholder" else "official-cover"} " +
-                    "coverClass=${if (verifiedOfficialCover.isNotBlank()) "detail-official-runtime" else "blank-placeholder-unverified"}"
+                    "officialDetailFetchEnabled=true " +
+                    "blankPlaceholderApplied=false " +
+                    "officialCoverMissing=$officialCoverMissing " +
+                    "uiCoverMode=${if (verifiedOfficialCover.isNotBlank()) "official-cover" else "missing-official-cover"} " +
+                    "coverClass=${if (verifiedOfficialCover.isNotBlank()) "detail-official-runtime" else "official-cover-missing"}"
             )
         }
         if (VERBOSE_LIST_LOG) {
@@ -2489,6 +2527,136 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     // 只清理历史版本可能遗留的持久化标题/封面键；v91 不再读写这些键，也不保留任何预取实现。
+    private fun selectedOfficialNewWorkTitleNos(elements: List<Element>): List<String> {
+        return elements
+            .asSequence()
+            .filter { element ->
+                element.attr("data-mihon-origin") == "popular-common-card" && isPopularCommonCardNewWork(element)
+            }
+            .mapNotNull { element -> titleNoFromElementIdentity(element)?.trim()?.takeIf { it.isNotBlank() } }
+            .distinct()
+            .toList()
+    }
+
+    private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
+        val titleNos = selectedOfficialNewWorkTitleNos(elements)
+        if (titleNos.isEmpty()) return OfficialCoverWaitStats()
+        var alreadyReady = 0
+        val states = mutableListOf<OfficialNewWorkCoverFetchState>()
+        titleNos.forEach { titleNo ->
+            if (verifiedDetailOfficialCoverForTitleNo(titleNo).isNotBlank()) {
+                alreadyReady += 1
+            } else {
+                ensureOfficialNewWorkCoverFetchStarted(titleNo)?.let { states.add(it) }
+            }
+        }
+
+        val waitStartedAt = System.currentTimeMillis()
+        states.forEach { state ->
+            val elapsed = System.currentTimeMillis() - waitStartedAt
+            val remaining = OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS - elapsed
+            if (remaining > 0 && !state.completed) {
+                runCatching { state.latch.await(remaining, TimeUnit.MILLISECONDS) }
+            }
+        }
+        val waitedMs = System.currentTimeMillis() - waitStartedAt
+        val success = titleNos.count { verifiedDetailOfficialCoverForTitleNo(it).isNotBlank() }
+        val missing = titleNos.size - success
+        dlog(
+            "officialNewWorkCoverWait titleNos=${titleNos.joinToString("|")} " +
+                "alreadyReady=$alreadyReady scheduled=${states.size} success=$success missing=$missing " +
+                "waited=${waitedMs}ms timeoutMs=$OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS " +
+                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM marketingRequests=0"
+        )
+        return OfficialCoverWaitStats(
+            titleNos = titleNos.size,
+            alreadyReady = alreadyReady,
+            scheduled = states.size,
+            success = success,
+            missing = missing,
+            waitedMs = waitedMs,
+        )
+    }
+
+    private fun ensureOfficialNewWorkCoverFetchStarted(titleNo: String): OfficialNewWorkCoverFetchState? {
+        val key = titleNo.trim()
+        if (key.isBlank()) return null
+        if (verifiedDetailOfficialCoverForTitleNo(key).isNotBlank()) return null
+        val now = System.currentTimeMillis()
+        val state = synchronized(officialNewWorkCoverFetchStates) {
+            pruneOfficialNewWorkCoverFetchStatesLocked(now)
+            val existing = officialNewWorkCoverFetchStates[key]
+            if (existing != null && (!existing.completed || now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS)) {
+                existing
+            } else {
+                OfficialNewWorkCoverFetchState(key).also { officialNewWorkCoverFetchStates[key] = it }
+            }
+        }
+        synchronized(state) {
+            if (!state.submitted && !state.completed) {
+                state.submitted = true
+                officialNewWorkCoverExecutor.execute { fetchOfficialNewWorkCoverFromDetail(key, state) }
+            }
+        }
+        return state
+    }
+
+    private fun pruneOfficialNewWorkCoverFetchStatesLocked(now: Long) {
+        val iterator = officialNewWorkCoverFetchStates.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val state = entry.value
+            if (state.completed && now - state.createdAt > OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS) {
+                iterator.remove()
+            }
+        }
+        while (officialNewWorkCoverFetchStates.size > OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES) {
+            val firstKey = officialNewWorkCoverFetchStates.keys.firstOrNull() ?: break
+            officialNewWorkCoverFetchStates.remove(firstKey)
+        }
+    }
+
+    private fun fetchOfficialNewWorkCoverFromDetail(titleNo: String, state: OfficialNewWorkCoverFetchState) {
+        val startedAt = System.currentTimeMillis()
+        var failed = false
+        try {
+            val request = GET("$baseUrl/episodeList?titleNo=$titleNo", headersBuilder().build())
+            client.newCall(request).execute().use { response ->
+                val document = response.asJsoup()
+                val cover = verifiedDetailOfficialCoverFromDocument(document)
+                if (cover.isNotBlank()) {
+                    val remembered = rememberVerifiedDetailOfficialCover(titleNo, cover)
+                    state.coverUrl = remembered
+                    dlog(
+                        "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
+                            "source=detail-og-twitter-cdn-sns code=${response.code} " +
+                            "finalUrl=${response.request.url} elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                            "marketingRequests=0"
+                    )
+                    failed = remembered.isBlank()
+                } else {
+                    failed = true
+                    dlog(
+                        "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=false " +
+                            "source=detail-unverified code=${response.code} finalUrl=${response.request.url} " +
+                            "elapsed=${System.currentTimeMillis() - startedAt}ms marketingRequests=0"
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            failed = true
+            wlog(
+                "officialNewWorkCoverFetchFailed titleNo=$titleNo " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
+                e,
+            )
+        } finally {
+            state.failed = failed
+            state.completed = true
+            state.latch.countDown()
+        }
+    }
+
     private fun clearLegacyNewWorkPersistentCaches() {
         if (legacyNewWorkPersistentCacheCleared) return
         synchronized(legacyNewWorkPersistentCacheClearLock) {
@@ -3503,10 +3671,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        // 1x1 透明 PNG。用于强制覆盖旧版本遗留的营销封面视觉缓存；不触发网络请求。
-        private const val STRICT_OFFICIAL_COVER_BLANK_PLACEHOLDER_URI =
-            "data:image/png;base64," +
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 2
+        private const val OFFICIAL_NEW_WORK_COVER_PARSE_WAIT_MS = 3_500L
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 64
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
