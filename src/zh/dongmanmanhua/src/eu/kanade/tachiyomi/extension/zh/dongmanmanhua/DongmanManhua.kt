@@ -724,17 +724,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         .addNetworkInterceptor { chain ->
             val request = chain.request()
+            val isPopularHomeRequest = request.url.encodedPath == "/" && request.url.queryParameter("pageName") == "home"
             val startedAt = System.currentTimeMillis()
             try {
                 val response = chain.proceed(request)
                 mergeSetCookieFromResponse(response)
                 val elapsed = System.currentTimeMillis() - startedAt
+                if (isPopularHomeRequest) {
+                    dlog("popularPerf networkHome elapsed=${elapsed}ms code=${response.code}")
+                }
                 if (elapsed >= SLOW_NETWORK_LOG_MS && isDetailLikePath(request.url.encodedPath)) {
                     dlog("networkSlow path=${request.url.encodedPath} url=${request.url} elapsed=${elapsed}ms code=${response.code}")
                 }
                 response
             } catch (e: Exception) {
                 val elapsed = System.currentTimeMillis() - startedAt
+                if (isPopularHomeRequest) {
+                    dlog("popularPerf networkHomeFailed elapsed=${elapsed}ms error=${e.javaClass.simpleName}")
+                }
                 if (isDetailLikePath(request.url.encodedPath) && suppressDetailNetworkFailureLog.get() != true) {
                     wlog("networkFailed path=${request.url.encodedPath} url=${request.url} elapsed=${elapsed}ms", e)
                 }
@@ -766,20 +773,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
+        val parseStartedAt = System.currentTimeMillis()
         val document = response.asJsoup()
+        val afterDocumentAt = System.currentTimeMillis()
         val rawElements = collectPopularMangaElements(document)
+        val afterCollectAt = System.currentTimeMillis()
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
         preseedOfficialMetaFromPopularRawElements(rawElements)
+        val afterMetaAt = System.currentTimeMillis()
         preseedOfficialTitlesFromNewPageForMarketingNewWorks(rawElements)
+        val afterTitlesAt = System.currentTimeMillis()
         preseedOfficialCoversForMarketingNewWorks(rawElements)
+        val afterCoversAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
             .filter { it.title.isNotEmpty() }
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
+        val afterEntriesAt = System.currentTimeMillis()
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         scheduleOfficialCoverPrefetchForMarketingNewWorks(rawElements)
         scheduleNewPageCoverWarmupForMarketingNewWorks(rawElements)
+        val finishedAt = System.currentTimeMillis()
+        dlog(
+            "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
+                "collect=${afterCollectAt - afterDocumentAt}ms " +
+                "meta=${afterMetaAt - afterCollectAt}ms " +
+                "titles=${afterTitlesAt - afterMetaAt}ms " +
+                "covers=${afterCoversAt - afterTitlesAt}ms " +
+                "selectBuild=${afterEntriesAt - afterCoversAt}ms " +
+                "schedule=${finishedAt - afterEntriesAt}ms " +
+                "total=${finishedAt - parseStartedAt}ms"
+        )
         return MangasPage(entries, false)
     }
 
