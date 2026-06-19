@@ -2426,14 +2426,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             ""
         }
+        val forcedBlankPlaceholderApplied = isMarketingNewWork && verifiedOfficialCover.isBlank()
 
         if (!isMarketingNewWork) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v91：新作只允许已由正常详情页证实的 cdn-sns 正式封面；没有证据则留空。
-        thumbnail_url = if (isMarketingNewWork) verifiedOfficialCover else parsedThumbnail
+        // v92：新作只允许已由正常详情页证实的 cdn-sns 正式封面；
+        // 未验证时写入本地 data URI 透明占位，强制覆盖旧版本遗留的营销封面缓存。
+        thumbnail_url = if (isMarketingNewWork) {
+            verifiedOfficialCover.ifBlank { STRICT_OFFICIAL_COVER_BLANK_PLACEHOLDER_URI }
+        } else {
+            parsedThumbnail
+        }
         logIdentityProbe(origin, titleNo, title, rawHref, href, url)
         if (isMarketingNewWork) {
             val eventTitleNo = scEventParameterValue(element, "recommended_titleNo")?.trim().orEmpty()
@@ -2445,7 +2451,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "titleValid=$titleValid marketingTitle=$parsedTitle " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank()} " +
                     "marketingThumbnailSuppressed=true " +
-                    "coverClass=${if (verifiedOfficialCover.isNotBlank()) "detail-official-runtime" else "none-unverified"}"
+                    "forcedBlankPlaceholderApplied=$forcedBlankPlaceholderApplied " +
+                    "uiClearMode=${if (forcedBlankPlaceholderApplied) "forced-data-placeholder" else "official-cover"} " +
+                    "coverClass=${if (verifiedOfficialCover.isNotBlank()) "detail-official-runtime" else "blank-placeholder-unverified"}"
             )
         }
         if (VERBOSE_LIST_LOG) {
@@ -3495,6 +3503,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
+        // 1x1 透明 PNG。用于强制覆盖旧版本遗留的营销封面视觉缓存；不触发网络请求。
+        private const val STRICT_OFFICIAL_COVER_BLANK_PLACEHOLDER_URI =
+            "data:image/png;base64," +
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
