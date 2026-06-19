@@ -96,6 +96,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val source: String,
     )
 
+    // v90-A：只保存手动详情页 HTML 中静态声明的请求提示；不触发请求，也不作为首页回填依据。
+    private data class CoverSourceDiscoveryInlineRequestHint(
+        val detector: String,
+        val endpoint: String,
+    )
+
     @Volatile
     private var detailNewPageSnapshot: DetailNewPageSnapshot? = null
     private val detailNewPageSnapshotLock = Any()
@@ -2006,7 +2012,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "mangaDetailsRequest title=${manga.title} manga.url=${manga.url} " +
                 "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
         )
-        // v89-A：仅标记用户正常打开详情时已经存在的请求；不由首页触发，也不产生探测请求。
+        // v90-A：仅标记用户正常打开详情时已经存在的请求；不由首页触发，也不产生探测请求。
         dlog(
             "coverSourceDiscoveryRequest trigger=normal-detail method=GET " +
                 "titleNo=${titleNoFromUrl(finalUrl).orEmpty()} endpoint=${coverSourceDiscoveryText(finalUrl, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
@@ -2022,8 +2028,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: document.title().substringBefore("_")
     }
 
-    // v89-A：官方封面来源发现。只读取用户正常打开详情时已经收到的 HTML；
-    // 不由首页调用，不追加 HTTP，不回写首页 title/cover 运行时缓存，也不选择任何新封面。
+    // v90-A：官方封面来源与静态接口发现。只读取用户正常打开详情时已经收到的 HTML；
+    // 不由首页调用，不追加 HTTP，不抓取外部 script，也不回写首页 title/cover 运行时缓存。
     private fun auditOfficialCoverSourceFromExistingDetailResponse(
         response: Response,
         document: org.jsoup.nodes.Document,
@@ -2050,6 +2056,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .take(COVER_SOURCE_DISCOVERY_STRUCTURED_LIMIT)
         val endpointHints = detailDeclaredCoverEndpointHints(document)
         val batchHints = endpointHints.filter(::isDeclaredCoverBatchHint)
+        val responseRoute = detailResponseRoute(response)
+        val externalScriptSources = detailExternalScriptSources(document)
+        val inlineRequestHints = detailInlineRequestHints(document)
 
         dlog(
             "coverSourceDiscoveryResponse trigger=normal-detail titleNo=${titleNo.orEmpty()} " +
@@ -2065,6 +2074,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "structuredImageBlocks=${structuredImages.size} " +
                 "coverPresent=${detailThumbnail.isNotBlank()} cacheRead=false cacheWrite=false"
         )
+        logDetailResponseRoute(titleNo, responseRoute)
+        logDetailStaticScriptInterfaces(titleNo, document, externalScriptSources, inlineRequestHints)
         structuredImages.forEachIndexed { index, value ->
             dlog(
                 "coverSourceDiscoveryStructured titleNo=${titleNo.orEmpty()} index=$index " +
@@ -2089,6 +2100,146 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "independentEndpoint=${if (endpointHints.isEmpty()) "not-discovered" else "declared-candidate"}"
             )
         }
+    }
+
+    // v90-A：response.request.url 是实际最终响应 URL；priorResponse 反向串起 OkHttp 已走过的重定向链。
+    // 这里只读取已存在 response，不执行 follow-up 或候选接口探测。
+    private fun detailResponseRoute(response: Response): List<Response> {
+        val reverseRoute = mutableListOf<Response>()
+        var current: Response? = response
+        var guard = 0
+        while (current != null && guard < COVER_SOURCE_DISCOVERY_ROUTE_LIMIT) {
+            reverseRoute += current
+            current = current.priorResponse
+            guard += 1
+        }
+        return reverseRoute.asReversed()
+    }
+
+    private fun logDetailResponseRoute(titleNo: String?, route: List<Response>) {
+        val routeUrls = route.map { it.request.url.toString() }
+        val routeStatuses = route.joinToString(">") { it.code.toString() }
+        val requestEndpoint = routeUrls.firstOrNull().orEmpty()
+        val actualResponseEndpoint = routeUrls.lastOrNull().orEmpty()
+        dlog(
+            "coverSourceDiscoveryRoute titleNo=${titleNo.orEmpty()} " +
+                "redirectCount=${(route.size - 1).coerceAtLeast(0)} " +
+                "statusChain=$routeStatuses " +
+                "requestEndpoint=${coverSourceDiscoveryText(requestEndpoint, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "actualResponseEndpoint=${coverSourceDiscoveryText(actualResponseEndpoint, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "route=${coverSourceDiscoveryText(routeUrls.joinToString(" -> "), COVER_SOURCE_DISCOVERY_ROUTE_TEXT_MAX)}"
+        )
+    }
+
+    // 只列 HTML 已声明的外部 script 地址；不请求、不下载、不扫描其内容。
+    private fun detailExternalScriptSources(document: org.jsoup.nodes.Document): List<String> {
+        return document.select("script[src]")
+            .map { script -> script.absUrl("src").ifBlank { script.attr("src") }.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .take(COVER_SOURCE_DISCOVERY_SCRIPT_SOURCE_LIMIT)
+    }
+
+    // 仅从详情 HTML 内联 script 中提取静态 fetch/XHR/axios/jQuery URL 字面量及 endpoint 常量。
+    // 变量拼接、外部 script 内容和真正接口响应均不在 v90-A 范围内。
+    private fun detailInlineRequestHints(document: org.jsoup.nodes.Document): List<CoverSourceDiscoveryInlineRequestHint> {
+        val result = linkedSetOf<CoverSourceDiscoveryInlineRequestHint>()
+
+        fun add(detector: String, rawEndpoint: String) {
+            val endpoint = rawEndpoint.replace('\n', ' ').replace('\r', ' ').trim()
+            if (looksLikeStaticRequestEndpoint(endpoint)) {
+                result += CoverSourceDiscoveryInlineRequestHint(detector = detector, endpoint = endpoint)
+            }
+        }
+
+        document.select("script:not([src])").forEach { script ->
+            val raw = script.data().ifBlank { script.html() }
+            if (raw.isBlank()) return@forEach
+
+            Regex("""(?is)\bfetch\s*\(\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("fetch", it.groupValues[1]) }
+            Regex("""(?is)\bfetch\s*\(\s*`([^`\\]{1,360})`""")
+                .findAll(raw).forEach { add("fetch-template", it.groupValues[1]) }
+            Regex("""(?is)\baxios\.(?:get|post|put|delete|patch)\s*\(\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("axios", it.groupValues[1]) }
+            Regex("""(?is)\baxios(?:\.request)?\s*\(\s*\{.{0,900}?\burl\s*:\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("axios-config", it.groupValues[1]) }
+            Regex("""(?is)\.open\s*\(\s*["'][A-Z]+["']\s*,\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("xhr-open", it.groupValues[1]) }
+            Regex("""(?is)[$][.](?:get|post)\s*\(\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("jquery", it.groupValues[1]) }
+            Regex("""(?is)[$][.]ajax\s*\(\s*\{.{0,900}?\burl\s*:\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("jquery-ajax", it.groupValues[1]) }
+            Regex("""(?is)\b(?:url|endpoint|apiUrl|api_url)\s*:\s*["']([^"'\\]{1,360})["']""")
+                .findAll(raw).forEach { add("endpoint-constant", it.groupValues[1]) }
+        }
+
+        return result.take(COVER_SOURCE_DISCOVERY_INLINE_HINT_LIMIT)
+    }
+
+    private fun looksLikeStaticRequestEndpoint(value: String): Boolean {
+        val normalized = value.trim().lowercase(Locale.ROOT)
+        if (normalized.isBlank()) return false
+        return normalized.startsWith("/") ||
+            normalized.startsWith("http://") ||
+            normalized.startsWith("https://") ||
+            normalized.startsWith("//") ||
+            normalized.contains("/api/") ||
+            normalized.contains("titleno") ||
+            normalized.contains("title_no") ||
+            normalized.contains("titleids") ||
+            normalized.contains("titlelist") ||
+            normalized.contains("thumbnail") ||
+            normalized.contains("cover") ||
+            normalized.contains("poster")
+    }
+
+    private fun logDetailStaticScriptInterfaces(
+        titleNo: String?,
+        document: org.jsoup.nodes.Document,
+        externalScriptSources: List<String>,
+        inlineRequestHints: List<CoverSourceDiscoveryInlineRequestHint>,
+    ) {
+        dlog(
+            "coverSourceDiscoveryScriptSources titleNo=${titleNo.orEmpty()} " +
+                "externalCount=${externalScriptSources.size} " +
+                "inlineScriptCount=${document.select("script:not([src])").size} " +
+                "externalScriptFetched=false"
+        )
+        externalScriptSources.forEachIndexed { index, src ->
+            dlog(
+                "coverSourceDiscoveryScriptSource titleNo=${titleNo.orEmpty()} index=$index " +
+                    "interfaceLike=${looksLikeCoverSourceEndpointHint(src)} " +
+                    "src=${coverSourceDiscoveryText(src, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)}"
+            )
+        }
+
+        inlineRequestHints.forEachIndexed { index, hint ->
+            val endpoint = hint.endpoint
+            dlog(
+                "coverSourceDiscoveryInlineRequestHint titleNo=${titleNo.orEmpty()} index=$index " +
+                    "detector=${hint.detector} " +
+                    "batchHint=${isDeclaredCoverBatchHint(endpoint)} " +
+                    "titleNoHint=${containsTitleNoRequestHint(endpoint)} " +
+                    "coverHint=${containsCoverRequestHint(endpoint)} " +
+                    "hint=${coverSourceDiscoveryText(endpoint, COVER_SOURCE_DISCOVERY_HINT_TEXT_MAX)}"
+            )
+        }
+        dlog(
+            "coverSourceDiscoveryInlineRequestHints titleNo=${titleNo.orEmpty()} count=${inlineRequestHints.size} " +
+                "batchCapability=${if (inlineRequestHints.any { isDeclaredCoverBatchHint(it.endpoint) }) "declared-candidate" else "not-declared-in-inline-html"} " +
+                "probeRequests=0"
+        )
+    }
+
+    private fun containsTitleNoRequestHint(value: String): Boolean {
+        val normalized = value.lowercase(Locale.ROOT)
+        return normalized.contains("titleno") || normalized.contains("title_no") || normalized.contains("titleids")
+    }
+
+    private fun containsCoverRequestHint(value: String): Boolean {
+        val normalized = value.lowercase(Locale.ROOT)
+        return normalized.contains("cover") || normalized.contains("thumbnail") || normalized.contains("poster") || normalized.contains("image")
     }
 
     private fun detailDeclaredCoverEndpointHints(document: org.jsoup.nodes.Document): List<String> {
@@ -2159,7 +2310,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 detailTitle = title,
                 detailThumbnail = detailThumbnail,
             )
-            // v89-A：来源发现阶段不把手动详情获得的封面写入官方元数据或新作封面缓存。
+            // v90-A：发现阶段不把手动详情获得的封面写入官方元数据或新作封面缓存。
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
             val updateTag = extractUpdateTag(html, titleNo)
@@ -4106,6 +4257,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val COVER_SOURCE_DISCOVERY_HINT_TEXT_MAX = 220
         private const val COVER_SOURCE_DISCOVERY_STRUCTURED_LIMIT = 3
         private const val COVER_SOURCE_DISCOVERY_HINT_LIMIT = 8
+        private const val COVER_SOURCE_DISCOVERY_ROUTE_LIMIT = 6
+        private const val COVER_SOURCE_DISCOVERY_ROUTE_TEXT_MAX = 480
+        private const val COVER_SOURCE_DISCOVERY_SCRIPT_SOURCE_LIMIT = 16
+        private const val COVER_SOURCE_DISCOVERY_INLINE_HINT_LIMIT = 20
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
         private const val DEBUG_POPULAR_GENRE_FILTER_LOG = false
