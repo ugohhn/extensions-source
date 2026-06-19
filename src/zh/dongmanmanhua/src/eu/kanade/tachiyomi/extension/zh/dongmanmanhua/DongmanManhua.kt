@@ -773,10 +773,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val afterDocumentAt = System.currentTimeMillis()
         val rawElements = collectPopularMangaElements(document)
         val afterCollectAt = System.currentTimeMillis()
-        // v88-A：只审计同一次 home HTML 内可见的图片字段与同 titleNo 模块候选。
-        // 不改显示封面、不发额外请求、不读取或写入封面缓存。
-        auditNativeHomeCoverEvidence(rawElements)
-        val afterNativeCoverAuditAt = System.currentTimeMillis()
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
         // 这里只整理同一次 home HTML 中普通模块本来就有的资料；
         // “新作登场”不会读取该内存资料，而是直接验证自己的事件字段。
@@ -792,8 +788,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
-                "nativeCoverAudit=${afterNativeCoverAuditAt - afterCollectAt}ms " +
-                "homeMeta=${afterHomeMetaAt - afterNativeCoverAuditAt}ms " +
+                "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
                 "nativeBuild=${afterEntriesAt - afterHomeMetaAt}ms " +
                 "extraRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
@@ -2011,6 +2006,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "mangaDetailsRequest title=${manga.title} manga.url=${manga.url} " +
                 "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
         )
+        // v89-A：仅标记用户正常打开详情时已经存在的请求；不由首页触发，也不产生探测请求。
+        dlog(
+            "coverSourceDiscoveryRequest trigger=normal-detail method=GET " +
+                "titleNo=${titleNoFromUrl(finalUrl).orEmpty()} endpoint=${coverSourceDiscoveryText(finalUrl, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "homeTriggered=false"
+        )
         return GET(finalUrl, reqHeaders)
     }
 
@@ -2019,6 +2020,121 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return detailDiv?.selectFirst("p.subj")?.text()
             ?: document.selectFirst("h1.subj, h3.subj")?.text()
             ?: document.title().substringBefore("_")
+    }
+
+    // v89-A：官方封面来源发现。只读取用户正常打开详情时已经收到的 HTML；
+    // 不由首页调用，不追加 HTTP，不回写首页 title/cover 运行时缓存，也不选择任何新封面。
+    private fun auditOfficialCoverSourceFromExistingDetailResponse(
+        response: Response,
+        document: org.jsoup.nodes.Document,
+        titleNo: String?,
+        detailTitle: String,
+        detailThumbnail: String,
+    ) {
+        val requestUrl = response.request.url.toString()
+        val contentType = response.header("Content-Type").orEmpty()
+        val contentLength = response.header("Content-Length").orEmpty()
+        val canonicalPath = response.request.url.encodedPath
+        val ogImage = document.selectFirst("meta[property=og:image]")?.attr("content").orEmpty()
+        val twitterImage = document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty()
+        val structuredImages = document.select("script[type=application/ld+json]")
+            .mapNotNull { script ->
+                val raw = script.data().ifBlank { script.html() }.trim()
+                if (raw.contains("\"image\"") || raw.contains("\"thumbnail\"") || raw.contains("\"cover\"")) {
+                    coverSourceDiscoveryText(raw, COVER_SOURCE_DISCOVERY_STRUCTURED_TEXT_MAX)
+                } else {
+                    null
+                }
+            }
+            .distinct()
+            .take(COVER_SOURCE_DISCOVERY_STRUCTURED_LIMIT)
+        val endpointHints = detailDeclaredCoverEndpointHints(document)
+        val batchHints = endpointHints.filter(::isDeclaredCoverBatchHint)
+
+        dlog(
+            "coverSourceDiscoveryResponse trigger=normal-detail titleNo=${titleNo.orEmpty()} " +
+                "method=${response.request.method} endpoint=${coverSourceDiscoveryText(requestUrl, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "path=$canonicalPath code=${response.code} contentType=${coverSourceDiscoveryText(contentType, 80)} " +
+                "contentLength=${contentLength.ifBlank { "unknown" }}"
+        )
+        dlog(
+            "coverSourceDiscoveryFields titleNo=${titleNo.orEmpty()} title=${coverSourceDiscoveryText(detailTitle)} " +
+                "ogImage=${coverSourceDiscoveryText(ogImage, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "twitterImage=${coverSourceDiscoveryText(twitterImage, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "detailHtmlCover=${coverSourceDiscoveryText(detailThumbnail, COVER_SOURCE_DISCOVERY_URL_TEXT_MAX)} " +
+                "structuredImageBlocks=${structuredImages.size} " +
+                "coverPresent=${detailThumbnail.isNotBlank()} cacheRead=false cacheWrite=false"
+        )
+        structuredImages.forEachIndexed { index, value ->
+            dlog(
+                "coverSourceDiscoveryStructured titleNo=${titleNo.orEmpty()} index=$index " +
+                    "value=${coverSourceDiscoveryText(value, COVER_SOURCE_DISCOVERY_STRUCTURED_TEXT_MAX)}"
+            )
+        }
+        if (endpointHints.isEmpty()) {
+            dlog(
+                "coverSourceDiscoveryEndpointHints titleNo=${titleNo.orEmpty()} count=0 " +
+                    "batchCapability=not-declared-in-current-html independentEndpoint=not-discovered"
+            )
+        } else {
+            endpointHints.forEachIndexed { index, hint ->
+                dlog(
+                    "coverSourceDiscoveryEndpointHint titleNo=${titleNo.orEmpty()} index=$index " +
+                        "batchHint=${isDeclaredCoverBatchHint(hint)} hint=${coverSourceDiscoveryText(hint, COVER_SOURCE_DISCOVERY_HINT_TEXT_MAX)}"
+                )
+            }
+            dlog(
+                "coverSourceDiscoveryEndpointHints titleNo=${titleNo.orEmpty()} count=${endpointHints.size} " +
+                    "batchCapability=${if (batchHints.isEmpty()) "not-declared-in-current-html" else "declared-candidate"} " +
+                    "independentEndpoint=${if (endpointHints.isEmpty()) "not-discovered" else "declared-candidate"}"
+            )
+        }
+    }
+
+    private fun detailDeclaredCoverEndpointHints(document: org.jsoup.nodes.Document): List<String> {
+        val result = linkedSetOf<String>()
+        document.select("script[src], link[href]").forEach { node ->
+            val value = node.absUrl("src").ifBlank { node.attr("src") }
+                .ifBlank { node.absUrl("href").ifBlank { node.attr("href") } }
+                .trim()
+            if (looksLikeCoverSourceEndpointHint(value)) result += value
+        }
+        document.select("script:not([src])").forEach { script ->
+            val raw = script.data().ifBlank { script.html() }
+            Regex("""[\"'](/[^\"']{1,220})[\"']""")
+                .findAll(raw)
+                .map { it.groupValues[1].trim() }
+                .filter(::looksLikeCoverSourceEndpointHint)
+                .forEach { result += it }
+        }
+        return result.take(COVER_SOURCE_DISCOVERY_HINT_LIMIT)
+    }
+
+    private fun looksLikeCoverSourceEndpointHint(value: String): Boolean {
+        val normalized = value.lowercase(Locale.ROOT)
+        if (normalized.isBlank()) return false
+        return normalized.contains("/api/") ||
+            normalized.contains("cover") ||
+            normalized.contains("thumbnail") ||
+            normalized.contains("poster") ||
+            normalized.contains("titlelist") ||
+            normalized.contains("title_no") ||
+            normalized.contains("titleno")
+    }
+
+    private fun isDeclaredCoverBatchHint(value: String): Boolean {
+        val normalized = value.lowercase(Locale.ROOT)
+        return normalized.contains("titlenos") ||
+            normalized.contains("titlenolist") ||
+            normalized.contains("title_no[]") ||
+            normalized.contains("titleno[]") ||
+            normalized.contains("titleids") ||
+            normalized.contains("ids[]")
+    }
+
+    private fun coverSourceDiscoveryText(value: String, maxLength: Int = COVER_SOURCE_DISCOVERY_TEXT_MAX): String {
+        val normalized = value.replace('\n', ' ').replace('\r', ' ').trim()
+        return if (normalized.length <= maxLength) normalized else normalized.take(maxLength) + "…"
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -2036,10 +2152,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (detailThumbnail.isNotBlank()) {
                 thumbnail_url = detailThumbnail
             }
-            rememberOfficialMangaMeta(titleNo, title, detailThumbnail, "detail")
-            if (!titleNo.isNullOrBlank() && detailThumbnail.isNotBlank()) {
-                rememberNewWorkCoverCache(mapOf(titleNo to detailThumbnail))
-            }
+            auditOfficialCoverSourceFromExistingDetailResponse(
+                response = response,
+                document = document,
+                titleNo = titleNo,
+                detailTitle = title,
+                detailThumbnail = detailThumbnail,
+            )
+            // v89-A：来源发现阶段不把手动详情获得的封面写入官方元数据或新作封面缓存。
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
             val html = document.html()
             val updateTag = extractUpdateTag(html, titleNo)
@@ -2428,197 +2548,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 eventTitleNo == normalizedTitleNo &&
                 it.isNotBlank()
         }.orEmpty()
-    }
-
-    private data class HomeNativeCoverField(
-        val field: String,
-        val rawUrl: String,
-        val normalizedUrl: String,
-        val bannerLike: Boolean,
-    )
-
-    private data class HomeNativeCoverCandidate(
-        val origin: String,
-        val rawIndex: Int,
-        val title: String,
-        val eventTitleMatches: Boolean,
-        val marketingNewWork: Boolean,
-        val href: String,
-        val fields: List<HomeNativeCoverField>,
-    )
-
-    private fun auditNativeHomeCoverEvidence(rawElements: List<Element>) {
-        val targetTitleNos = rawElements.asSequence()
-            .filter { element ->
-                element.attr("data-mihon-origin") == "popular-common-card" &&
-                    isPopularCommonCardNewWork(element)
-            }
-            .mapNotNull(::titleNoFromElementIdentity)
-            .map { value -> value.trim() }
-            .filter { value -> value.isNotBlank() }
-            .distinct()
-            .take(HOME_NATIVE_COVER_AUDIT_TARGET_LIMIT)
-            .toList()
-        if (targetTitleNos.isEmpty()) return
-
-        targetTitleNos.forEach { titleNo ->
-            val targetElement = rawElements.firstOrNull { element ->
-                element.attr("data-mihon-origin") == "popular-common-card" &&
-                    isPopularCommonCardNewWork(element) &&
-                    titleNoFromElementIdentity(element)?.trim() == titleNo
-            } ?: return@forEach
-            val eventTitle = nativeEventTitleForMarketingNewWork(targetElement, titleNo)
-            val candidates = rawElements.asSequence()
-                .filter { element -> titleNoFromElementIdentity(element)?.trim() == titleNo }
-                .map(::homeNativeCoverCandidate)
-                .toList()
-            val sameResponseOrigins = candidates.map(HomeNativeCoverCandidate::origin)
-                .distinct()
-                .joinToString(",")
-            val matchingNativeCandidate = candidates.firstOrNull { candidate ->
-                isNativeHomeCoverModule(candidate) &&
-                    candidate.eventTitleMatches &&
-                    candidate.fields.any { field -> !field.bannerLike }
-            }
-            val nonMarketingCandidate = candidates.firstOrNull { candidate ->
-                isNativeHomeCoverModule(candidate) &&
-                    candidate.fields.any { field -> !field.bannerLike }
-            }
-            val marketingCandidate = candidates.firstOrNull { candidate -> candidate.marketingNewWork }
-            val decision = when {
-                matchingNativeCandidate != null -> "same-home-title-match-candidate"
-                nonMarketingCandidate != null -> "same-home-nonmarketing-candidate"
-                marketingCandidate?.fields?.any { field -> !field.bannerLike } == true -> "marketing-card-only"
-                candidates.any { candidate -> candidate.fields.isNotEmpty() } -> "banner-or-unverified-only"
-                else -> "no-image-field"
-            }
-            dlog(
-                "homeNativeCover titleNo=$titleNo eventTitle=${homeNativeCoverText(eventTitle)} " +
-                    "rawOrigins=$sameResponseOrigins candidateCount=${candidates.size} " +
-                    "marketingFields=${marketingCandidate?.fields?.size ?: 0} " +
-                    "decision=$decision"
-            )
-            candidates.forEachIndexed { index, candidate ->
-                val candidateClass = when {
-                    isNativeHomeCoverModule(candidate) && candidate.eventTitleMatches &&
-                        candidate.fields.any { field -> !field.bannerLike } -> "same-home-title-match-candidate"
-                    isNativeHomeCoverModule(candidate) && candidate.fields.any { field -> !field.bannerLike } ->
-                        "same-home-nonmarketing-candidate"
-                    candidate.marketingNewWork && candidate.fields.any { field -> !field.bannerLike } -> "marketing-card"
-                    candidate.origin == "popular-banner" -> "banner"
-                    candidate.fields.isNotEmpty() -> "unverified-card"
-                    else -> "no-image-field"
-                }
-                dlog(
-                    "homeNativeCoverCandidate titleNo=$titleNo index=$index origin=${candidate.origin} " +
-                        "rawIndex=${candidate.rawIndex} title=${homeNativeCoverText(candidate.title)} " +
-                        "eventTitleMatch=${candidate.eventTitleMatches} marketingNewWork=${candidate.marketingNewWork} " +
-                        "href=${homeNativeCoverText(candidate.href)} candidateClass=$candidateClass " +
-                        "coverFields=${homeNativeCoverFieldsText(candidate.fields)}"
-                )
-            }
-        }
-    }
-
-    private fun homeNativeCoverCandidate(element: Element): HomeNativeCoverCandidate {
-        val origin = element.attr("data-mihon-origin").ifBlank { "unknown" }
-        val titleNo = titleNoFromElementIdentity(element)
-        val title = mangaTitleFromElement(element)
-        val eventTitle = nativeEventTitleForMarketingNewWork(element, titleNo)
-        val rawHref = element.attr("href")
-        val href = element.absUrl("href").ifEmpty { rawHref }
-        return HomeNativeCoverCandidate(
-            origin = origin,
-            rawIndex = element.attr("data-mihon-raw-index").toIntOrNull() ?: -1,
-            title = title,
-            eventTitleMatches = eventTitle.isNotBlank() && title == eventTitle,
-            marketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element),
-            href = href,
-            fields = homeNativeCoverFields(element),
-        )
-    }
-
-    private fun isNativeHomeCoverModule(candidate: HomeNativeCoverCandidate): Boolean {
-        return candidate.origin == "popular-ranking" ||
-            candidate.origin == "popular-genre-category" ||
-            (candidate.origin == "popular-common-card" && !candidate.marketingNewWork)
-    }
-
-    private fun homeNativeCoverFields(element: Element): List<HomeNativeCoverField> {
-        val result = linkedMapOf<String, HomeNativeCoverField>()
-        val nodes = mutableListOf(element)
-        element.select("img, source, [style*=background]").forEach { node ->
-            if (node !== element) nodes.add(node)
-        }
-        nodes.forEach { node ->
-            node.attributes().forEach { attribute ->
-                val attributeName = attribute.key.lowercase(Locale.ROOT)
-                if (!isHomeNativeCoverUrlAttribute(attributeName)) return@forEach
-                val rawValue = homeNativeCoverRawUrl(attributeName, attribute.value)
-                addHomeNativeCoverField(
-                    result = result,
-                    field = "${node.tagName()}:$attributeName",
-                    rawUrl = rawValue,
-                )
-            }
-            Regex("""url\(['\"]?([^)'\"]+)['\"]?\)""")
-                .findAll(node.attr("style"))
-                .forEachIndexed { index, match ->
-                    addHomeNativeCoverField(
-                        result = result,
-                        field = "${node.tagName()}:style-background-$index",
-                        rawUrl = match.groupValues.getOrNull(1).orEmpty(),
-                    )
-                }
-        }
-        return result.values.toList()
-    }
-
-    private fun isHomeNativeCoverUrlAttribute(attributeName: String): Boolean {
-        if (attributeName in HOME_NATIVE_COVER_URL_ATTRIBUTES) return true
-        if (!attributeName.startsWith("data-")) return false
-        return attributeName.contains("image") ||
-            attributeName.contains("img") ||
-            attributeName.contains("cover") ||
-            attributeName.contains("thumb") ||
-            attributeName.contains("poster")
-    }
-
-    private fun homeNativeCoverRawUrl(attributeName: String, rawValue: String): String {
-        val value = rawValue.trim()
-        if (attributeName != "srcset" && attributeName != "data-srcset") return value
-        return value.substringBefore(',').trim().substringBefore(' ').trim()
-    }
-
-    private fun addHomeNativeCoverField(
-        result: MutableMap<String, HomeNativeCoverField>,
-        field: String,
-        rawUrl: String,
-    ) {
-        val normalizedRawUrl = rawUrl.trim()
-        if (normalizedRawUrl.isBlank()) return
-        val normalizedUrl = buildThumbnailUrl(normalizedRawUrl, cdnBase)
-        val candidate = HomeNativeCoverField(
-            field = field,
-            rawUrl = normalizedRawUrl,
-            normalizedUrl = normalizedUrl,
-            bannerLike = normalizedRawUrl.contains("/banner/", ignoreCase = true),
-        )
-        result.putIfAbsent("$field|${candidate.rawUrl}", candidate)
-    }
-
-    private fun homeNativeCoverFieldsText(fields: List<HomeNativeCoverField>): String {
-        if (fields.isEmpty()) return "none"
-        return fields.joinToString("|") { field ->
-            "${field.field}=${homeNativeCoverText(field.rawUrl, HOME_NATIVE_COVER_URL_TEXT_MAX)}" +
-                "->${homeNativeCoverText(field.normalizedUrl, HOME_NATIVE_COVER_URL_TEXT_MAX)}" +
-                ";bannerLike=${field.bannerLike}"
-        }
-    }
-
-    private fun homeNativeCoverText(value: String, maxLength: Int = HOME_NATIVE_COVER_TEXT_MAX): String {
-        val normalized = value.replace('\n', ' ').replace('\r', ' ').trim()
-        return if (normalized.length <= maxLength) normalized else normalized.take(maxLength) + "…"
     }
 
     private fun mangaFromElement(element: Element, origin: String = "manga-element"): SManga = SManga.create().apply {
@@ -4171,23 +4100,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val NEW_PROBE_LOG_LIMIT = 5
-        private const val HOME_NATIVE_COVER_AUDIT_TARGET_LIMIT = 5
-        private const val HOME_NATIVE_COVER_TEXT_MAX = 120
-        private const val HOME_NATIVE_COVER_URL_TEXT_MAX = 180
-        private val HOME_NATIVE_COVER_URL_ATTRIBUTES = setOf(
-            "src",
-            "data-src",
-            "data-original",
-            "data-lazy-src",
-            "data-url",
-            "data-image",
-            "data-img",
-            "data-thumb",
-            "data-thumbnail",
-            "data-cover",
-            "srcset",
-            "data-srcset",
-        )
+        private const val COVER_SOURCE_DISCOVERY_TEXT_MAX = 120
+        private const val COVER_SOURCE_DISCOVERY_URL_TEXT_MAX = 180
+        private const val COVER_SOURCE_DISCOVERY_STRUCTURED_TEXT_MAX = 260
+        private const val COVER_SOURCE_DISCOVERY_HINT_TEXT_MAX = 220
+        private const val COVER_SOURCE_DISCOVERY_STRUCTURED_LIMIT = 3
+        private const val COVER_SOURCE_DISCOVERY_HINT_LIMIT = 8
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
         private const val DEBUG_POPULAR_GENRE_FILTER_LOG = false
