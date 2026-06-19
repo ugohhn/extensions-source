@@ -763,9 +763,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
+            val stabilitySession = nextPopularStabilityProbeSession()
+            dlog(
+                "popularStabilityProbe session=$stabilitySession phase=request " +
+                    "page=$page ${officialCoverRuntimeProbeStats()} " +
+                    "mode=v97-runtime-url-direct"
+            )
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v96：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // v97：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
             // 新作封面不在 popularMangaParse 阶段等待；列表返回后立即后台预解析首屏官方封面，图片加载器复用同一个 in-flight 结果。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
@@ -806,6 +812,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "coverMode=virtual-official-loader-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
+        )
+        dlog(
+            "popularStabilityProbe session=$popularStabilityProbeSession phase=parse " +
+                "raw=${rawElements.size} selected=${elements.size} entries=${entries.size} " +
+                "warmupTargets=${warmupStats.titleNos} warmupAlreadyReady=${warmupStats.alreadyReady} " +
+                "warmupScheduled=${warmupStats.scheduled} officialCoverWait=0ms " +
+                "mainpathOfficialDetailRequests=0 marketingRequests=0 " +
+                "${officialCoverRuntimeProbeStats()} total=${afterEntriesAt - parseStartedAt}ms"
         )
         return MangasPage(entries, false)
     }
@@ -1316,6 +1330,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     @Volatile
     private var legacyNewWorkPersistentCacheCleared = false
 
+    @Volatile
+    private var popularStabilityProbeSession = 0
+
+    private fun nextPopularStabilityProbeSession(): Int = synchronized(this) {
+        popularStabilityProbeSession += 1
+        popularStabilityProbeSession
+    }
+
     private data class GenrePageCache(
         val genre: String,
         val createdAt: Long,
@@ -1388,6 +1410,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
+
+    private fun officialCoverRuntimeProbeStats(): String {
+        val verifiedCount = synchronized(verifiedDetailOfficialCoverByTitleNo) {
+            verifiedDetailOfficialCoverByTitleNo.size
+        }
+        val detailUrlCount = synchronized(officialCoverDetailUrlByTitleNo) {
+            officialCoverDetailUrlByTitleNo.size
+        }
+        val fetchStats = synchronized(officialNewWorkCoverFetchStates) {
+            val total = officialNewWorkCoverFetchStates.size
+            val running = officialNewWorkCoverFetchStates.values.count { !it.completed }
+            val completed = officialNewWorkCoverFetchStates.values.count { it.completed }
+            val failed = officialNewWorkCoverFetchStates.values.count { it.failed }
+            "fetchStates=$total fetchRunning=$running fetchCompleted=$completed fetchFailed=$failed"
+        }
+        return "verifiedCovers=$verifiedCount detailUrls=$detailUrlCount $fetchStats"
+    }
 
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
