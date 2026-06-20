@@ -2643,12 +2643,40 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .orEmpty()
             .ifBlank { officialCoverDetailUrlForTitleNo(titleNo) }
             .ifBlank { titleNo.takeIf { it.isNotBlank() }?.let { "$baseUrl/episodeList?titleNo=$it" }.orEmpty() }
+        dlog(
+            "officialCoverVirtualRequestStart titleNo=$titleNo virtualUrl=${request.url} " +
+                "detailUrl=$detailUrl thread=${Thread.currentThread().name} marketingRequests=0"
+        )
         val cachedDetailCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
         val trustedRuntimeCover = if (cachedDetailCover.isBlank()) trustedRuntimeOfficialCoverForTitleNo(titleNo) else ""
         val resolved = when {
-            cachedDetailCover.isNotBlank() -> OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
-            trustedRuntimeCover.isNotBlank() -> OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
-            else -> resolveOfficialCoverForVirtualRequestDirectDemand(titleNo, detailUrl, chain, startedAt)
+            cachedDetailCover.isNotBlank() -> {
+                dlog(
+                    "officialCoverRuntimeHit titleNo=$titleNo hit=verified-runtime source=detail-official-runtime-cache " +
+                        "elapsed=${System.currentTimeMillis() - startedAt}ms coverUrl=$cachedDetailCover marketingRequests=0"
+                )
+                OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
+            }
+            trustedRuntimeCover.isNotBlank() -> {
+                dlog(
+                    "officialCoverRuntimeHit titleNo=$titleNo hit=trusted-runtime source=trusted-runtime-official-meta " +
+                        "elapsed=${System.currentTimeMillis() - startedAt}ms coverUrl=$trustedRuntimeCover marketingRequests=0"
+                )
+                OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
+            }
+            else -> {
+                dlog(
+                    "officialCoverDirectDemandResolveStart titleNo=$titleNo detailUrl=$detailUrl " +
+                        "elapsed=${System.currentTimeMillis() - startedAt}ms marketingRequests=0"
+                )
+                val directResolved = resolveOfficialCoverForVirtualRequestDirectDemand(titleNo, detailUrl, chain, startedAt)
+                dlog(
+                    "officialCoverDirectDemandResolveDone titleNo=$titleNo coverPresent=${directResolved.coverUrl.isNotBlank()} " +
+                        "source=${directResolved.source} elapsed=${System.currentTimeMillis() - startedAt}ms " +
+                        "coverUrl=${directResolved.coverUrl} marketingRequests=0"
+                )
+                directResolved
+            }
         }
         if (resolved.coverUrl.isBlank()) {
             dlog(
@@ -2671,14 +2699,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
             .build()
         val imageRequest = GET(resolved.coverUrl, imageHeaders)
-        val imageResponse = chain.proceed(imageRequest)
         dlog(
-            "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
-                "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
-                "imageElapsed=${System.currentTimeMillis() - imageStartedAt}ms " +
-                "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
+            "officialCoverImageFetchStart titleNo=$titleNo source=${resolved.source} " +
+                "resolveMs=${imageStartedAt - startedAt}ms imageUrl=${resolved.coverUrl} " +
+                "referer=${detailUrl.ifBlank { "$baseUrl/" }} marketingRequests=0"
         )
-        return imageResponse
+        return try {
+            val imageResponse = chain.proceed(imageRequest)
+            val imageElapsed = System.currentTimeMillis() - imageStartedAt
+            dlog(
+                "officialCoverImageFetchDone titleNo=$titleNo imageCode=${imageResponse.code} " +
+                    "imageElapsed=${imageElapsed}ms totalElapsed=${System.currentTimeMillis() - startedAt}ms " +
+                    "imageUrl=${resolved.coverUrl} marketingRequests=0"
+            )
+            dlog(
+                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
+                    "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
+                    "imageElapsed=${imageElapsed}ms " +
+                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
+            )
+            imageResponse
+        } catch (e: Exception) {
+            wlog(
+                "officialCoverImageFetchFailed titleNo=$titleNo source=${resolved.source} " +
+                    "imageElapsed=${System.currentTimeMillis() - imageStartedAt}ms totalElapsed=${System.currentTimeMillis() - startedAt}ms " +
+                    "imageUrl=${resolved.coverUrl} error=${e.javaClass.simpleName}",
+                e,
+            )
+            throw e
+        }
     }
 
     private fun resolveOfficialCoverForVirtualRequestDirectDemand(
