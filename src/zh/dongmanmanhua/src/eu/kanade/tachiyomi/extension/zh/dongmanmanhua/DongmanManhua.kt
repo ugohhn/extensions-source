@@ -802,7 +802,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "coverPlanAlreadyReady=${coverStats.alreadyReady} " +
                 "coverPlanTrusted=${coverStats.trustedReady} " +
                 "coverPlanScheduled=${coverStats.scheduled} " +
-                "coverMode=virtual-official-loader-hybrid-visible4-bytes-prefetch " +
+                "coverMode=virtual-official-loader-hybrid-visible4-bytes-prefetch-overall " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1262,8 +1262,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
-    // v99.1：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
+    // v99.2：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
     // 进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘；取消/Socket closed 不写失败态。
+    // 只对当前 visible4 做短暂 bytes-state grace，避免刚启动预取时虚拟请求立刻重复下载图片。
     private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
@@ -1340,6 +1341,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
     private val officialCoverImageBytesCache = linkedMapOf<String, OfficialCoverImageBytesCacheEntry>()
     private val officialCoverImageBytesFetchStates = mutableMapOf<String, OfficialCoverImageBytesFetchState>()
+    private val officialCoverVisible4TitleNos = linkedSetOf<String>()
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -2748,7 +2750,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return bytesCacheResponse(request, cachedBytes)
         }
 
-        awaitOfficialCoverImageBytesIfInflight(titleNo, resolved.coverUrl, startedAt)?.let { prefetchedBytes ->
+        val bytesStateGraceMs = if (isCurrentVisible4OfficialCoverTarget(titleNo)) {
+            OFFICIAL_COVER_BYTES_PREFETCH_STATE_GRACE_MS
+        } else {
+            0L
+        }
+        awaitOfficialCoverImageBytesIfInflight(titleNo, resolved.coverUrl, startedAt, bytesStateGraceMs)?.let { prefetchedBytes ->
             dlog(
                 "officialCoverBytesPrefetchJoinHit titleNo=$titleNo source=${resolved.source} " +
                     "cacheSource=${prefetchedBytes.source} resolveMs=${System.currentTimeMillis() - startedAt}ms " +
@@ -2977,6 +2984,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun hybridVisible4OfficialCoverStatsForPopular(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT)
+        synchronized(officialCoverVisible4TitleNos) {
+            officialCoverVisible4TitleNos.clear()
+            officialCoverVisible4TitleNos.addAll(targets.map { it.titleNo.trim() }.filter { it.isNotBlank() })
+        }
         if (targets.isEmpty()) return OfficialCoverWaitStats()
 
         var alreadyReady = 0
@@ -3023,7 +3034,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "virtualTargets=${virtualTitleNos.size} virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
                 "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
                 "alreadyInflight=$alreadyInflight visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch-stability " +
+                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch-overall " +
                 "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
         )
         return OfficialCoverWaitStats(
@@ -3211,27 +3222,57 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .build()
     }
 
+    private fun isCurrentVisible4OfficialCoverTarget(titleNo: String): Boolean {
+        val key = titleNo.trim()
+        if (key.isBlank()) return false
+        return synchronized(officialCoverVisible4TitleNos) { key in officialCoverVisible4TitleNos }
+    }
+
     private fun awaitOfficialCoverImageBytesIfInflight(
         titleNo: String,
         coverUrl: String,
         overallStartedAt: Long,
+        stateGraceMs: Long = 0L,
     ): OfficialCoverImageBytesCacheEntry? {
         val key = titleNo.trim()
         val normalizedCoverUrl = coverUrl.trim()
         if (key.isBlank() || normalizedCoverUrl.isBlank()) return null
         val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
-        val state = synchronized(officialCoverImageBytesFetchStates) {
+        var state = synchronized(officialCoverImageBytesFetchStates) {
             officialCoverImageBytesFetchStates[cacheKey]
-        } ?: return null
+        }
+        if (state == null && stateGraceMs > 0L) {
+            val graceStartedAt = System.currentTimeMillis()
+            val deadline = graceStartedAt + stateGraceMs
+            while (state == null && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(10L)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+                state = synchronized(officialCoverImageBytesFetchStates) {
+                    officialCoverImageBytesFetchStates[cacheKey]
+                }
+            }
+            if (state != null) {
+                dlog(
+                    "officialCoverBytesPrefetchStateGraceHit titleNo=$key " +
+                        "waited=${System.currentTimeMillis() - graceStartedAt}ms graceLimit=${stateGraceMs}ms " +
+                        "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
+                )
+            }
+        }
+        val stateSnapshot = state ?: return null
         val waitStartedAt = System.currentTimeMillis()
-        if (!state.completed) {
-            runCatching { state.latch.await(OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS, TimeUnit.MILLISECONDS) }
+        if (!stateSnapshot.completed) {
+            runCatching { stateSnapshot.latch.await(OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS, TimeUnit.MILLISECONDS) }
         }
         val waitedMs = System.currentTimeMillis() - waitStartedAt
         val cached = officialCoverImageBytesForTitleNo(key, normalizedCoverUrl)
         dlog(
             "officialCoverBytesPrefetchJoin titleNo=$key hit=${cached != null} " +
-                "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
+                "completed=${stateSnapshot.completed} failed=${stateSnapshot.failed} waited=${waitedMs}ms " +
                 "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
         )
         return cached
@@ -4433,12 +4474,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
-        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_1_bytes"
+        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_2_bytes"
         private const val OFFICIAL_COVER_BYTES_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES = 16
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES = 1024 * 1024
         private const val OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS = 900L
+        private const val OFFICIAL_COVER_BYTES_PREFETCH_STATE_GRACE_MS = 80L
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
