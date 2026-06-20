@@ -1156,8 +1156,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                                 "class=${item.className()} href=$href cleanPath=${cached.url}"
                         )
                     }
-                    // /new 的真实响应本身就是当前新作集合；列表展示仍保持 hasNew=true。
-                    cached.copy(hasNew = true)
+                    // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
+                    // 但 .new_works_items 的 thumbnail 是营销封面：这里不写入 cache，也不交给 UI。
+                    // 不做同步详情请求，只生成虚拟官方封面 URL；图片加载阶段再按现有 in-flight 逻辑解析官方封面。
+                    val titleNo = cached.titleNo?.trim().orEmpty()
+                    val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
+                    val trustedRuntimeOfficialCover = if (verifiedOfficialCover.isBlank()) {
+                        trustedRuntimeOfficialCoverForTitleNo(titleNo)
+                    } else {
+                        ""
+                    }
+                    val virtualOfficialCover = if (
+                        titleNo.isNotBlank() &&
+                        verifiedOfficialCover.isBlank() &&
+                        trustedRuntimeOfficialCover.isBlank()
+                    ) {
+                        val detailUrl = officialNewWorkDetailUrlForElement(item, titleNo)
+                        buildOfficialCoverVirtualUrl(titleNo, detailUrl)
+                    } else {
+                        ""
+                    }
+                    val officialThumbnail = verifiedOfficialCover.ifBlank {
+                        trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover }
+                    }
+                    dlog(
+                        "latestUpdatesParse NEW officialCover titleNo=$titleNo " +
+                            "marketingThumbnailSuppressed=${cached.thumbnailUrl.isNotBlank()} " +
+                            "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
+                            "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
+                            "officialThumbnailPresent=${officialThumbnail.isNotBlank()} " +
+                            "mainpathOfficialDetailRequests=0 marketingRequests=0"
+                    )
+                    cached.copy(thumbnailUrl = officialThumbnail, hasNew = true)
                 }
                 .distinctBy { mangaIdentityDedupKey(it.titleNo, it.url) }
             putUpdatePageCache(updateCacheKey("NEW", ""), cachedItems)
@@ -1165,7 +1195,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val newCount = cachedItems.count { it.hasNew }
             dlog(
                 "latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount " +
-                    "cacheWrite=true detailSnapshot=true source=new-page"
+                    "cacheWrite=true detailSnapshot=true source=new-page-official-cover " +
+                    "mainpathOfficialDetailRequests=0 marketingRequests=0"
             )
             return MangasPage(entries, false)
         }
