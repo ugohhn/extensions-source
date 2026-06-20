@@ -763,15 +763,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         probeIsLoginValid()
         if (page == 1) {
             resetFilterSessionState("popular-page1")
-            val stabilitySession = nextPopularStabilityProbeSession()
-            dlog(
-                "popularStabilityProbe session=$stabilitySession phase=request " +
-                    "page=$page ${officialCoverRuntimeProbeStats()} " +
-                    "mode=v97-runtime-url-direct"
-            )
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v97：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // v96：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
             // 新作封面不在 popularMangaParse 阶段等待；列表返回后立即后台预解析首屏官方封面，图片加载器复用同一个 in-flight 结果。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
@@ -812,14 +806,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "coverMode=virtual-official-loader-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
-        )
-        dlog(
-            "popularStabilityProbe session=$popularStabilityProbeSession phase=parse " +
-                "raw=${rawElements.size} selected=${elements.size} entries=${entries.size} " +
-                "warmupTargets=${warmupStats.titleNos} warmupAlreadyReady=${warmupStats.alreadyReady} " +
-                "warmupScheduled=${warmupStats.scheduled} officialCoverWait=0ms " +
-                "mainpathOfficialDetailRequests=0 marketingRequests=0 " +
-                "${officialCoverRuntimeProbeStats()} total=${afterEntriesAt - parseStartedAt}ms"
         )
         return MangasPage(entries, false)
     }
@@ -1330,14 +1316,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     @Volatile
     private var legacyNewWorkPersistentCacheCleared = false
 
-    @Volatile
-    private var popularStabilityProbeSession = 0
-
-    private fun nextPopularStabilityProbeSession(): Int = synchronized(this) {
-        popularStabilityProbeSession += 1
-        popularStabilityProbeSession
-    }
-
     private data class GenrePageCache(
         val genre: String,
         val createdAt: Long,
@@ -1410,23 +1388,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
-
-    private fun officialCoverRuntimeProbeStats(): String {
-        val verifiedCount = synchronized(verifiedDetailOfficialCoverByTitleNo) {
-            verifiedDetailOfficialCoverByTitleNo.size
-        }
-        val detailUrlCount = synchronized(officialCoverDetailUrlByTitleNo) {
-            officialCoverDetailUrlByTitleNo.size
-        }
-        val fetchStats = synchronized(officialNewWorkCoverFetchStates) {
-            val total = officialNewWorkCoverFetchStates.size
-            val running = officialNewWorkCoverFetchStates.values.count { !it.completed }
-            val completed = officialNewWorkCoverFetchStates.values.count { it.completed }
-            val failed = officialNewWorkCoverFetchStates.values.count { it.failed }
-            "fetchStates=$total fetchRunning=$running fetchCompleted=$completed fetchFailed=$failed"
-        }
-        return "verifiedCovers=$verifiedCount detailUrls=$detailUrlCount $fetchStats"
-    }
 
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
@@ -2491,6 +2452,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return true
     }
 
+    private fun needsPopularOfficialCoverFallback(
+        origin: String,
+        titleNo: String?,
+        parsedThumbnail: String,
+        isMarketingNewWork: Boolean,
+    ): Boolean {
+        if (titleNo.isNullOrBlank()) return false
+        if (isMarketingNewWork) return true
+        // 轮播图本身是横幅，不能当竖版封面；轮播独占条目也不能把 thumbnail_url 留空。
+        return origin == "popular-banner" && parsedThumbnail.isBlank()
+    }
+
     private fun nativeEventTitleForMarketingNewWork(element: Element, titleNo: String?): String {
         val normalizedTitleNo = titleNo?.trim().orEmpty()
         val eventTitleNo = scEventParameterValue(element, "recommended_titleNo")?.trim().orEmpty()
@@ -2517,38 +2490,39 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
         // 新作卡的 style-background 是营销图：严格模式下不读取、不赋值、更不会交给图片加载器。
         val parsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
+        val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, parsedThumbnail, isMarketingNewWork)
         val nativeEventTitle = if (isMarketingNewWork) {
             nativeEventTitleForMarketingNewWork(element, titleNo)
         } else {
             ""
         }
-        val verifiedOfficialCover = if (isMarketingNewWork) {
+        val verifiedOfficialCover = if (needsOfficialCoverFallback) {
             verifiedDetailOfficialCoverForTitleNo(titleNo)
         } else {
             ""
         }
-        val trustedRuntimeOfficialCover = if (isMarketingNewWork && verifiedOfficialCover.isBlank()) {
+        val trustedRuntimeOfficialCover = if (needsOfficialCoverFallback && verifiedOfficialCover.isBlank()) {
             trustedRuntimeOfficialCoverForTitleNo(titleNo)
         } else {
             ""
         }
-        val virtualOfficialCover = if (isMarketingNewWork && verifiedOfficialCover.isBlank() && trustedRuntimeOfficialCover.isBlank()) {
+        val virtualOfficialCover = if (needsOfficialCoverFallback && verifiedOfficialCover.isBlank() && trustedRuntimeOfficialCover.isBlank()) {
             val detailUrl = titleNo?.let { officialNewWorkDetailUrlForElement(element, it) }.orEmpty()
             buildOfficialCoverVirtualUrl(titleNo, detailUrl)
         } else {
             ""
         }
         val selectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
-        val officialCoverMissing = isMarketingNewWork && selectedOfficialCover.isBlank()
+        val officialCoverMissing = needsOfficialCoverFallback && selectedOfficialCover.isBlank()
 
-        if (!isMarketingNewWork) {
+        if (!needsOfficialCoverFallback) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v95：新作卡不等待详情页封面。thumbnail_url 塞内部虚拟官方封面 URL，
-        // 图片加载阶段再解析详情页 meta 并返回真实 cdn-sns 图片；不使用营销图、不使用空白图。
-        thumbnail_url = if (isMarketingNewWork) {
+        // v97.2：首页里只要当前图片不能作为可信竖封面，但有 titleNo，就给虚拟官方封面 URL。
+        // 这覆盖新作营销卡和轮播独占条目，避免 thumbnail_url 为空导致 Mihon Invalid image。
+        thumbnail_url = if (needsOfficialCoverFallback) {
             selectedOfficialCover
         } else {
             parsedThumbnail
@@ -2567,6 +2541,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "marketingThumbnailSuppressed=true " +
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
+                    "officialCoverMissing=$officialCoverMissing " +
+                    "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
+                    "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
+            )
+        } else if (needsOfficialCoverFallback) {
+            dlog(
+                "popularBannerOnlyOfficialCover titleNo=${titleNo.orEmpty()} origin=$origin title=$title " +
+                    "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
+                    "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
+                    "bannerThumbnailSuppressed=true blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
@@ -2783,7 +2767,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         elements
             .asSequence()
             .filter { element ->
-                element.attr("data-mihon-origin") == "popular-common-card" && isPopularCommonCardNewWork(element)
+                val origin = element.attr("data-mihon-origin")
+                (origin == "popular-common-card" && isPopularCommonCardNewWork(element)) || origin == "popular-banner"
             }
             .forEach { element ->
                 val titleNo = titleNoFromElementIdentity(element)?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
