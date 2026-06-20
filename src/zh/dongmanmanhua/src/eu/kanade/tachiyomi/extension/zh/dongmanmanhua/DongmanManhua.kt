@@ -1300,6 +1300,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private data class OfficialNewWorkCoverTarget(
         val titleNo: String,
         val detailUrl: String,
+        val origin: String,
+        val rawIndex: Int,
     )
 
     private data class FastOfficialCoverScanResult(
@@ -2773,7 +2775,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .forEach { element ->
                 val titleNo = titleNoFromElementIdentity(element)?.trim()?.takeIf { it.isNotBlank() } ?: return@forEach
                 val detailUrl = officialNewWorkDetailUrlForElement(element, titleNo)
-                targets.putIfAbsent(titleNo, OfficialNewWorkCoverTarget(titleNo, detailUrl))
+                val origin = element.attr("data-mihon-origin")
+                val rawIndex = element.attr("data-mihon-raw-index").toIntOrNull() ?: Int.MAX_VALUE
+                targets.putIfAbsent(titleNo, OfficialNewWorkCoverTarget(titleNo, detailUrl, origin, rawIndex))
             }
         return targets.values.toList()
     }
@@ -2799,11 +2803,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun prewarmOfficialNewWorkCoversForPopularAsync(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT)
         if (targets.isEmpty()) return OfficialCoverWaitStats()
+        val immediateTargets = visibleFirstOfficialCoverTargets(targets)
+        val immediateTitleNos = immediateTargets.map { it.titleNo }.toSet()
+        val delayedTargets = targets.filter { it.titleNo !in immediateTitleNos }
+
         var alreadyReady = 0
         var trustedReady = 0
         var scheduled = 0
         val scheduledTitleNos = mutableListOf<String>()
-        targets.forEach { target ->
+        immediateTargets.forEach { target ->
             when {
                 verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
                 trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
@@ -2816,12 +2824,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
         }
+
+        if (delayedTargets.isNotEmpty()) {
+            scheduleDelayedOfficialCoverWarmup(delayedTargets)
+        }
+
         dlog(
             "officialCoverWarmupSchedule titleNos=${targets.joinToString("|") { it.titleNo }} " +
+                "immediateTitleNos=${immediateTargets.joinToString("|") { it.titleNo }} " +
+                "delayedTitleNos=${delayedTargets.joinToString("|") { it.titleNo }} " +
                 "alreadyReady=$alreadyReady trustedReady=$trustedReady scheduled=$scheduled " +
                 "scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
-                "limit=$OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
-                "mode=virtual-prefetch-inflight wait=0ms marketingRequests=0"
+                "limit=$OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT " +
+                "visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
+                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
+                "delayMs=$OFFICIAL_NEW_WORK_COVER_DELAYED_PREFETCH_DELAY_MS " +
+                "mode=visible-first-virtual-prefetch wait=0ms marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -2829,6 +2847,52 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             trustedReady = trustedReady,
             scheduled = scheduled,
         )
+    }
+
+    private fun visibleFirstOfficialCoverTargets(targets: List<OfficialNewWorkCoverTarget>): List<OfficialNewWorkCoverTarget> {
+        val result = linkedMapOf<String, OfficialNewWorkCoverTarget>()
+        fun add(target: OfficialNewWorkCoverTarget) {
+            if (result.size < OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT) {
+                result.putIfAbsent(target.titleNo, target)
+            }
+        }
+
+        // 轮播只优先第一张。其他轮播 slide 不是同时可见，不应占满后台队列。
+        targets.filter { it.origin == "popular-banner" }.take(1).forEach(::add)
+        // 新作普通卡片更接近用户连续滚动看到的列表，优先补位。
+        targets.filter { it.origin == "popular-common-card" }.forEach(::add)
+        // 如果首页结构变化导致数量不足，再按原始顺序补满。
+        targets.sortedBy { it.rawIndex }.forEach(::add)
+        return result.values.toList()
+    }
+
+    private fun scheduleDelayedOfficialCoverWarmup(targets: List<OfficialNewWorkCoverTarget>) {
+        Handler(Looper.getMainLooper()).postDelayed({
+            var scheduled = 0
+            val scheduledTitleNos = mutableListOf<String>()
+            var alreadyReady = 0
+            var trustedReady = 0
+            targets.forEach { target ->
+                when {
+                    verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
+                    trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
+                    else -> {
+                        val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl)
+                        if (state != null) {
+                            scheduled += 1
+                            scheduledTitleNos += target.titleNo
+                        }
+                    }
+                }
+            }
+            dlog(
+                "officialCoverWarmupDelayedSchedule titleNos=${targets.joinToString("|") { it.titleNo }} " +
+                    "alreadyReady=$alreadyReady trustedReady=$trustedReady scheduled=$scheduled " +
+                    "scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
+                    "delayMs=$OFFICIAL_NEW_WORK_COVER_DELAYED_PREFETCH_DELAY_MS " +
+                    "mode=visible-first-backfill marketingRequests=0"
+            )
+        }, OFFICIAL_NEW_WORK_COVER_DELAYED_PREFETCH_DELAY_MS)
     }
 
     private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
@@ -4071,6 +4135,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 5
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_NEW_WORK_COVER_DELAYED_PREFETCH_DELAY_MS = 500L
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
