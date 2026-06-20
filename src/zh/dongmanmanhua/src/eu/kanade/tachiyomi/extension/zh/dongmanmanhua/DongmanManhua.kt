@@ -43,7 +43,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Semaphore
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
@@ -765,8 +765,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             resetFilterSessionState("popular-page1")
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
-            // v98.3：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
-            // 新作封面仍不等待；只对前 4 个可见官方封面做轻量预热，避免 v97.5 的后台全量队列。
+            // v96：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
+            // 新作封面不在 popularMangaParse 阶段等待；列表返回后立即后台预解析首屏官方封面，图片加载器复用同一个 in-flight 结果。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -783,7 +783,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
-        val coverStats = hybridVisible8OfficialCoverStatsForPopular(elements)
+        val warmupStats = prewarmOfficialNewWorkCoversForPopularAsync(elements)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -799,11 +799,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
                 "mainpathExtraRequests=0 " +
                 "mainpathOfficialDetailRequests=0 " +
-                "coverPlanTargets=${coverStats.titleNos} " +
-                "coverPlanAlreadyReady=${coverStats.alreadyReady} " +
-                "coverPlanTrusted=${coverStats.trustedReady} " +
-                "coverPlanScheduled=${coverStats.scheduled} " +
-                "coverMode=virtual-official-loader-hybrid-visible8-bytes-prefetch " +
+                "warmupTargets=${warmupStats.titleNos} " +
+                "warmupAlreadyReady=${warmupStats.alreadyReady} " +
+                "warmupTrusted=${warmupStats.trustedReady} " +
+                "warmupScheduled=${warmupStats.scheduled} " +
+                "coverMode=virtual-official-loader-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1263,9 +1263,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
-    // v99.3：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
-    // 进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘；取消/Socket closed 不写失败态。
-    // 只对当前 visible8 做 bytes-state grace；前 4 优先，后 4 轻量尾随，观察整体封面速度。
+    // v97：虚拟封面 URL 对外保持稳定，只带 titleNo。
+    // detailUrl 仅存在进程内，供虚拟加载器解析官方 cdn-sns 封面时使用；不写持久化、不缓存图片 bytes。
     private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
@@ -1283,36 +1282,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var coverUrl: String = ""
 
         @Volatile
-        var failureSource: String = ""
+        var submitted: Boolean = false
+
+        @Volatile
+        var demandSubmitted: Boolean = false
+
+        @Volatile
+        var prefetchSubmitted: Boolean = false
 
         @Volatile
         var running: Boolean = false
 
+        @Volatile
+        var fetchKind: String = "prefetch-inflight"
+
         val latch = CountDownLatch(1)
     }
 
-
-    private data class OfficialCoverImageBytesCacheEntry(
-        val titleNo: String,
-        val coverUrl: String,
-        val bytes: ByteArray,
-        val contentType: String,
-        val createdAt: Long = System.currentTimeMillis(),
-        val source: String,
-    )
-
-    private class OfficialCoverImageBytesFetchState(
-        val titleNo: String,
-        val coverUrl: String,
-        val createdAt: Long = System.currentTimeMillis(),
-    ) {
-        @Volatile
-        var completed: Boolean = false
-
-        @Volatile
-        var failed: Boolean = false
-
-        val latch = CountDownLatch(1)
+    private enum class OfficialCoverFetchPriority {
+        DEMAND,
+        VISIBLE,
+        PREFETCH,
     }
 
     private data class OfficialCoverWaitStats(
@@ -1340,10 +1330,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     )
 
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
-    private val officialCoverImageBytesCache = linkedMapOf<String, OfficialCoverImageBytesCacheEntry>()
-    private val officialCoverImageBytesFetchStates = mutableMapOf<String, OfficialCoverImageBytesFetchState>()
-    private val officialCoverBytesPrefetchSemaphore = Semaphore(OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM, true)
-    private val officialCoverVisible8TitleNos = linkedSetOf<String>()
+    private val officialNewWorkCoverDemandExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM)
+    private val officialNewWorkCoverPrefetchExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM)
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -2625,17 +2613,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val source: String,
     )
 
-    private fun isTransientOfficialCoverException(e: Exception): Boolean {
-        if (e is InterruptedIOException) return true
-        val message = e.message.orEmpty()
-        return message.equals("Canceled", ignoreCase = true) ||
-            message.equals("Socket closed", ignoreCase = true)
-    }
-
-    private fun isTransientOfficialCoverFailureSource(source: String): Boolean {
-        return source == "virtual-detail-meta-canceled" || source == "hybrid-visible8-canceled"
-    }
-
     private fun trustedRuntimeOfficialCoverForTitleNo(titleNo: String?): String {
         val meta = getOfficialMangaMeta(titleNo) ?: return ""
         val cover = stripImageProcessParams(meta.thumbnailUrl)
@@ -2676,7 +2653,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val key = titleNo?.trim().orEmpty()
         val normalizedDetailUrl = rememberOfficialCoverDetailUrl(key, detailUrl)
         if (key.isBlank() || normalizedDetailUrl.isBlank()) return ""
-        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key&coverRev=$OFFICIAL_COVER_VIRTUAL_REV"
+        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key"
     }
 
     private fun executeOfficialCoverVirtualRequest(request: Request, chain: Interceptor.Chain): Response {
@@ -2687,41 +2664,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .orEmpty()
             .ifBlank { officialCoverDetailUrlForTitleNo(titleNo) }
             .ifBlank { titleNo.takeIf { it.isNotBlank() }?.let { "$baseUrl/episodeList?titleNo=$it" }.orEmpty() }
-        dlog(
-            "officialCoverVirtualRequestStart titleNo=$titleNo coverRev=${request.url.queryParameter("coverRev").orEmpty()} " +
-                "virtualUrl=${request.url} detailUrl=$detailUrl " +
-                "thread=${Thread.currentThread().name} marketingRequests=0"
-        )
         val cachedDetailCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
         val trustedRuntimeCover = if (cachedDetailCover.isBlank()) trustedRuntimeOfficialCoverForTitleNo(titleNo) else ""
         val resolved = when {
-            cachedDetailCover.isNotBlank() -> {
-                dlog(
-                    "officialCoverRuntimeHit titleNo=$titleNo hit=verified-runtime source=detail-official-runtime-cache " +
-                        "elapsed=${System.currentTimeMillis() - startedAt}ms coverUrl=$cachedDetailCover marketingRequests=0"
-                )
-                OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
-            }
-            trustedRuntimeCover.isNotBlank() -> {
-                dlog(
-                    "officialCoverRuntimeHit titleNo=$titleNo hit=trusted-runtime source=trusted-runtime-official-meta " +
-                        "elapsed=${System.currentTimeMillis() - startedAt}ms coverUrl=$trustedRuntimeCover marketingRequests=0"
-                )
-                OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
-            }
-            else -> {
-                dlog(
-                    "officialCoverDirectDemandResolveStart titleNo=$titleNo detailUrl=$detailUrl " +
-                        "elapsed=${System.currentTimeMillis() - startedAt}ms marketingRequests=0"
-                )
-                val directResolved = resolveOfficialCoverForVirtualRequestDirectDemand(titleNo, detailUrl, chain, startedAt)
-                dlog(
-                    "officialCoverDirectDemandResolveDone titleNo=$titleNo coverPresent=${directResolved.coverUrl.isNotBlank()} " +
-                        "source=${directResolved.source} elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                        "coverUrl=${directResolved.coverUrl} marketingRequests=0"
-                )
-                directResolved
-            }
+            cachedDetailCover.isNotBlank() -> OfficialCoverResolveResult(cachedDetailCover, "detail-official-runtime-cache")
+            trustedRuntimeCover.isNotBlank() -> OfficialCoverResolveResult(trustedRuntimeCover, "trusted-runtime-official-meta")
+            else -> resolveOfficialCoverForVirtualRequestViaInflight(titleNo, detailUrl, startedAt)
         }
         if (resolved.coverUrl.isBlank()) {
             dlog(
@@ -2738,169 +2686,64 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .build()
         }
 
-        officialCoverImageBytesForTitleNo(titleNo, resolved.coverUrl)?.let { cachedBytes ->
-            dlog(
-                "officialCoverBytesCacheHit titleNo=$titleNo source=${resolved.source} " +
-                    "cacheSource=${cachedBytes.source} resolveMs=${System.currentTimeMillis() - startedAt}ms " +
-                    "bytes=${cachedBytes.bytes.size} imageUrl=${resolved.coverUrl} marketingRequests=0"
-            )
-            dlog(
-                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=bytes-cache-hit " +
-                    "imageCode=200 resolveMs=${System.currentTimeMillis() - startedAt}ms imageElapsed=0ms " +
-                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} bytes=${cachedBytes.bytes.size} marketingRequests=0"
-            )
-            return bytesCacheResponse(request, cachedBytes)
-        }
-
-        val bytesStateGraceMs = if (isCurrentVisible8OfficialCoverTarget(titleNo)) {
-            OFFICIAL_COVER_BYTES_PREFETCH_STATE_GRACE_MS
-        } else {
-            0L
-        }
-        awaitOfficialCoverImageBytesIfInflight(titleNo, resolved.coverUrl, startedAt, bytesStateGraceMs)?.let { prefetchedBytes ->
-            dlog(
-                "officialCoverBytesPrefetchJoinHit titleNo=$titleNo source=${resolved.source} " +
-                    "cacheSource=${prefetchedBytes.source} resolveMs=${System.currentTimeMillis() - startedAt}ms " +
-                    "bytes=${prefetchedBytes.bytes.size} imageUrl=${resolved.coverUrl} marketingRequests=0"
-            )
-            dlog(
-                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=bytes-prefetch-join-hit " +
-                    "imageCode=200 resolveMs=${System.currentTimeMillis() - startedAt}ms imageElapsed=0ms " +
-                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} bytes=${prefetchedBytes.bytes.size} marketingRequests=0"
-            )
-            return bytesCacheResponse(request, prefetchedBytes)
-        }
-
         val imageStartedAt = System.currentTimeMillis()
         val imageHeaders = headersBuilder()
             .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
             .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
             .build()
         val imageRequest = GET(resolved.coverUrl, imageHeaders)
+        val imageResponse = chain.proceed(imageRequest)
         dlog(
-            "officialCoverImageFetchStart titleNo=$titleNo source=${resolved.source} " +
-                "resolveMs=${imageStartedAt - startedAt}ms imageUrl=${resolved.coverUrl} " +
-                "referer=${detailUrl.ifBlank { "$baseUrl/" }} bytesCacheMiss=true marketingRequests=0"
+            "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
+                "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
+                "imageElapsed=${System.currentTimeMillis() - imageStartedAt}ms " +
+                "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
         )
-        return try {
-            val imageResponse = chain.proceed(imageRequest)
-            val contentType = imageResponse.body.contentType()?.toString().orEmpty()
-            val imageBytes = imageResponse.body.bytes()
-            val cacheWrite = rememberOfficialCoverImageBytes(
-                titleNo = titleNo,
-                coverUrl = resolved.coverUrl,
-                bytes = imageBytes,
-                contentType = contentType,
-                source = "virtual-image-fetch",
-            )
-            val imageElapsed = System.currentTimeMillis() - imageStartedAt
-            dlog(
-                "officialCoverImageFetchDone titleNo=$titleNo imageCode=${imageResponse.code} " +
-                    "imageElapsed=${imageElapsed}ms totalElapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "imageUrl=${resolved.coverUrl} bytes=${imageBytes.size} cacheWrite=$cacheWrite marketingRequests=0"
-            )
-            dlog(
-                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
-                    "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
-                    "imageElapsed=${imageElapsed}ms bytes=${imageBytes.size} cacheWrite=$cacheWrite " +
-                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
-            )
-            imageResponse.newBuilder()
-                .body(imageBytes.toResponseBody(contentType.ifBlank { "image/jpeg" }.toMediaType()))
-                .build()
-        } catch (e: Exception) {
-            wlog(
-                "officialCoverImageFetchFailed titleNo=$titleNo source=${resolved.source} " +
-                    "imageElapsed=${System.currentTimeMillis() - imageStartedAt}ms totalElapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "imageUrl=${resolved.coverUrl} error=${e.javaClass.simpleName}",
-                e,
-            )
-            throw e
-        }
+        return imageResponse
     }
 
-    private fun resolveOfficialCoverForVirtualRequestDirectDemand(
+    private fun resolveOfficialCoverForVirtualRequestViaInflight(
         titleNo: String,
         detailUrl: String,
-        chain: Interceptor.Chain,
         overallStartedAt: Long,
     ): OfficialCoverResolveResult {
-        val key = titleNo.trim()
-        if (key.isBlank() || detailUrl.isBlank()) return OfficialCoverResolveResult("", "missing-title-or-detail")
+        if (titleNo.isBlank() || detailUrl.isBlank()) return OfficialCoverResolveResult("", "missing-title-or-detail")
+        val state = ensureOfficialNewWorkCoverFetchStarted(
+            titleNo,
+            detailUrl,
+            OfficialCoverFetchPriority.DEMAND,
+        )
+            ?: return verifiedDetailOfficialCoverForTitleNo(titleNo)
+                .takeIf { it.isNotBlank() }
+                ?.let { OfficialCoverResolveResult(it, "detail-official-runtime-cache") }
+                ?: OfficialCoverResolveResult("", "inflight-not-started")
 
-        val existingCover = verifiedDetailOfficialCoverForTitleNo(key)
-        if (existingCover.isNotBlank()) return OfficialCoverResolveResult(existingCover, "detail-official-runtime-cache")
-
-        val now = System.currentTimeMillis()
-        var stateToJoin: OfficialNewWorkCoverFetchState? = null
-        var stateToFetch: OfficialNewWorkCoverFetchState? = null
-        synchronized(officialNewWorkCoverFetchStates) {
-            pruneOfficialNewWorkCoverFetchStatesLocked(now)
-            val existing = officialNewWorkCoverFetchStates[key]
-            if (existing != null && !existing.completed) {
-                stateToJoin = existing
-            } else {
-                val created = OfficialNewWorkCoverFetchState(key, detailUrl)
-                created.running = true
-                officialNewWorkCoverFetchStates[key] = created
-                stateToFetch = created
-            }
+        val waitStartedAt = System.currentTimeMillis()
+        if (!state.completed) {
+            runCatching { state.latch.await(OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS, TimeUnit.MILLISECONDS) }
         }
-
-        stateToJoin?.let { state ->
-            val waitStartedAt = System.currentTimeMillis()
-            if (!state.completed) {
-                runCatching { state.latch.await(OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS, TimeUnit.MILLISECONDS) }
-            }
-            val waitedMs = System.currentTimeMillis() - waitStartedAt
-            val remembered = verifiedDetailOfficialCoverForTitleNo(key)
-            if (remembered.isNotBlank()) {
-                dlog(
-                    "officialCoverVirtualResolveJoin titleNo=$key coverPresent=true " +
-                        "source=virtual-direct-demand-join completed=${state.completed} failed=${state.failed} " +
-                        "waited=${waitedMs}ms overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms " +
-                        "detailUrl=$detailUrl marketingRequests=0"
-                )
-                return OfficialCoverResolveResult(remembered, "virtual-direct-demand-join")
-            }
-            val joinFailureSource = state.failureSource.ifBlank {
-                if (state.completed) "virtual-direct-demand-failed" else "virtual-direct-demand-pending"
-            }
+        val waitedMs = System.currentTimeMillis() - waitStartedAt
+        val remembered = verifiedDetailOfficialCoverForTitleNo(titleNo)
+        if (remembered.isNotBlank()) {
             dlog(
-                "officialCoverVirtualResolveJoin titleNo=$key coverPresent=false " +
-                    "source=$joinFailureSource " +
-                    "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
-                    "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms detailUrl=$detailUrl marketingRequests=0"
+                "officialCoverVirtualResolveJoin titleNo=$titleNo coverPresent=true " +
+                    "source=virtual-inflight-official-cover completed=${state.completed} failed=${state.failed} " +
+                    "waited=${waitedMs}ms overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms " +
+                    "detailUrl=$detailUrl marketingRequests=0"
             )
-            return OfficialCoverResolveResult("", joinFailureSource)
+            return OfficialCoverResolveResult(remembered, "virtual-inflight-official-cover")
         }
 
-        val state = stateToFetch ?: return verifiedDetailOfficialCoverForTitleNo(key)
-            .takeIf { it.isNotBlank() }
-            ?.let { OfficialCoverResolveResult(it, "detail-official-runtime-cache") }
-            ?: OfficialCoverResolveResult("", "direct-demand-not-started")
-        val resolved = resolveOfficialCoverForVirtualRequest(key, detailUrl, chain, overallStartedAt)
-        val transientFailure = isTransientOfficialCoverFailureSource(resolved.source)
-        synchronized(state) {
-            state.coverUrl = resolved.coverUrl
-            state.failureSource = resolved.source.takeIf { resolved.coverUrl.isBlank() }.orEmpty()
-            state.failed = resolved.coverUrl.isBlank() && !transientFailure
-            state.completed = !transientFailure
-            state.running = false
-        }
-        state.latch.countDown()
-        if (transientFailure) {
-            synchronized(officialNewWorkCoverFetchStates) {
-                if (officialNewWorkCoverFetchStates[key] === state) {
-                    officialNewWorkCoverFetchStates.remove(key)
-                }
-            }
-        }
-        return if (resolved.coverUrl.isNotBlank()) {
-            resolved.copy(source = "virtual-direct-demand")
-        } else {
-            resolved
-        }
+        dlog(
+            "officialCoverVirtualResolveJoin titleNo=$titleNo coverPresent=false " +
+                "source=${if (state.completed) "virtual-inflight-failed" else "virtual-inflight-pending"} " +
+                "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
+                "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms detailUrl=$detailUrl marketingRequests=0"
+        )
+        return OfficialCoverResolveResult(
+            "",
+            if (state.completed) "virtual-inflight-failed" else "virtual-inflight-pending",
+        )
     }
 
     private fun resolveOfficialCoverForVirtualRequest(
@@ -2934,16 +2777,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "virtual-detail-meta-fast" else scan.source)
             }
         } catch (e: Exception) {
-            val source = if (isTransientOfficialCoverException(e)) "virtual-detail-meta-canceled" else "virtual-detail-meta-failed"
-            val message =
+            wlog(
                 "officialCoverVirtualResolveFailed titleNo=$titleNo detailUrl=$detailUrl " +
-                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName} source=$source"
-            if (source == "virtual-detail-meta-canceled") {
-                dlog(message)
-            } else {
-                wlog(message, e)
-            }
-            OfficialCoverResolveResult("", source)
+                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName}",
+                e,
+            )
+            OfficialCoverResolveResult("", "virtual-detail-meta-failed")
         }
     }
 
@@ -2984,399 +2823,177 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun hybridVisible8OfficialCoverStatsForPopular(elements: List<Element>): OfficialCoverWaitStats {
-        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT)
-        synchronized(officialCoverVisible8TitleNos) {
-            officialCoverVisible8TitleNos.clear()
-            officialCoverVisible8TitleNos.addAll(targets.map { it.titleNo.trim() }.filter { it.isNotBlank() })
-        }
+    private fun prewarmOfficialNewWorkCoversForPopularAsync(elements: List<Element>): OfficialCoverWaitStats {
+        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT)
         if (targets.isEmpty()) return OfficialCoverWaitStats()
+        val visibleTargets = visibleFirstOfficialCoverTargets(targets)
+        val visibleTitleNos = visibleTargets.map { it.titleNo }.toSet()
+        val backgroundTargets = targets.filter { it.titleNo !in visibleTitleNos }
 
         var alreadyReady = 0
         var trustedReady = 0
-        var scheduled = 0
-        var alreadyInflight = 0
-        val virtualTitleNos = mutableListOf<String>()
-        val scheduledTitleNos = mutableListOf<String>()
+        var demandScheduled = 0
+        var prefetchScheduled = 0
+        val demandTitleNos = mutableListOf<String>()
+        val prefetchTitleNos = mutableListOf<String>()
 
-        targets.forEachIndexed { rank, target ->
-            val key = target.titleNo.trim()
-            val detailUrl = rememberOfficialCoverDetailUrl(key, target.detailUrl)
+        fun scheduleTarget(target: OfficialNewWorkCoverTarget, priority: OfficialCoverFetchPriority) {
             when {
-                verifiedDetailOfficialCoverForTitleNo(key).isNotBlank() -> alreadyReady += 1
-                trustedRuntimeOfficialCoverForTitleNo(key).isNotBlank() -> trustedReady += 1
-                detailUrl.isBlank() -> virtualTitleNos += key
+                verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
+                trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
                 else -> {
-                    virtualTitleNos += key
-                    var stateToFetch: OfficialNewWorkCoverFetchState? = null
-                    synchronized(officialNewWorkCoverFetchStates) {
-                        pruneOfficialNewWorkCoverFetchStatesLocked(System.currentTimeMillis())
-                        val existing = officialNewWorkCoverFetchStates[key]
-                        if (existing != null && !existing.completed) {
-                            alreadyInflight += 1
+                    val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, priority)
+                    if (state != null) {
+                        if (priority == OfficialCoverFetchPriority.PREFETCH) {
+                            prefetchScheduled += 1
+                            prefetchTitleNos += target.titleNo
                         } else {
-                            val created = OfficialNewWorkCoverFetchState(key, detailUrl)
-                            created.running = true
-                            officialNewWorkCoverFetchStates[key] = created
-                            stateToFetch = created
+                            demandScheduled += 1
+                            demandTitleNos += target.titleNo
                         }
-                    }
-                    stateToFetch?.let { state ->
-                        scheduled += 1
-                        scheduledTitleNos += key
-                        scheduleHybridVisible8OfficialCoverPrewarm(target, state, rank)
                     }
                 }
             }
         }
 
+        visibleTargets.forEach { scheduleTarget(it, OfficialCoverFetchPriority.VISIBLE) }
+        backgroundTargets.forEach { scheduleTarget(it, OfficialCoverFetchPriority.PREFETCH) }
+
         dlog(
-            "officialCoverHybridVisible8Plan titleNos=${targets.joinToString("|") { it.titleNo }} " +
+            "officialCoverWarmupSchedule titleNos=${targets.joinToString("|") { it.titleNo }} " +
+                "visibleTitleNos=${visibleTargets.joinToString("|") { it.titleNo }} " +
+                "backgroundTitleNos=${backgroundTargets.joinToString("|") { it.titleNo }} " +
                 "alreadyReady=$alreadyReady trustedReady=$trustedReady " +
-                "virtualTargets=${virtualTitleNos.size} virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
-                "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
-                "alreadyInflight=$alreadyInflight visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "frontTargets=${targets.take(OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT).size} " +
-                "tailTargets=${(targets.size - OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT).coerceAtLeast(0)} " +
-                "bytesParallelism=$OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM " +
-                "crossTitleQueue=false wait=0ms mode=hybrid-visible8-bytes-prefetch " +
-                "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
+                "demandScheduled=$demandScheduled prefetchScheduled=$prefetchScheduled " +
+                "demandTitleNos=${demandTitleNos.joinToString("|")} " +
+                "prefetchTitleNos=${prefetchTitleNos.joinToString("|")} " +
+                "limit=$OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT " +
+                "visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
+                "demandParallelism=$OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM " +
+                "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM " +
+                "totalParallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
+                "mode=demand4-prefetch1-virtual-prefetch wait=0ms marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
             alreadyReady = alreadyReady,
             trustedReady = trustedReady,
-            scheduled = scheduled,
+            scheduled = demandScheduled + prefetchScheduled,
         )
     }
 
-    private fun scheduleHybridVisible8OfficialCoverPrewarm(
-        target: OfficialNewWorkCoverTarget,
-        state: OfficialNewWorkCoverFetchState,
-        rank: Int,
-    ) {
-        Thread {
-            val startedAt = System.currentTimeMillis()
-            if (rank >= OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT) {
-                runCatching { Thread.sleep(OFFICIAL_COVER_BYTES_VISIBLE8_TAIL_START_DELAY_MS) }
+    private fun visibleFirstOfficialCoverTargets(targets: List<OfficialNewWorkCoverTarget>): List<OfficialNewWorkCoverTarget> {
+        val result = linkedMapOf<String, OfficialNewWorkCoverTarget>()
+        fun add(target: OfficialNewWorkCoverTarget) {
+            if (result.size < OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT) {
+                result.putIfAbsent(target.titleNo, target)
             }
-            val resolved = resolveOfficialCoverForHybridVisible8Prewarm(target.titleNo, target.detailUrl, startedAt)
-            val transientFailure = isTransientOfficialCoverFailureSource(resolved.source)
-            synchronized(state) {
-                state.coverUrl = resolved.coverUrl
-                state.failureSource = resolved.source.takeIf { resolved.coverUrl.isBlank() }.orEmpty()
-                state.failed = resolved.coverUrl.isBlank() && !transientFailure
-                state.completed = !transientFailure
-                state.running = false
-            }
-            state.latch.countDown()
-            if (transientFailure) {
-                synchronized(officialNewWorkCoverFetchStates) {
-                    if (officialNewWorkCoverFetchStates[target.titleNo] === state) {
-                        officialNewWorkCoverFetchStates.remove(target.titleNo)
-                    }
-                }
-            }
-            dlog(
-                "officialCoverHybridVisible8PrewarmDone titleNo=${target.titleNo} rank=$rank " +
-                    "tier=${if (rank < OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT) "front" else "tail"} " +
-                    "coverPresent=${resolved.coverUrl.isNotBlank()} source=${resolved.source} " +
-                    "elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "detailUrl=${target.detailUrl} bytesPrefetch=${resolved.coverUrl.isNotBlank()} marketingRequests=0"
-            )
-            if (resolved.coverUrl.isNotBlank()) {
-                prefetchOfficialCoverImageBytes(
-                    titleNo = target.titleNo,
-                    coverUrl = resolved.coverUrl,
-                    detailUrl = target.detailUrl,
-                    source = resolved.source,
-                    overallStartedAt = startedAt,
-                )
-            }
-        }.apply {
-            name = "DMH-cover-visible8-${rank}-${target.titleNo}"
-            isDaemon = true
-            start()
         }
+
+        // 轮播第一张和新作卡属于更可能被立刻看到的目标，走 demand/visible 队列。
+        targets.filter { it.origin == "popular-banner" }.take(1).forEach(::add)
+        targets.filter { it.origin == "popular-common-card" }.forEach(::add)
+        targets.sortedBy { it.rawIndex }.forEach(::add)
+        return result.values.toList()
     }
 
-    private fun resolveOfficialCoverForHybridVisible8Prewarm(
-        titleNo: String,
-        detailUrl: String,
-        overallStartedAt: Long,
-    ): OfficialCoverResolveResult {
-        val key = titleNo.trim()
-        if (key.isBlank() || detailUrl.isBlank()) return OfficialCoverResolveResult("", "missing-title-or-detail")
-
-        val existingCover = verifiedDetailOfficialCoverForTitleNo(key)
-        if (existingCover.isNotBlank()) return OfficialCoverResolveResult(existingCover, "detail-official-runtime-cache")
-
-        return try {
-            val requestHeaders = headersBuilder()
-                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .set("X-Mihon-Official-Cover-Meta-Only", "1")
-                .build()
-            val detailRequest = GET(detailUrl, requestHeaders)
-            val detailStartedAt = System.currentTimeMillis()
-            client.newCall(detailRequest).execute().use { response ->
-                val responseAt = System.currentTimeMillis()
-                val scan = scanOfficialCoverMetaFast(response, key)
-                val scanEndedAt = System.currentTimeMillis()
-                val remembered = if (scan.coverUrl.isNotBlank()) rememberVerifiedDetailOfficialCover(key, scan.coverUrl) else ""
-                dlog(
-                    "officialCoverHybridVisible8Resolve titleNo=$key coverPresent=${remembered.isNotBlank()} " +
-                        "source=${scan.source} code=${response.code} requestedUrl=$detailUrl " +
-                        "finalUrl=${response.request.url} ttfb=${responseAt - detailStartedAt}ms " +
-                        "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - detailStartedAt}ms " +
-                        "overallElapsed=${scanEndedAt - overallStartedAt}ms bytesScanned=${scan.bytesScanned} " +
-                        "earlyClose=${scan.earlyClose} fullJsoup=false cacheWrite=false " +
-                        "directDetail=${!detailUrl.contains("/episodeList")} marketingRequests=0"
-                )
-                OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "hybrid-visible8-prewarm" else scan.source)
-            }
-        } catch (e: Exception) {
-            val source = if (isTransientOfficialCoverException(e)) "hybrid-visible8-canceled" else "hybrid-visible8-failed"
-            val message =
-                "officialCoverHybridVisible8ResolveFailed titleNo=$key detailUrl=$detailUrl " +
-                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName} source=$source"
-            if (source == "hybrid-visible8-canceled") {
-                dlog(message)
+    private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
+        val targets = selectedOfficialNewWorkTargets(elements)
+        if (targets.isEmpty()) return OfficialCoverWaitStats()
+        var alreadyReady = 0
+        val states = mutableListOf<OfficialNewWorkCoverFetchState>()
+        targets.forEach { target ->
+            if (verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank()) {
+                alreadyReady += 1
             } else {
-                wlog(message, e)
-            }
-            OfficialCoverResolveResult("", source)
-        }
-    }
-
-
-    private fun officialCoverImageBytesCacheKey(titleNo: String, coverUrl: String): String {
-        return titleNo.trim() + "|" + coverUrl.trim()
-    }
-
-    private fun pruneOfficialCoverImageBytesCacheLocked(now: Long) {
-        val iterator = officialCoverImageBytesCache.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next().value
-            if (now - entry.createdAt > OFFICIAL_COVER_BYTES_CACHE_TTL_MS) {
-                iterator.remove()
+                ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, OfficialCoverFetchPriority.DEMAND)?.let { states.add(it) }
             }
         }
-        while (officialCoverImageBytesCache.size > OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES) {
-            val firstKey = officialCoverImageBytesCache.keys.firstOrNull() ?: break
-            officialCoverImageBytesCache.remove(firstKey)
-        }
-        var totalBytes = officialCoverImageBytesCache.values.fold(0) { acc, entry -> acc + entry.bytes.size }
-        while (totalBytes > OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES && officialCoverImageBytesCache.isNotEmpty()) {
-            val firstKey = officialCoverImageBytesCache.keys.firstOrNull() ?: break
-            val removed = officialCoverImageBytesCache.remove(firstKey)
-            totalBytes -= removed?.bytes?.size ?: 0
-        }
-    }
 
-    private fun officialCoverImageBytesForTitleNo(titleNo: String, coverUrl: String): OfficialCoverImageBytesCacheEntry? {
-        val key = titleNo.trim()
-        val normalizedCoverUrl = coverUrl.trim()
-        if (key.isBlank() || normalizedCoverUrl.isBlank()) return null
-        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
-        val now = System.currentTimeMillis()
-        return synchronized(officialCoverImageBytesCache) {
-            pruneOfficialCoverImageBytesCacheLocked(now)
-            officialCoverImageBytesCache[cacheKey]
-        }
-    }
-
-    private fun rememberOfficialCoverImageBytes(
-        titleNo: String,
-        coverUrl: String,
-        bytes: ByteArray,
-        contentType: String,
-        source: String,
-    ): Boolean {
-        val key = titleNo.trim()
-        val normalizedCoverUrl = coverUrl.trim()
-        if (key.isBlank() || normalizedCoverUrl.isBlank() || bytes.isEmpty()) return false
-        if (bytes.size > OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES) {
-            dlog(
-                "officialCoverBytesCacheSkip titleNo=$key reason=too-large bytes=${bytes.size} " +
-                    "limit=$OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES imageUrl=$normalizedCoverUrl marketingRequests=0"
-            )
-            return false
-        }
-        val entry = OfficialCoverImageBytesCacheEntry(
-            titleNo = key,
-            coverUrl = normalizedCoverUrl,
-            bytes = bytes,
-            contentType = contentType.ifBlank { "image/jpeg" },
-            source = source,
-        )
-        synchronized(officialCoverImageBytesCache) {
-            officialCoverImageBytesCache[officialCoverImageBytesCacheKey(key, normalizedCoverUrl)] = entry
-            pruneOfficialCoverImageBytesCacheLocked(System.currentTimeMillis())
-        }
-        return true
-    }
-
-    private fun bytesCacheResponse(request: Request, entry: OfficialCoverImageBytesCacheEntry): Response {
-        return Response.Builder()
-            .request(request)
-            .protocol(Protocol.HTTP_1_1)
-            .code(200)
-            .message("OK")
-            .headers(
-                Headers.Builder()
-                    .set("Content-Type", entry.contentType.ifBlank { "image/jpeg" })
-                    .set("X-DMH-Official-Cover-Bytes-Cache", "1")
-                    .build(),
-            )
-            .body(entry.bytes.toResponseBody(entry.contentType.ifBlank { "image/jpeg" }.toMediaType()))
-            .build()
-    }
-
-    private fun isCurrentVisible8OfficialCoverTarget(titleNo: String): Boolean {
-        val key = titleNo.trim()
-        if (key.isBlank()) return false
-        return synchronized(officialCoverVisible8TitleNos) { key in officialCoverVisible8TitleNos }
-    }
-
-    private fun awaitOfficialCoverImageBytesIfInflight(
-        titleNo: String,
-        coverUrl: String,
-        overallStartedAt: Long,
-        stateGraceMs: Long = 0L,
-    ): OfficialCoverImageBytesCacheEntry? {
-        val key = titleNo.trim()
-        val normalizedCoverUrl = coverUrl.trim()
-        if (key.isBlank() || normalizedCoverUrl.isBlank()) return null
-        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
-        var state = synchronized(officialCoverImageBytesFetchStates) {
-            officialCoverImageBytesFetchStates[cacheKey]
-        }
-        if (state == null && stateGraceMs > 0L) {
-            val graceStartedAt = System.currentTimeMillis()
-            val deadline = graceStartedAt + stateGraceMs
-            while (state == null && System.currentTimeMillis() < deadline) {
-                try {
-                    Thread.sleep(10L)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
-                }
-                state = synchronized(officialCoverImageBytesFetchStates) {
-                    officialCoverImageBytesFetchStates[cacheKey]
-                }
-            }
-            if (state != null) {
-                dlog(
-                    "officialCoverBytesPrefetchStateGraceHit titleNo=$key " +
-                        "waited=${System.currentTimeMillis() - graceStartedAt}ms graceLimit=${stateGraceMs}ms " +
-                        "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
-                )
-            }
-        }
-        val stateSnapshot = state ?: return null
         val waitStartedAt = System.currentTimeMillis()
-        if (!stateSnapshot.completed) {
-            runCatching { stateSnapshot.latch.await(OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS, TimeUnit.MILLISECONDS) }
+        val primaryWaitMs = awaitOfficialNewWorkCoverStates(states, OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS)
+        val incompleteAfterPrimary = states.count { !it.completed }
+        val tailWaitMs = if (incompleteAfterPrimary > 0) {
+            awaitOfficialNewWorkCoverStates(states.filter { !it.completed }, OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS)
+        } else {
+            0L
         }
         val waitedMs = System.currentTimeMillis() - waitStartedAt
-        val cached = officialCoverImageBytesForTitleNo(key, normalizedCoverUrl)
+        val success = targets.count { verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() }
+        val missing = targets.size - success
         dlog(
-            "officialCoverBytesPrefetchJoin titleNo=$key hit=${cached != null} " +
-                "completed=${stateSnapshot.completed} failed=${stateSnapshot.failed} waited=${waitedMs}ms " +
-                "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
+            "officialNewWorkCoverWait titleNos=${targets.joinToString("|") { it.titleNo }} " +
+                "alreadyReady=$alreadyReady scheduled=${states.size} success=$success missing=$missing " +
+                "waited=${waitedMs}ms primaryWait=${primaryWaitMs}ms tailWait=${tailWaitMs}ms " +
+                "primaryTimeoutMs=$OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS " +
+                "tailTimeoutMs=$OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS " +
+                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM mode=legacy-fast-meta-unused marketingRequests=0"
         )
-        return cached
+        return OfficialCoverWaitStats(
+            titleNos = targets.size,
+            alreadyReady = alreadyReady,
+            scheduled = states.size,
+            success = success,
+            missing = missing,
+            waitedMs = waitedMs,
+        )
     }
 
-    private fun prefetchOfficialCoverImageBytes(
-        titleNo: String,
-        coverUrl: String,
-        detailUrl: String,
-        source: String,
-        overallStartedAt: Long,
-    ) {
-        val key = titleNo.trim()
-        val normalizedCoverUrl = coverUrl.trim()
-        if (key.isBlank() || normalizedCoverUrl.isBlank()) return
-        if (officialCoverImageBytesForTitleNo(key, normalizedCoverUrl) != null) {
-            dlog(
-                "officialCoverBytesPrefetchSkip titleNo=$key reason=cache-hit imageUrl=$normalizedCoverUrl marketingRequests=0"
-            )
-            return
-        }
-        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
-        val state = synchronized(officialCoverImageBytesFetchStates) {
-            val existing = officialCoverImageBytesFetchStates[cacheKey]
-            if (existing != null && !existing.completed) {
-                return
-            }
-            OfficialCoverImageBytesFetchState(key, normalizedCoverUrl).also { officialCoverImageBytesFetchStates[cacheKey] = it }
-        }
+    private fun awaitOfficialNewWorkCoverStates(states: List<OfficialNewWorkCoverFetchState>, timeoutMs: Long): Long {
+        if (states.isEmpty() || timeoutMs <= 0L) return 0L
         val startedAt = System.currentTimeMillis()
-        dlog(
-            "officialCoverBytesPrefetchStart titleNo=$key source=$source " +
-                "imageUrl=$normalizedCoverUrl detailUrl=$detailUrl marketingRequests=0"
-        )
-        var semaphoreAcquired = false
-        try {
-            val queueStartedAt = System.currentTimeMillis()
-            officialCoverBytesPrefetchSemaphore.acquire()
-            semaphoreAcquired = true
-            val slotWaitMs = System.currentTimeMillis() - queueStartedAt
-            if (slotWaitMs > 0L) {
-                dlog(
-                    "officialCoverBytesPrefetchSlot titleNo=$key waited=${slotWaitMs}ms " +
-                        "parallelism=$OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM imageUrl=$normalizedCoverUrl marketingRequests=0"
-                )
+        states.forEach { state ->
+            val elapsed = System.currentTimeMillis() - startedAt
+            val remaining = timeoutMs - elapsed
+            if (remaining > 0 && !state.completed) {
+                runCatching { state.latch.await(remaining, TimeUnit.MILLISECONDS) }
             }
-            val imageHeaders = headersBuilder()
-                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
-                .build()
-            val imageRequest = GET(normalizedCoverUrl, imageHeaders)
-            client.newCall(imageRequest).execute().use { response ->
-                val contentLength = response.body.contentLength()
-                if (contentLength > OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES) {
-                    state.failed = true
-                    dlog(
-                        "officialCoverBytesPrefetchSkip titleNo=$key reason=too-large-content-length " +
-                            "contentLength=$contentLength limit=$OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES " +
-                            "elapsed=${System.currentTimeMillis() - startedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
-                    )
-                    return@use
+        }
+        return System.currentTimeMillis() - startedAt
+    }
+
+    private fun ensureOfficialNewWorkCoverFetchStarted(
+        titleNo: String,
+        detailUrl: String,
+        priority: OfficialCoverFetchPriority = OfficialCoverFetchPriority.DEMAND,
+    ): OfficialNewWorkCoverFetchState? {
+        val key = titleNo.trim()
+        if (key.isBlank()) return null
+        if (verifiedDetailOfficialCoverForTitleNo(key).isNotBlank()) return null
+        val now = System.currentTimeMillis()
+        val state = synchronized(officialNewWorkCoverFetchStates) {
+            pruneOfficialNewWorkCoverFetchStatesLocked(now)
+            val existing = officialNewWorkCoverFetchStates[key]
+            if (existing != null && (!existing.completed || (!existing.failed && now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS))) {
+                existing
+            } else {
+                OfficialNewWorkCoverFetchState(key, detailUrl).also { officialNewWorkCoverFetchStates[key] = it }
+            }
+        }
+        submitOfficialNewWorkCoverFetch(state, priority)
+        return state
+    }
+
+    private fun submitOfficialNewWorkCoverFetch(
+        state: OfficialNewWorkCoverFetchState,
+        priority: OfficialCoverFetchPriority,
+    ) {
+        synchronized(state) {
+            if (state.completed) return
+            val isDemandLike = priority == OfficialCoverFetchPriority.DEMAND || priority == OfficialCoverFetchPriority.VISIBLE
+            if (isDemandLike) {
+                if (!state.demandSubmitted && !state.running) {
+                    state.demandSubmitted = true
+                    state.submitted = true
+                    state.fetchKind = if (priority == OfficialCoverFetchPriority.VISIBLE) "visible-inflight" else "demand-inflight"
+                    officialNewWorkCoverDemandExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
                 }
-                val contentType = response.body.contentType()?.toString().orEmpty()
-                val bytes = response.body.bytes()
-                val cacheWrite = response.isSuccessful && rememberOfficialCoverImageBytes(
-                    titleNo = key,
-                    coverUrl = normalizedCoverUrl,
-                    bytes = bytes,
-                    contentType = contentType,
-                    source = "bytes-prefetch",
-                )
-                state.failed = !cacheWrite
-                dlog(
-                    "officialCoverBytesPrefetchDone titleNo=$key imageCode=${response.code} " +
-                        "imageElapsed=${System.currentTimeMillis() - startedAt}ms overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms " +
-                        "bytes=${bytes.size} cacheWrite=$cacheWrite imageUrl=$normalizedCoverUrl marketingRequests=0"
-                )
-            }
-        } catch (e: Exception) {
-            state.failed = true
-            if (e is InterruptedException) Thread.currentThread().interrupt()
-            wlog(
-                "officialCoverBytesPrefetchFailed titleNo=$key " +
-                    "imageElapsed=${System.currentTimeMillis() - startedAt}ms imageUrl=$normalizedCoverUrl " +
-                    "error=${e.javaClass.simpleName}",
-                e,
-            )
-        } finally {
-            if (semaphoreAcquired) officialCoverBytesPrefetchSemaphore.release()
-            state.completed = true
-            state.latch.countDown()
-            synchronized(officialCoverImageBytesFetchStates) {
-                if (officialCoverImageBytesFetchStates[cacheKey] === state) {
-                    officialCoverImageBytesFetchStates.remove(cacheKey)
+            } else {
+                if (!state.prefetchSubmitted && !state.demandSubmitted && !state.running) {
+                    state.prefetchSubmitted = true
+                    state.submitted = true
+                    state.fetchKind = "prefetch-inflight"
+                    officialNewWorkCoverPrefetchExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
                 }
             }
         }
@@ -3394,6 +3011,69 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         while (officialNewWorkCoverFetchStates.size > OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES) {
             val firstKey = officialNewWorkCoverFetchStates.keys.firstOrNull() ?: break
             officialNewWorkCoverFetchStates.remove(firstKey)
+        }
+    }
+
+    private fun fetchOfficialNewWorkCoverFromDetail(titleNo: String, state: OfficialNewWorkCoverFetchState) {
+        val fetchKind = synchronized(state) {
+            if (state.completed || state.running) return
+            state.running = true
+            state.fetchKind
+        }
+        val startedAt = System.currentTimeMillis()
+        var failed = false
+        val requestUrl = state.detailUrl.ifBlank { "$baseUrl/episodeList?titleNo=$titleNo" }
+        try {
+            val requestHeaders = headersBuilder()
+                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .set("X-Mihon-Official-Cover-Meta-Only", "1")
+                .build()
+            val request = GET(requestUrl, requestHeaders)
+            val call = client.newCall(request)
+            call.timeout().timeout(OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
+                val responseAt = System.currentTimeMillis()
+                val scan = scanOfficialCoverMetaFast(response, titleNo)
+                val scanEndedAt = System.currentTimeMillis()
+                if (scan.coverUrl.isNotBlank()) {
+                    val remembered = rememberVerifiedDetailOfficialCover(titleNo, scan.coverUrl)
+                    state.coverUrl = remembered
+                    dlog(
+                        "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
+                            "source=${scan.source} fetchKind=$fetchKind code=${response.code} requestedUrl=$requestUrl " +
+                            "finalUrl=${response.request.url} ttfb=${responseAt - startedAt}ms " +
+                            "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - startedAt}ms " +
+                            "bytesScanned=${scan.bytesScanned} earlyClose=${scan.earlyClose} " +
+                            "fullJsoup=false cacheWrite=false directDetail=${!requestUrl.contains("/episodeList")} " +
+                            "marketingRequests=0"
+                    )
+                    failed = remembered.isBlank()
+                } else {
+                    failed = true
+                    dlog(
+                        "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=false " +
+                            "source=${scan.source.ifBlank { "detail-meta-fast-unverified" }} code=${response.code} " +
+                            "requestedUrl=$requestUrl finalUrl=${response.request.url} " +
+                            "ttfb=${responseAt - startedAt}ms readMeta=${scanEndedAt - responseAt}ms " +
+                            "elapsed=${scanEndedAt - startedAt}ms bytesScanned=${scan.bytesScanned} " +
+                            "earlyClose=${scan.earlyClose} fullJsoup=false cacheWrite=false marketingRequests=0"
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            failed = true
+            wlog(
+                "officialNewWorkCoverFetchFailed titleNo=$titleNo " +
+                    "requestedUrl=$requestUrl elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
+                e,
+            )
+        } finally {
+            synchronized(state) {
+                state.failed = failed
+                state.completed = true
+                state.running = false
+            }
+            state.latch.countDown()
         }
     }
 
@@ -4487,11 +4167,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 5
+        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 1
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT = 4
-        private const val OFFICIAL_COVER_BYTES_VISIBLE8_TAIL_START_DELAY_MS = 250L
-        private const val OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM = 2
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
+        private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
+        private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
@@ -4500,13 +4183,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
-        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_3_visible8_bytes"
-        private const val OFFICIAL_COVER_BYTES_CACHE_TTL_MS = 10 * 60 * 1000L
-        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES = 16
-        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
-        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES = 1024 * 1024
-        private const val OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS = 900L
-        private const val OFFICIAL_COVER_BYTES_PREFETCH_STATE_GRACE_MS = 80L
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
