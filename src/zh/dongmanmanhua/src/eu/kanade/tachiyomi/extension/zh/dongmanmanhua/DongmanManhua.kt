@@ -2632,7 +2632,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val key = titleNo?.trim().orEmpty()
         val normalizedDetailUrl = rememberOfficialCoverDetailUrl(key, detailUrl)
         if (key.isBlank() || normalizedDetailUrl.isBlank()) return ""
-        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key"
+        return "$baseUrl$OFFICIAL_COVER_VIRTUAL_PATH?titleNo=$key&coverRev=$OFFICIAL_COVER_VIRTUAL_REV"
     }
 
     private fun executeOfficialCoverVirtualRequest(request: Request, chain: Interceptor.Chain): Response {
@@ -2644,8 +2644,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .ifBlank { officialCoverDetailUrlForTitleNo(titleNo) }
             .ifBlank { titleNo.takeIf { it.isNotBlank() }?.let { "$baseUrl/episodeList?titleNo=$it" }.orEmpty() }
         dlog(
-            "officialCoverVirtualRequestStart titleNo=$titleNo virtualUrl=${request.url} " +
-                "detailUrl=$detailUrl thread=${Thread.currentThread().name} marketingRequests=0"
+            "officialCoverVirtualRequestStart titleNo=$titleNo coverRev=${request.url.queryParameter("coverRev").orEmpty()} " +
+                "virtualUrl=${request.url} detailUrl=$detailUrl " +
+                "thread=${Thread.currentThread().name} marketingRequests=0"
         )
         val cachedDetailCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
         val trustedRuntimeCover = if (cachedDetailCover.isBlank()) trustedRuntimeOfficialCoverForTitleNo(titleNo) else ""
@@ -2904,7 +2905,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "officialCoverDirectDemandPlan titleNos=${targets.joinToString("|") { it.titleNo }} " +
                 "alreadyReady=$alreadyReady trustedReady=$trustedReady " +
                 "virtualTargets=$virtualTargets virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
-                "scheduled=0 crossTitleQueue=false wait=0ms mode=direct-demand-no-queue marketingRequests=0"
+                "scheduled=0 crossTitleQueue=false wait=0ms mode=direct-demand-no-queue " +
+                "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -4028,6 +4030,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
+        private const val OFFICIAL_COVER_VIRTUAL_REV = "98_2"
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
