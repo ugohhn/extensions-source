@@ -1262,8 +1262,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
-    // v99：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
-    // 实验性增加进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘。
+    // v99.1：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
+    // 进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘；取消/Socket closed 不写失败态。
     private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
@@ -1279,6 +1279,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         @Volatile
         var coverUrl: String = ""
+
+        @Volatile
+        var failureSource: String = ""
 
         @Volatile
         var running: Boolean = false
@@ -2618,6 +2621,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val source: String,
     )
 
+    private fun isTransientOfficialCoverException(e: Exception): Boolean {
+        if (e is InterruptedIOException) return true
+        val message = e.message.orEmpty()
+        return message.equals("Canceled", ignoreCase = true) ||
+            message.equals("Socket closed", ignoreCase = true)
+    }
+
+    private fun isTransientOfficialCoverFailureSource(source: String): Boolean {
+        return source == "virtual-detail-meta-canceled" || source == "hybrid-visible4-canceled"
+    }
+
     private fun trustedRuntimeOfficialCoverForTitleNo(titleNo: String?): String {
         val meta = getOfficialMangaMeta(titleNo) ?: return ""
         val cover = stripImageProcessParams(meta.thumbnailUrl)
@@ -2840,16 +2854,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 )
                 return OfficialCoverResolveResult(remembered, "virtual-direct-demand-join")
             }
+            val joinFailureSource = state.failureSource.ifBlank {
+                if (state.completed) "virtual-direct-demand-failed" else "virtual-direct-demand-pending"
+            }
             dlog(
                 "officialCoverVirtualResolveJoin titleNo=$key coverPresent=false " +
-                    "source=${if (state.completed) "virtual-direct-demand-failed" else "virtual-direct-demand-pending"} " +
+                    "source=$joinFailureSource " +
                     "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
                     "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms detailUrl=$detailUrl marketingRequests=0"
             )
-            return OfficialCoverResolveResult(
-                "",
-                if (state.completed) "virtual-direct-demand-failed" else "virtual-direct-demand-pending",
-            )
+            return OfficialCoverResolveResult("", joinFailureSource)
         }
 
         val state = stateToFetch ?: return verifiedDetailOfficialCoverForTitleNo(key)
@@ -2857,13 +2871,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.let { OfficialCoverResolveResult(it, "detail-official-runtime-cache") }
             ?: OfficialCoverResolveResult("", "direct-demand-not-started")
         val resolved = resolveOfficialCoverForVirtualRequest(key, detailUrl, chain, overallStartedAt)
+        val transientFailure = isTransientOfficialCoverFailureSource(resolved.source)
         synchronized(state) {
             state.coverUrl = resolved.coverUrl
-            state.failed = resolved.coverUrl.isBlank()
-            state.completed = true
+            state.failureSource = resolved.source.takeIf { resolved.coverUrl.isBlank() }.orEmpty()
+            state.failed = resolved.coverUrl.isBlank() && !transientFailure
+            state.completed = !transientFailure
             state.running = false
         }
         state.latch.countDown()
+        if (transientFailure) {
+            synchronized(officialNewWorkCoverFetchStates) {
+                if (officialNewWorkCoverFetchStates[key] === state) {
+                    officialNewWorkCoverFetchStates.remove(key)
+                }
+            }
+        }
         return if (resolved.coverUrl.isNotBlank()) {
             resolved.copy(source = "virtual-direct-demand")
         } else {
@@ -2902,12 +2925,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "virtual-detail-meta-fast" else scan.source)
             }
         } catch (e: Exception) {
-            wlog(
+            val source = if (isTransientOfficialCoverException(e)) "virtual-detail-meta-canceled" else "virtual-detail-meta-failed"
+            val message =
                 "officialCoverVirtualResolveFailed titleNo=$titleNo detailUrl=$detailUrl " +
-                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName}",
-                e,
-            )
-            OfficialCoverResolveResult("", "virtual-detail-meta-failed")
+                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName} source=$source"
+            if (source == "virtual-detail-meta-canceled") {
+                dlog(message)
+            } else {
+                wlog(message, e)
+            }
+            OfficialCoverResolveResult("", source)
         }
     }
 
@@ -2996,7 +3023,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "virtualTargets=${virtualTitleNos.size} virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
                 "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
                 "alreadyInflight=$alreadyInflight visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch " +
+                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch-stability " +
                 "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
         )
         return OfficialCoverWaitStats(
@@ -3014,13 +3041,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Thread {
             val startedAt = System.currentTimeMillis()
             val resolved = resolveOfficialCoverForHybridVisible4Prewarm(target.titleNo, target.detailUrl, startedAt)
+            val transientFailure = isTransientOfficialCoverFailureSource(resolved.source)
             synchronized(state) {
                 state.coverUrl = resolved.coverUrl
-                state.failed = resolved.coverUrl.isBlank()
-                state.completed = true
+                state.failureSource = resolved.source.takeIf { resolved.coverUrl.isBlank() }.orEmpty()
+                state.failed = resolved.coverUrl.isBlank() && !transientFailure
+                state.completed = !transientFailure
                 state.running = false
             }
             state.latch.countDown()
+            if (transientFailure) {
+                synchronized(officialNewWorkCoverFetchStates) {
+                    if (officialNewWorkCoverFetchStates[target.titleNo] === state) {
+                        officialNewWorkCoverFetchStates.remove(target.titleNo)
+                    }
+                }
+            }
             dlog(
                 "officialCoverHybridVisible4PrewarmDone titleNo=${target.titleNo} " +
                     "coverPresent=${resolved.coverUrl.isNotBlank()} source=${resolved.source} " +
@@ -3078,12 +3114,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "hybrid-visible4-prewarm" else scan.source)
             }
         } catch (e: Exception) {
-            wlog(
+            val source = if (isTransientOfficialCoverException(e)) "hybrid-visible4-canceled" else "hybrid-visible4-failed"
+            val message =
                 "officialCoverHybridVisible4ResolveFailed titleNo=$key detailUrl=$detailUrl " +
-                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName}",
-                e,
-            )
-            OfficialCoverResolveResult("", "hybrid-visible4-failed")
+                    "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName} source=$source"
+            if (source == "hybrid-visible4-canceled") {
+                dlog(message)
+            } else {
+                wlog(message, e)
+            }
+            OfficialCoverResolveResult("", source)
         }
     }
 
@@ -4393,7 +4433,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
-        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_bytes"
+        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_1_bytes"
         private const val OFFICIAL_COVER_BYTES_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES = 16
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
