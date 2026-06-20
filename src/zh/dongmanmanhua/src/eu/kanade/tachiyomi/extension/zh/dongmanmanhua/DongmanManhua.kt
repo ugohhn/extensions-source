@@ -43,6 +43,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
@@ -782,7 +783,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
-        val coverStats = hybridVisible4OfficialCoverStatsForPopular(elements)
+        val coverStats = hybridVisible8OfficialCoverStatsForPopular(elements)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -802,7 +803,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "coverPlanAlreadyReady=${coverStats.alreadyReady} " +
                 "coverPlanTrusted=${coverStats.trustedReady} " +
                 "coverPlanScheduled=${coverStats.scheduled} " +
-                "coverMode=virtual-official-loader-hybrid-visible4-bytes-prefetch-overall " +
+                "coverMode=virtual-official-loader-hybrid-visible8-bytes-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1262,9 +1263,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
-    // v99.2：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
+    // v99.3：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
     // 进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘；取消/Socket closed 不写失败态。
-    // 只对当前 visible4 做短暂 bytes-state grace，避免刚启动预取时虚拟请求立刻重复下载图片。
+    // 只对当前 visible8 做 bytes-state grace；前 4 优先，后 4 轻量尾随，观察整体封面速度。
     private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
@@ -1341,7 +1342,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
     private val officialCoverImageBytesCache = linkedMapOf<String, OfficialCoverImageBytesCacheEntry>()
     private val officialCoverImageBytesFetchStates = mutableMapOf<String, OfficialCoverImageBytesFetchState>()
-    private val officialCoverVisible4TitleNos = linkedSetOf<String>()
+    private val officialCoverBytesPrefetchSemaphore = Semaphore(OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM, true)
+    private val officialCoverVisible8TitleNos = linkedSetOf<String>()
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -2631,7 +2633,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun isTransientOfficialCoverFailureSource(source: String): Boolean {
-        return source == "virtual-detail-meta-canceled" || source == "hybrid-visible4-canceled"
+        return source == "virtual-detail-meta-canceled" || source == "hybrid-visible8-canceled"
     }
 
     private fun trustedRuntimeOfficialCoverForTitleNo(titleNo: String?): String {
@@ -2750,7 +2752,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             return bytesCacheResponse(request, cachedBytes)
         }
 
-        val bytesStateGraceMs = if (isCurrentVisible4OfficialCoverTarget(titleNo)) {
+        val bytesStateGraceMs = if (isCurrentVisible8OfficialCoverTarget(titleNo)) {
             OFFICIAL_COVER_BYTES_PREFETCH_STATE_GRACE_MS
         } else {
             0L
@@ -2982,11 +2984,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
-    private fun hybridVisible4OfficialCoverStatsForPopular(elements: List<Element>): OfficialCoverWaitStats {
+    private fun hybridVisible8OfficialCoverStatsForPopular(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT)
-        synchronized(officialCoverVisible4TitleNos) {
-            officialCoverVisible4TitleNos.clear()
-            officialCoverVisible4TitleNos.addAll(targets.map { it.titleNo.trim() }.filter { it.isNotBlank() })
+        synchronized(officialCoverVisible8TitleNos) {
+            officialCoverVisible8TitleNos.clear()
+            officialCoverVisible8TitleNos.addAll(targets.map { it.titleNo.trim() }.filter { it.isNotBlank() })
         }
         if (targets.isEmpty()) return OfficialCoverWaitStats()
 
@@ -2997,7 +2999,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val virtualTitleNos = mutableListOf<String>()
         val scheduledTitleNos = mutableListOf<String>()
 
-        targets.forEach { target ->
+        targets.forEachIndexed { rank, target ->
             val key = target.titleNo.trim()
             val detailUrl = rememberOfficialCoverDetailUrl(key, target.detailUrl)
             when {
@@ -3022,19 +3024,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     stateToFetch?.let { state ->
                         scheduled += 1
                         scheduledTitleNos += key
-                        scheduleHybridVisible4OfficialCoverPrewarm(target, state)
+                        scheduleHybridVisible8OfficialCoverPrewarm(target, state, rank)
                     }
                 }
             }
         }
 
         dlog(
-            "officialCoverHybridVisible4Plan titleNos=${targets.joinToString("|") { it.titleNo }} " +
+            "officialCoverHybridVisible8Plan titleNos=${targets.joinToString("|") { it.titleNo }} " +
                 "alreadyReady=$alreadyReady trustedReady=$trustedReady " +
                 "virtualTargets=${virtualTitleNos.size} virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
                 "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
                 "alreadyInflight=$alreadyInflight visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch-overall " +
+                "frontTargets=${targets.take(OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT).size} " +
+                "tailTargets=${(targets.size - OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT).coerceAtLeast(0)} " +
+                "bytesParallelism=$OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM " +
+                "crossTitleQueue=false wait=0ms mode=hybrid-visible8-bytes-prefetch " +
                 "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
         )
         return OfficialCoverWaitStats(
@@ -3045,13 +3050,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
-    private fun scheduleHybridVisible4OfficialCoverPrewarm(
+    private fun scheduleHybridVisible8OfficialCoverPrewarm(
         target: OfficialNewWorkCoverTarget,
         state: OfficialNewWorkCoverFetchState,
+        rank: Int,
     ) {
         Thread {
             val startedAt = System.currentTimeMillis()
-            val resolved = resolveOfficialCoverForHybridVisible4Prewarm(target.titleNo, target.detailUrl, startedAt)
+            if (rank >= OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT) {
+                runCatching { Thread.sleep(OFFICIAL_COVER_BYTES_VISIBLE8_TAIL_START_DELAY_MS) }
+            }
+            val resolved = resolveOfficialCoverForHybridVisible8Prewarm(target.titleNo, target.detailUrl, startedAt)
             val transientFailure = isTransientOfficialCoverFailureSource(resolved.source)
             synchronized(state) {
                 state.coverUrl = resolved.coverUrl
@@ -3069,7 +3078,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 }
             }
             dlog(
-                "officialCoverHybridVisible4PrewarmDone titleNo=${target.titleNo} " +
+                "officialCoverHybridVisible8PrewarmDone titleNo=${target.titleNo} rank=$rank " +
+                    "tier=${if (rank < OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT) "front" else "tail"} " +
                     "coverPresent=${resolved.coverUrl.isNotBlank()} source=${resolved.source} " +
                     "elapsed=${System.currentTimeMillis() - startedAt}ms " +
                     "detailUrl=${target.detailUrl} bytesPrefetch=${resolved.coverUrl.isNotBlank()} marketingRequests=0"
@@ -3084,13 +3094,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 )
             }
         }.apply {
-            name = "DMH-cover-visible4-${target.titleNo}"
+            name = "DMH-cover-visible8-${rank}-${target.titleNo}"
             isDaemon = true
             start()
         }
     }
 
-    private fun resolveOfficialCoverForHybridVisible4Prewarm(
+    private fun resolveOfficialCoverForHybridVisible8Prewarm(
         titleNo: String,
         detailUrl: String,
         overallStartedAt: Long,
@@ -3114,7 +3124,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val scanEndedAt = System.currentTimeMillis()
                 val remembered = if (scan.coverUrl.isNotBlank()) rememberVerifiedDetailOfficialCover(key, scan.coverUrl) else ""
                 dlog(
-                    "officialCoverHybridVisible4Resolve titleNo=$key coverPresent=${remembered.isNotBlank()} " +
+                    "officialCoverHybridVisible8Resolve titleNo=$key coverPresent=${remembered.isNotBlank()} " +
                         "source=${scan.source} code=${response.code} requestedUrl=$detailUrl " +
                         "finalUrl=${response.request.url} ttfb=${responseAt - detailStartedAt}ms " +
                         "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - detailStartedAt}ms " +
@@ -3122,14 +3132,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         "earlyClose=${scan.earlyClose} fullJsoup=false cacheWrite=false " +
                         "directDetail=${!detailUrl.contains("/episodeList")} marketingRequests=0"
                 )
-                OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "hybrid-visible4-prewarm" else scan.source)
+                OfficialCoverResolveResult(remembered, if (remembered.isNotBlank()) "hybrid-visible8-prewarm" else scan.source)
             }
         } catch (e: Exception) {
-            val source = if (isTransientOfficialCoverException(e)) "hybrid-visible4-canceled" else "hybrid-visible4-failed"
+            val source = if (isTransientOfficialCoverException(e)) "hybrid-visible8-canceled" else "hybrid-visible8-failed"
             val message =
-                "officialCoverHybridVisible4ResolveFailed titleNo=$key detailUrl=$detailUrl " +
+                "officialCoverHybridVisible8ResolveFailed titleNo=$key detailUrl=$detailUrl " +
                     "elapsed=${System.currentTimeMillis() - overallStartedAt}ms error=${e.javaClass.simpleName} source=$source"
-            if (source == "hybrid-visible4-canceled") {
+            if (source == "hybrid-visible8-canceled") {
                 dlog(message)
             } else {
                 wlog(message, e)
@@ -3222,10 +3232,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .build()
     }
 
-    private fun isCurrentVisible4OfficialCoverTarget(titleNo: String): Boolean {
+    private fun isCurrentVisible8OfficialCoverTarget(titleNo: String): Boolean {
         val key = titleNo.trim()
         if (key.isBlank()) return false
-        return synchronized(officialCoverVisible4TitleNos) { key in officialCoverVisible4TitleNos }
+        return synchronized(officialCoverVisible8TitleNos) { key in officialCoverVisible8TitleNos }
     }
 
     private fun awaitOfficialCoverImageBytesIfInflight(
@@ -3307,7 +3317,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "officialCoverBytesPrefetchStart titleNo=$key source=$source " +
                 "imageUrl=$normalizedCoverUrl detailUrl=$detailUrl marketingRequests=0"
         )
+        var semaphoreAcquired = false
         try {
+            val queueStartedAt = System.currentTimeMillis()
+            officialCoverBytesPrefetchSemaphore.acquire()
+            semaphoreAcquired = true
+            val slotWaitMs = System.currentTimeMillis() - queueStartedAt
+            if (slotWaitMs > 0L) {
+                dlog(
+                    "officialCoverBytesPrefetchSlot titleNo=$key waited=${slotWaitMs}ms " +
+                        "parallelism=$OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM imageUrl=$normalizedCoverUrl marketingRequests=0"
+                )
+            }
             val imageHeaders = headersBuilder()
                 .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
                 .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
@@ -3342,6 +3363,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         } catch (e: Exception) {
             state.failed = true
+            if (e is InterruptedException) Thread.currentThread().interrupt()
             wlog(
                 "officialCoverBytesPrefetchFailed titleNo=$key " +
                     "imageElapsed=${System.currentTimeMillis() - startedAt}ms imageUrl=$normalizedCoverUrl " +
@@ -3349,6 +3371,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 e,
             )
         } finally {
+            if (semaphoreAcquired) officialCoverBytesPrefetchSemaphore.release()
             state.completed = true
             state.latch.countDown()
             synchronized(officialCoverImageBytesFetchStates) {
@@ -4465,7 +4488,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 8
+        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_BYTES_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_COVER_BYTES_VISIBLE8_TAIL_START_DELAY_MS = 250L
+        private const val OFFICIAL_COVER_BYTES_PREFETCH_PARALLELISM = 2
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
@@ -4474,7 +4500,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
-        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_2_bytes"
+        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_3_visible8_bytes"
         private const val OFFICIAL_COVER_BYTES_CACHE_TTL_MS = 10 * 60 * 1000L
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES = 16
         private const val OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
