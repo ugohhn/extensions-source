@@ -802,7 +802,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "coverPlanAlreadyReady=${coverStats.alreadyReady} " +
                 "coverPlanTrusted=${coverStats.trustedReady} " +
                 "coverPlanScheduled=${coverStats.scheduled} " +
-                "coverMode=virtual-official-loader-hybrid-visible4 " +
+                "coverMode=virtual-official-loader-hybrid-visible4-bytes-prefetch " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1262,8 +1262,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v94 允许首页新作受控轻量扫描详情页 meta 获取正式封面；不使用首页营销卡图、不写持久化封面缓存。
     private val verifiedDetailOfficialCoverByTitleNo = mutableMapOf<String, String>()
 
-    // v97：虚拟封面 URL 对外保持稳定，只带 titleNo。
-    // detailUrl 仅存在进程内，供虚拟加载器解析官方 cdn-sns 封面时使用；不写持久化、不缓存图片 bytes。
+    // v99：虚拟封面 URL 对外保持稳定版本号；detailUrl 只保留在进程内。
+    // 实验性增加进程内图片 bytes 预取/缓存；不写持久化、不代理到磁盘。
     private val officialCoverDetailUrlByTitleNo = mutableMapOf<String, String>()
 
     private class OfficialNewWorkCoverFetchState(
@@ -1282,6 +1282,30 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         @Volatile
         var running: Boolean = false
+
+        val latch = CountDownLatch(1)
+    }
+
+
+    private data class OfficialCoverImageBytesCacheEntry(
+        val titleNo: String,
+        val coverUrl: String,
+        val bytes: ByteArray,
+        val contentType: String,
+        val createdAt: Long = System.currentTimeMillis(),
+        val source: String,
+    )
+
+    private class OfficialCoverImageBytesFetchState(
+        val titleNo: String,
+        val coverUrl: String,
+        val createdAt: Long = System.currentTimeMillis(),
+    ) {
+        @Volatile
+        var completed: Boolean = false
+
+        @Volatile
+        var failed: Boolean = false
 
         val latch = CountDownLatch(1)
     }
@@ -1311,6 +1335,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     )
 
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
+    private val officialCoverImageBytesCache = linkedMapOf<String, OfficialCoverImageBytesCacheEntry>()
+    private val officialCoverImageBytesFetchStates = mutableMapOf<String, OfficialCoverImageBytesFetchState>()
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -2694,6 +2720,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .build()
         }
 
+        officialCoverImageBytesForTitleNo(titleNo, resolved.coverUrl)?.let { cachedBytes ->
+            dlog(
+                "officialCoverBytesCacheHit titleNo=$titleNo source=${resolved.source} " +
+                    "cacheSource=${cachedBytes.source} resolveMs=${System.currentTimeMillis() - startedAt}ms " +
+                    "bytes=${cachedBytes.bytes.size} imageUrl=${resolved.coverUrl} marketingRequests=0"
+            )
+            dlog(
+                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=bytes-cache-hit " +
+                    "imageCode=200 resolveMs=${System.currentTimeMillis() - startedAt}ms imageElapsed=0ms " +
+                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} bytes=${cachedBytes.bytes.size} marketingRequests=0"
+            )
+            return bytesCacheResponse(request, cachedBytes)
+        }
+
+        awaitOfficialCoverImageBytesIfInflight(titleNo, resolved.coverUrl, startedAt)?.let { prefetchedBytes ->
+            dlog(
+                "officialCoverBytesPrefetchJoinHit titleNo=$titleNo source=${resolved.source} " +
+                    "cacheSource=${prefetchedBytes.source} resolveMs=${System.currentTimeMillis() - startedAt}ms " +
+                    "bytes=${prefetchedBytes.bytes.size} imageUrl=${resolved.coverUrl} marketingRequests=0"
+            )
+            dlog(
+                "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=bytes-prefetch-join-hit " +
+                    "imageCode=200 resolveMs=${System.currentTimeMillis() - startedAt}ms imageElapsed=0ms " +
+                    "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} bytes=${prefetchedBytes.bytes.size} marketingRequests=0"
+            )
+            return bytesCacheResponse(request, prefetchedBytes)
+        }
+
         val imageStartedAt = System.currentTimeMillis()
         val imageHeaders = headersBuilder()
             .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
@@ -2703,23 +2757,34 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "officialCoverImageFetchStart titleNo=$titleNo source=${resolved.source} " +
                 "resolveMs=${imageStartedAt - startedAt}ms imageUrl=${resolved.coverUrl} " +
-                "referer=${detailUrl.ifBlank { "$baseUrl/" }} marketingRequests=0"
+                "referer=${detailUrl.ifBlank { "$baseUrl/" }} bytesCacheMiss=true marketingRequests=0"
         )
         return try {
             val imageResponse = chain.proceed(imageRequest)
+            val contentType = imageResponse.body.contentType()?.toString().orEmpty()
+            val imageBytes = imageResponse.body.bytes()
+            val cacheWrite = rememberOfficialCoverImageBytes(
+                titleNo = titleNo,
+                coverUrl = resolved.coverUrl,
+                bytes = imageBytes,
+                contentType = contentType,
+                source = "virtual-image-fetch",
+            )
             val imageElapsed = System.currentTimeMillis() - imageStartedAt
             dlog(
                 "officialCoverImageFetchDone titleNo=$titleNo imageCode=${imageResponse.code} " +
                     "imageElapsed=${imageElapsed}ms totalElapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "imageUrl=${resolved.coverUrl} marketingRequests=0"
+                    "imageUrl=${resolved.coverUrl} bytes=${imageBytes.size} cacheWrite=$cacheWrite marketingRequests=0"
             )
             dlog(
                 "officialCoverVirtualImage titleNo=$titleNo coverResolved=true source=${resolved.source} " +
                     "imageCode=${imageResponse.code} resolveMs=${imageStartedAt - startedAt}ms " +
-                    "imageElapsed=${imageElapsed}ms " +
+                    "imageElapsed=${imageElapsed}ms bytes=${imageBytes.size} cacheWrite=$cacheWrite " +
                     "virtualUrl=${request.url} finalCoverUrl=${resolved.coverUrl} marketingRequests=0"
             )
-            imageResponse
+            imageResponse.newBuilder()
+                .body(imageBytes.toResponseBody(contentType.ifBlank { "image/jpeg" }.toMediaType()))
+                .build()
         } catch (e: Exception) {
             wlog(
                 "officialCoverImageFetchFailed titleNo=$titleNo source=${resolved.source} " +
@@ -2931,7 +2996,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "virtualTargets=${virtualTitleNos.size} virtualTitleNos=${virtualTitleNos.joinToString("|")} " +
                 "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
                 "alreadyInflight=$alreadyInflight visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-prewarm " +
+                "backgroundTargets=0 crossTitleQueue=false wait=0ms mode=hybrid-visible4-bytes-prefetch " +
                 "coverRev=$OFFICIAL_COVER_VIRTUAL_REV marketingRequests=0"
         )
         return OfficialCoverWaitStats(
@@ -2960,8 +3025,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "officialCoverHybridVisible4PrewarmDone titleNo=${target.titleNo} " +
                     "coverPresent=${resolved.coverUrl.isNotBlank()} source=${resolved.source} " +
                     "elapsed=${System.currentTimeMillis() - startedAt}ms " +
-                    "detailUrl=${target.detailUrl} marketingRequests=0"
+                    "detailUrl=${target.detailUrl} bytesPrefetch=${resolved.coverUrl.isNotBlank()} marketingRequests=0"
             )
+            if (resolved.coverUrl.isNotBlank()) {
+                prefetchOfficialCoverImageBytes(
+                    titleNo = target.titleNo,
+                    coverUrl = resolved.coverUrl,
+                    detailUrl = target.detailUrl,
+                    source = resolved.source,
+                    overallStartedAt = startedAt,
+                )
+            }
         }.apply {
             name = "DMH-cover-visible4-${target.titleNo}"
             isDaemon = true
@@ -3010,6 +3084,197 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 e,
             )
             OfficialCoverResolveResult("", "hybrid-visible4-failed")
+        }
+    }
+
+
+    private fun officialCoverImageBytesCacheKey(titleNo: String, coverUrl: String): String {
+        return titleNo.trim() + "|" + coverUrl.trim()
+    }
+
+    private fun pruneOfficialCoverImageBytesCacheLocked(now: Long) {
+        val iterator = officialCoverImageBytesCache.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next().value
+            if (now - entry.createdAt > OFFICIAL_COVER_BYTES_CACHE_TTL_MS) {
+                iterator.remove()
+            }
+        }
+        while (officialCoverImageBytesCache.size > OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES) {
+            val firstKey = officialCoverImageBytesCache.keys.firstOrNull() ?: break
+            officialCoverImageBytesCache.remove(firstKey)
+        }
+        var totalBytes = officialCoverImageBytesCache.values.fold(0) { acc, entry -> acc + entry.bytes.size }
+        while (totalBytes > OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES && officialCoverImageBytesCache.isNotEmpty()) {
+            val firstKey = officialCoverImageBytesCache.keys.firstOrNull() ?: break
+            val removed = officialCoverImageBytesCache.remove(firstKey)
+            totalBytes -= removed?.bytes?.size ?: 0
+        }
+    }
+
+    private fun officialCoverImageBytesForTitleNo(titleNo: String, coverUrl: String): OfficialCoverImageBytesCacheEntry? {
+        val key = titleNo.trim()
+        val normalizedCoverUrl = coverUrl.trim()
+        if (key.isBlank() || normalizedCoverUrl.isBlank()) return null
+        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
+        val now = System.currentTimeMillis()
+        return synchronized(officialCoverImageBytesCache) {
+            pruneOfficialCoverImageBytesCacheLocked(now)
+            officialCoverImageBytesCache[cacheKey]
+        }
+    }
+
+    private fun rememberOfficialCoverImageBytes(
+        titleNo: String,
+        coverUrl: String,
+        bytes: ByteArray,
+        contentType: String,
+        source: String,
+    ): Boolean {
+        val key = titleNo.trim()
+        val normalizedCoverUrl = coverUrl.trim()
+        if (key.isBlank() || normalizedCoverUrl.isBlank() || bytes.isEmpty()) return false
+        if (bytes.size > OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES) {
+            dlog(
+                "officialCoverBytesCacheSkip titleNo=$key reason=too-large bytes=${bytes.size} " +
+                    "limit=$OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES imageUrl=$normalizedCoverUrl marketingRequests=0"
+            )
+            return false
+        }
+        val entry = OfficialCoverImageBytesCacheEntry(
+            titleNo = key,
+            coverUrl = normalizedCoverUrl,
+            bytes = bytes,
+            contentType = contentType.ifBlank { "image/jpeg" },
+            source = source,
+        )
+        synchronized(officialCoverImageBytesCache) {
+            officialCoverImageBytesCache[officialCoverImageBytesCacheKey(key, normalizedCoverUrl)] = entry
+            pruneOfficialCoverImageBytesCacheLocked(System.currentTimeMillis())
+        }
+        return true
+    }
+
+    private fun bytesCacheResponse(request: Request, entry: OfficialCoverImageBytesCacheEntry): Response {
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .headers(
+                Headers.Builder()
+                    .set("Content-Type", entry.contentType.ifBlank { "image/jpeg" })
+                    .set("X-DMH-Official-Cover-Bytes-Cache", "1")
+                    .build(),
+            )
+            .body(entry.bytes.toResponseBody(entry.contentType.ifBlank { "image/jpeg" }.toMediaType()))
+            .build()
+    }
+
+    private fun awaitOfficialCoverImageBytesIfInflight(
+        titleNo: String,
+        coverUrl: String,
+        overallStartedAt: Long,
+    ): OfficialCoverImageBytesCacheEntry? {
+        val key = titleNo.trim()
+        val normalizedCoverUrl = coverUrl.trim()
+        if (key.isBlank() || normalizedCoverUrl.isBlank()) return null
+        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
+        val state = synchronized(officialCoverImageBytesFetchStates) {
+            officialCoverImageBytesFetchStates[cacheKey]
+        } ?: return null
+        val waitStartedAt = System.currentTimeMillis()
+        if (!state.completed) {
+            runCatching { state.latch.await(OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS, TimeUnit.MILLISECONDS) }
+        }
+        val waitedMs = System.currentTimeMillis() - waitStartedAt
+        val cached = officialCoverImageBytesForTitleNo(key, normalizedCoverUrl)
+        dlog(
+            "officialCoverBytesPrefetchJoin titleNo=$key hit=${cached != null} " +
+                "completed=${state.completed} failed=${state.failed} waited=${waitedMs}ms " +
+                "overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
+        )
+        return cached
+    }
+
+    private fun prefetchOfficialCoverImageBytes(
+        titleNo: String,
+        coverUrl: String,
+        detailUrl: String,
+        source: String,
+        overallStartedAt: Long,
+    ) {
+        val key = titleNo.trim()
+        val normalizedCoverUrl = coverUrl.trim()
+        if (key.isBlank() || normalizedCoverUrl.isBlank()) return
+        if (officialCoverImageBytesForTitleNo(key, normalizedCoverUrl) != null) {
+            dlog(
+                "officialCoverBytesPrefetchSkip titleNo=$key reason=cache-hit imageUrl=$normalizedCoverUrl marketingRequests=0"
+            )
+            return
+        }
+        val cacheKey = officialCoverImageBytesCacheKey(key, normalizedCoverUrl)
+        val state = synchronized(officialCoverImageBytesFetchStates) {
+            val existing = officialCoverImageBytesFetchStates[cacheKey]
+            if (existing != null && !existing.completed) {
+                return
+            }
+            OfficialCoverImageBytesFetchState(key, normalizedCoverUrl).also { officialCoverImageBytesFetchStates[cacheKey] = it }
+        }
+        val startedAt = System.currentTimeMillis()
+        dlog(
+            "officialCoverBytesPrefetchStart titleNo=$key source=$source " +
+                "imageUrl=$normalizedCoverUrl detailUrl=$detailUrl marketingRequests=0"
+        )
+        try {
+            val imageHeaders = headersBuilder()
+                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .set("Referer", detailUrl.ifBlank { "$baseUrl/" })
+                .build()
+            val imageRequest = GET(normalizedCoverUrl, imageHeaders)
+            client.newCall(imageRequest).execute().use { response ->
+                val contentLength = response.body.contentLength()
+                if (contentLength > OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES) {
+                    state.failed = true
+                    dlog(
+                        "officialCoverBytesPrefetchSkip titleNo=$key reason=too-large-content-length " +
+                            "contentLength=$contentLength limit=$OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES " +
+                            "elapsed=${System.currentTimeMillis() - startedAt}ms imageUrl=$normalizedCoverUrl marketingRequests=0"
+                    )
+                    return@use
+                }
+                val contentType = response.body.contentType()?.toString().orEmpty()
+                val bytes = response.body.bytes()
+                val cacheWrite = response.isSuccessful && rememberOfficialCoverImageBytes(
+                    titleNo = key,
+                    coverUrl = normalizedCoverUrl,
+                    bytes = bytes,
+                    contentType = contentType,
+                    source = "bytes-prefetch",
+                )
+                state.failed = !cacheWrite
+                dlog(
+                    "officialCoverBytesPrefetchDone titleNo=$key imageCode=${response.code} " +
+                        "imageElapsed=${System.currentTimeMillis() - startedAt}ms overallElapsed=${System.currentTimeMillis() - overallStartedAt}ms " +
+                        "bytes=${bytes.size} cacheWrite=$cacheWrite imageUrl=$normalizedCoverUrl marketingRequests=0"
+                )
+            }
+        } catch (e: Exception) {
+            state.failed = true
+            wlog(
+                "officialCoverBytesPrefetchFailed titleNo=$key " +
+                    "imageElapsed=${System.currentTimeMillis() - startedAt}ms imageUrl=$normalizedCoverUrl " +
+                    "error=${e.javaClass.simpleName}",
+                e,
+            )
+        } finally {
+            state.completed = true
+            state.latch.countDown()
+            synchronized(officialCoverImageBytesFetchStates) {
+                if (officialCoverImageBytesFetchStates[cacheKey] === state) {
+                    officialCoverImageBytesFetchStates.remove(cacheKey)
+                }
+            }
         }
     }
 
@@ -4128,7 +4393,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
         private const val OFFICIAL_COVER_VIRTUAL_PATH = "/__mihon_official_cover"
-        private const val OFFICIAL_COVER_VIRTUAL_REV = "98_3"
+        private const val OFFICIAL_COVER_VIRTUAL_REV = "99_bytes"
+        private const val OFFICIAL_COVER_BYTES_CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_ENTRIES = 16
+        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+        private const val OFFICIAL_COVER_BYTES_CACHE_MAX_SINGLE_BYTES = 1024 * 1024
+        private const val OFFICIAL_COVER_BYTES_PREFETCH_JOIN_WAIT_MS = 900L
         private const val NEW_PROBE_LOG_LIMIT = 5
         private const val VERBOSE_LIST_LOG = false
         private const val DEBUG_POPULAR_MODULE_LOG = false
