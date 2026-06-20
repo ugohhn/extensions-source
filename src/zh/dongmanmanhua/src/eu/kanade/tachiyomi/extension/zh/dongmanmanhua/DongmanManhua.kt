@@ -2872,7 +2872,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "demandParallelism=$OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM " +
                 "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM " +
                 "totalParallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
-                "mode=demand-first-virtual-prefetch wait=0ms marketingRequests=0"
+                "mode=demand4-prefetch1-virtual-prefetch wait=0ms marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -4168,8 +4168,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 5
-        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 3
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 2
+        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 1
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
         private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
