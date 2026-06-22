@@ -3999,12 +3999,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun buildThumbnailUrl(rawUrl: String, base: String = cdnBase): String {
         val url = stripImageProcessParams(rawUrl.trim())
-        return when {
+        val built = when {
             url.isBlank() -> ""
             url.startsWith("http://") || url.startsWith("https://") -> url
             url.startsWith("//") -> "https:$url"
             url.startsWith("/") -> "$base$url"
             else -> "$base/$url"
+        }
+        return normalizeOfficialCdnThumbnailUrl(built)
+    }
+
+    private fun normalizeOfficialCdnThumbnailUrl(url: String): String {
+        val normalized = stripImageProcessParams(url.trim())
+        if (normalized.isBlank()) return ""
+        return when {
+            normalized.startsWith("https://cdn.dongmanmanhua.cn/") -> {
+                "http://cdn-sns.dongmanmanhua.cn/" + normalized.removePrefix("https://cdn.dongmanmanhua.cn/")
+            }
+            normalized.startsWith("http://cdn.dongmanmanhua.cn/") -> {
+                "http://cdn-sns.dongmanmanhua.cn/" + normalized.removePrefix("http://cdn.dongmanmanhua.cn/")
+            }
+            else -> normalized
         }
     }
 
@@ -4026,14 +4041,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?.ifEmpty { img.attr("src") }
             ?: ""
         if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) {
-            return buildThumbnailUrl(rawUrl, cdnBase)
+            val thumbnail = buildThumbnailUrl(rawUrl, cdnBase)
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && rawUrl.contains("cdn.dongmanmanhua.cn")) {
+                dlog(
+                    "thumbnailCdnSnsNormalize origin=$origin titleNo=${titleNo.orEmpty()} " +
+                        "raw=$rawUrl final=$thumbnail"
+                )
+            }
+            return thumbnail
         }
 
         val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
         val match = Regex("""url\(['"]?([^)'"]+)['"]?\)""").find(style)
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
         return if (styleUrl.isNotBlank() && !styleUrl.contains("/banner/")) {
-            buildThumbnailUrl(styleUrl, cdnBase)
+            val thumbnail = buildThumbnailUrl(styleUrl, cdnBase)
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && styleUrl.contains("cdn.dongmanmanhua.cn")) {
+                dlog(
+                    "thumbnailCdnSnsNormalize origin=$origin titleNo=${titleNo.orEmpty()} " +
+                        "raw=$styleUrl final=$thumbnail"
+                )
+            }
+            thumbnail
         } else {
             ""
         }
