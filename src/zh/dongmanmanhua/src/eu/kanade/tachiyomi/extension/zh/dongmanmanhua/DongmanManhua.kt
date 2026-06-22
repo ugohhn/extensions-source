@@ -2115,12 +2115,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (verifiedDetailThumbnail.isNotBlank()) {
                 val finalDetailThumbnail = rememberVerifiedDetailOfficialCover(titleNo, verifiedDetailThumbnail)
                     .ifBlank { verifiedDetailThumbnail }
-                thumbnail_url = finalDetailThumbnail
+                val detailThumbnailForUi = detailCoverCacheKeyUrl(finalDetailThumbnail)
+                thumbnail_url = detailThumbnailForUi
                 rememberOfficialMangaMeta(titleNo, title, finalDetailThumbnail, "detail")
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
-                        "finalThumbnailApplied=true thumbnailUrl=$finalDetailThumbnail"
+                        "finalThumbnailApplied=true detailCacheKeyApplied=${detailThumbnailForUi != finalDetailThumbnail} " +
+                        "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$finalDetailThumbnail"
                 )
             } else {
                 dlog(
@@ -3291,6 +3293,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             verifiedDetailOfficialCoverByTitleNo[key] = normalized
         }
         return normalized
+    }
+
+    private fun detailCoverCacheKeyUrl(thumbnailUrl: String): String {
+        val normalized = stripImageProcessParams(thumbnailUrl.trim())
+        if (normalized.isBlank()) return ""
+        if (normalized.contains("mihon_detail_cover=1")) return normalized
+        val separator = if (normalized.contains("?")) "&" else "?"
+        return normalized + separator + "mihon_detail_cover=1"
     }
 
     private fun verifiedDetailOfficialCoverForTitleNo(titleNo: String?): String {
