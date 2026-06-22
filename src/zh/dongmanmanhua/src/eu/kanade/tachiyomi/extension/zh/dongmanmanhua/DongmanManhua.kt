@@ -2113,16 +2113,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             artist = author
             val verifiedDetailThumbnail = verifiedDetailOfficialCoverFromDocument(document)
             if (verifiedDetailThumbnail.isNotBlank()) {
-                thumbnail_url = verifiedDetailThumbnail
-                rememberVerifiedDetailOfficialCover(titleNo, verifiedDetailThumbnail)
+                val finalDetailThumbnail = rememberVerifiedDetailOfficialCover(titleNo, verifiedDetailThumbnail)
+                    .ifBlank { verifiedDetailThumbnail }
+                thumbnail_url = finalDetailThumbnail
+                rememberOfficialMangaMeta(titleNo, title, finalDetailThumbnail, "detail")
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
-                        "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true"
+                        "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
+                        "finalThumbnailApplied=true thumbnailUrl=$finalDetailThumbnail"
                 )
             } else {
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
-                        "coverPresent=false source=unverified runtimeOnly=true"
+                        "coverPresent=false source=unverified runtimeOnly=true finalThumbnailApplied=false"
                 )
             }
             val genreBase = detailDiv?.selectFirst("p.genre")?.text() ?: ""
@@ -2459,7 +2462,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun mangaFromCachedItem(item: CachedMangaItem): SManga = SManga.create().apply {
         url = item.url
         title = item.title
-        thumbnail_url = item.thumbnailUrl
+        val detailOfficialCover = verifiedDetailOfficialCoverForTitleNo(item.titleNo)
+        val selectedThumbnail = detailOfficialCover.ifBlank { item.thumbnailUrl }
+        thumbnail_url = selectedThumbnail
+        if (detailOfficialCover.isNotBlank() && detailOfficialCover != item.thumbnailUrl) {
+            dlog(
+                "cachedPageDetailCoverOverride titleNo=${item.titleNo.orEmpty()} " +
+                    "title=$title oldThumbnail=${item.thumbnailUrl} finalThumbnail=$detailOfficialCover"
+            )
+        }
         logIdentityProbe("cached-page", item.titleNo, title, "", "", url)
     }
 
