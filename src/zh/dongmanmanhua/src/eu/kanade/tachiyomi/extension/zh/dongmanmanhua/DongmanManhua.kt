@@ -711,7 +711,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         .addInterceptor { chain ->
             val request = chain.request()
             val listKey = listInflightCoalesceKey(request)
-            if (listKey != null && getListInflightCoalesceEnable()) {
+            val inflightEnabled = getListInflightCoalesceEnable()
+            val refreshAction = when {
+                listKey == null -> "notEligible"
+                !inflightEnabled -> "disabled"
+                else -> "eligible"
+            }
+            logRefreshModeProbe(request, listKey, inflightEnabled, refreshAction)
+            if (listKey != null && inflightEnabled) {
                 executeListRequestWithInflightCoalesce(listKey, request, chain)
             } else {
                 chain.proceed(request)
@@ -807,6 +814,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
+        logCleanAuditSummary("popular", entries)
         return MangasPage(entries, false)
     }
 
@@ -1198,6 +1206,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "cacheWrite=true detailSnapshot=true source=new-page-official-cover " +
                     "mainpathOfficialDetailRequests=0 marketingRequests=0"
             )
+            logCleanAuditSummary("new-page", entries)
             return MangasPage(entries, false)
         }
 
@@ -1220,6 +1229,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private var identityProbeConflictLogCount = 0
     private var identityFallbackEpisodeLogCount = 0
     private var identityReuseCanonicalLogCount = 0
+    private var cleanAuditDirtyLogCount = 0
 
     private data class DetailHtmlCache(
         val titleNo: String,
@@ -1441,6 +1451,103 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun dlog(message: String) = Log.d(TAG, message)
     private fun wlog(message: String, throwable: Throwable? = null) = Log.w(TAG, message, throwable)
 
+    private fun refreshProbeType(request: Request): String {
+        val url = request.url
+        val path = url.encodedPath
+        return when {
+            path == "/" && url.queryParameter("pageName") == "home" -> "popular"
+            path == "/dailySchedule" || path == "/new" -> "latest"
+            path == LOCAL_GENRE_CACHE_PATH -> "filter-local-genre"
+            path == LOCAL_UPDATE_CACHE_PATH -> "filter-local-update"
+            path == "/search" || path == "/searchResult" -> "search"
+            path == "/recent/more" || path == "/episode/unlock/titleList" -> "my-manga"
+            path.contains("/list") -> "detail-or-list"
+            else -> "other"
+        }
+    }
+
+    private fun logRefreshModeProbe(
+        request: Request,
+        listKey: String?,
+        inflightEnabled: Boolean,
+        action: String,
+    ) {
+        val url = request.url
+        val path = url.encodedPath
+        val type = refreshProbeType(request)
+        if (type == "other" || type == "detail-or-list") return
+        val page = url.queryParameter("mihonPage")
+            ?: url.queryParameter("mihonLatestPage")
+            ?: url.queryParameter("page")
+            ?: "1"
+        val source = when (path) {
+            LOCAL_GENRE_CACHE_PATH, LOCAL_UPDATE_CACHE_PATH -> "localSynthetic"
+            else -> "networkCandidate"
+        }
+        dlog(
+            "refreshModeProbe type=$type method=${request.method} page=$page path=$path " +
+                "source=$source inflightEnabled=$inflightEnabled inflightEligible=${listKey != null} " +
+                "inflightAction=$action key=${listKey.orEmpty()} url=$url"
+        )
+    }
+
+    private fun cleanAuditDirtyStoredUrl(storedUrl: String): Boolean {
+        return storedUrl.contains("source=") ||
+            storedUrl.contains("pageModel=") ||
+            storedUrl.contains("mihonLatest=") ||
+            storedUrl.contains("mihonLatestPage=") ||
+            storedUrl.contains("mihonPage=") ||
+            storedUrl.contains("__dongman_cache__")
+    }
+
+    private fun cleanAuditPlaceholderTitle(title: String): Boolean {
+        return Regex("""^作品\d+""").containsMatchIn(title.trim())
+    }
+
+    private fun logCleanAuditSummary(origin: String, entries: List<SManga>) {
+        if (entries.isEmpty()) {
+            dlog("cleanAuditSummary origin=$origin entries=0")
+            return
+        }
+        var storedEpisode = 0
+        var dirtyStoredUrl = 0
+        var ossParam = 0
+        var listDetailCoverKey = 0
+        var emptyTitle = 0
+        var placeholderTitle = 0
+        entries.forEach { manga ->
+            val storedUrl = normalizeMangaPath(manga.url)
+            val thumbnail = manga.thumbnail_url.orEmpty()
+            val isStoredEpisode = storedUrl.startsWith("/episodeList")
+            val isDirtyStoredUrl = cleanAuditDirtyStoredUrl(storedUrl)
+            val hasOssParam = thumbnail.contains("x-oss-process")
+            val hasListDetailCoverKey = thumbnail.contains("mihon_detail_cover=1")
+            val hasEmptyTitle = manga.title.isBlank()
+            val hasPlaceholderTitle = cleanAuditPlaceholderTitle(manga.title)
+            if (isStoredEpisode) storedEpisode += 1
+            if (isDirtyStoredUrl) dirtyStoredUrl += 1
+            if (hasOssParam) ossParam += 1
+            if (hasListDetailCoverKey) listDetailCoverKey += 1
+            if (hasEmptyTitle) emptyTitle += 1
+            if (hasPlaceholderTitle) placeholderTitle += 1
+            val dirty = isStoredEpisode || isDirtyStoredUrl || hasOssParam || hasListDetailCoverKey || hasEmptyTitle || hasPlaceholderTitle
+            if (dirty && cleanAuditDirtyLogCount < CLEAN_AUDIT_DIRTY_LOG_LIMIT) {
+                cleanAuditDirtyLogCount += 1
+                dlog(
+                    "cleanAuditDirty origin=$origin title=${manga.title} storedUrl=$storedUrl " +
+                        "storedEpisode=$isStoredEpisode dirtyStoredUrl=$isDirtyStoredUrl " +
+                        "ossParam=$hasOssParam listDetailCoverKey=$hasListDetailCoverKey " +
+                        "emptyTitle=$hasEmptyTitle placeholderTitle=$hasPlaceholderTitle thumbnail=$thumbnail"
+                )
+            }
+        }
+        dlog(
+            "cleanAuditSummary origin=$origin entries=${entries.size} storedEpisode=$storedEpisode " +
+                "dirtyStoredUrl=$dirtyStoredUrl ossParam=$ossParam listDetailCoverKey=$listDetailCoverKey " +
+                "emptyTitle=$emptyTitle placeholderTitle=$placeholderTitle"
+        )
+    }
+
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     private fun getListInflightCoalesceEnable(): Boolean = preferences.getBoolean(PREF_LIST_INFLIGHT_COALESCE, false)
@@ -1643,6 +1750,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "myMangaState=$myMangaState/${previous?.myMangaState ?: -1} myManga=$myMangaName/$myMangaValue " +
                     "url=${request.url}"
             )
+            dlog(
+                "refreshModeProbe type=filter branch=$branch activeGroup=$activeGroup page=$page " +
+                    "source=${if (request.url.encodedPath == LOCAL_GENRE_CACHE_PATH || request.url.encodedPath == LOCAL_UPDATE_CACHE_PATH) "localSynthetic" else "networkCandidate"} " +
+                    "inflightEnabled=${getListInflightCoalesceEnable()} url=${request.url}"
+            )
             return request
         }
 
@@ -1661,7 +1773,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 .set("Referer", "$baseUrl/search")
                 .set("Content-Type", "application/x-www-form-urlencoded")
                 .build()
-            return POST("$baseUrl/search", headers, body)
+            val request = POST("$baseUrl/search", headers, body)
+            dlog("refreshModeProbe type=search mode=mixed-initial page=$page source=networkCandidate inflightEnabled=${getListInflightCoalesceEnable()} url=${request.url}")
+            return request
         }
         val start = if (isMixedMode()) nextStartMap[query] ?: (1 + (page - 1) * 20) else 1 + (page - 1) * 20
         val body = FormBody.Builder().add("keyword", query).add("searchType", "WEBTOON").add("start", start.toString()).build()
@@ -1671,7 +1785,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .set("Content-Type", "application/x-www-form-urlencoded")
             .set("X-Requested-With", "XMLHttpRequest")
             .build()
-        return POST("$baseUrl/searchResult", headers, body)
+        val request = POST("$baseUrl/searchResult", headers, body)
+        dlog("refreshModeProbe type=search mode=json page=$page start=$start source=networkCandidate inflightEnabled=${getListInflightCoalesceEnable()} url=${request.url}")
+        return request
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -1720,6 +1836,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "parseRecentMangaPage url=${response.request.url} " +
                 "candidates=${candidates.size} realItems=${realItems.size} entries=${entries.size}"
         )
+        logCleanAuditSummary("recent", entries)
         return MangasPage(entries, false)
     }
 
@@ -1736,7 +1853,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val manga = mangaFromJsonTitle(item)
             if (manga.title.isNotEmpty()) entries.add(manga)
         }
-        return MangasPage(entries.distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }, false)
+        val dedupedEntries = entries.distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
+        logCleanAuditSummary("purchased", dedupedEntries)
+        return MangasPage(dedupedEntries, false)
     }
 
     private fun parseDailyScheduleHtml(response: Response): MangasPage {
@@ -1805,6 +1924,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "combinedLatest=$latestCombined page=$latestPage start=$startIndex raw=${pageItems.size} entries=${entries.size} " +
                 "newCount=$newCount hasNextPage=$hasNextPage cacheWrite=true onePageLatest=$latestCombined"
         )
+        logCleanAuditSummary("dailySchedule", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -1958,6 +2078,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "cacheWrite=$shouldClientPaginate cacheKey=$cacheKey total=$totalSize " +
                 "page=$page pageSize=$GENRE_PAGE_SIZE entries=${entries.size} hasNextPage=$hasNextPage"
         )
+        logCleanAuditSummary("manga-list", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -1976,6 +2097,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "parseCachedGenrePage genre=$genre page=$page cacheHit=true " +
                 "total=${cache.items.size} entries=${entries.size} hasNextPage=$hasNextPage"
         )
+        logCleanAuditSummary("cache-genre", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -2001,6 +2123,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "parseCachedUpdatePage key=$key weekday=$weekday sort=$sort page=$page cacheHit=true " +
                 "total=${cache.items.size} entries=${entries.size} hasNextPage=$hasNextPage"
         )
+        logCleanAuditSummary("cache-update", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -2018,6 +2141,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val keyword = extractKeywordFromBody(response.request.body)
             if (keyword.isNotEmpty()) nextStartMap[keyword] = totalEntries + 1
         }
+        logCleanAuditSummary("search-html", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -2074,6 +2198,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val keyword = extractKeywordFromBody(response.request.body)
             if (keyword.isNotEmpty()) nextStartMap[keyword] = start + rawCount
         }
+        logCleanAuditSummary("search-json", entries)
         return MangasPage(entries, hasNextPage)
     }
 
@@ -2089,6 +2214,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "mangaDetailsRequest title=${manga.title} manga.url=${manga.url} " +
                 "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
+        )
+        dlog(
+            "detailHealthProbe requestType=details title=${manga.title} storedUrl=${normalizeMangaPath(manga.url)} " +
+                "storedEpisode=${normalizeMangaPath(manga.url).startsWith("/episodeList")} requestPath=$requestPath finalUrl=$finalUrl"
         )
         return GET(finalUrl, reqHeaders)
     }
@@ -2152,6 +2281,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "genreBase=$genreBase updateTag=$updateTag newTag=$newTag genre=$genre status=$status " +
                     "networkMs=$networkMs parseMs=${System.currentTimeMillis() - parseStartedAt}"
             )
+            dlog(
+                "detailHealthProbe parse titleNo=${titleNo.orEmpty()} title=$title " +
+                    "authorEmpty=${author.isNullOrBlank()} descEmpty=${description.isNullOrBlank()} " +
+                    "genreEmpty=${genre.isNullOrBlank()} status=$status thumbnail=${thumbnail_url.orEmpty()} " +
+                    "networkMs=$networkMs parseMs=${System.currentTimeMillis() - parseStartedAt}"
+            )
         }
     }
 
@@ -2169,6 +2304,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "chapterListRequest title=${manga.title} manga.url=${manga.url} " +
                 "cleanPath=$cleanPath requestPath=$requestPath finalUrl=$finalUrl"
+        )
+        dlog(
+            "detailHealthProbe requestType=chapters title=${manga.title} storedUrl=${normalizeMangaPath(manga.url)} " +
+                "storedEpisode=${normalizeMangaPath(manga.url).startsWith("/episodeList")} requestPath=$requestPath finalUrl=$finalUrl"
         )
         return GET(finalUrl, reqHeaders)
     }
@@ -2212,6 +2351,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         val result = chapters.reversed()
         dlog("chapterListParse url=${response.request.url} chapters=${result.size}")
+        dlog("detailHealthProbe chapters url=${response.request.url} chapters=${result.size}")
         return result
     }
 
@@ -3444,9 +3584,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 isOwner = true
             }
         }
+        dlog(
+            "listInflightProbe action=${if (isOwner) "owner" else "join"} key=$key " +
+                "age=${System.currentTimeMillis() - state.createdAt}ms url=${request.url}"
+        )
 
         if (!isOwner) {
             val startedAt = System.currentTimeMillis()
+            dlog("listInflightProbe action=wait key=$key age=${System.currentTimeMillis() - state.createdAt}ms url=${request.url}")
             val finished = runCatching {
                 state.latch.await(listInflightWaitMs, TimeUnit.MILLISECONDS)
             }.getOrDefault(false)
@@ -3465,6 +3610,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var ownerFailed = false
         try {
+            dlog("listInflightProbe action=ownerNetwork key=$key url=${request.url}")
             val response = chain.proceed(request)
             val contentType = response.body.contentType()?.toString().orEmpty()
                 .ifBlank { response.header("Content-Type").orEmpty().ifBlank { "text/html;charset=UTF-8" } }
@@ -3569,6 +3715,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         if (!isOwner) {
             val startedAt = System.currentTimeMillis()
+            dlog("detailHealthProbe html action=wait titleNo=$titleNo url=${request.url}")
             val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
             if (cacheBeforeWait != null) {
                 dlog("detailHtmlCacheHit titleNo=$titleNo age=${System.currentTimeMillis() - cacheBeforeWait.createdAt}ms url=${request.url}")
@@ -3595,6 +3742,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         var ownerFailed = false
         try {
+            dlog("detailHealthProbe html action=owner titleNo=$titleNo url=${request.url}")
             val response = chain.proceed(request)
             val contentType = response.body.contentType()?.toString().orEmpty().ifBlank { "text/html;charset=UTF-8" }
             val bodyString = response.body.string()
@@ -4272,6 +4420,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val DEBUG_IDENTITY_REUSE_LOG = false
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
+        private const val CLEAN_AUDIT_DIRTY_LOG_LIMIT = 240
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
