@@ -475,7 +475,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
             summary = "%s"
-            entries = arrayOf("速度优先（当前模式）", "封面优先 / 一步到位（实验）")
+            entries = arrayOf("速度优先（当前模式）", "封面优先 / 一步到位（严格实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
@@ -1185,7 +1185,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
                     // 但 .new_works_items 的 thumbnail 是营销封面：这里不写入 cache，也不交给 UI。
                     // 速度优先：不做同步详情请求，只生成虚拟官方封面 URL；图片加载阶段再按现有 in-flight 逻辑解析官方封面。
-                    // 封面优先：本轮 parse 前已限时等待官方封面；拿不到再回退到虚拟官方封面。
+                    // 封面优先：本轮 parse 前严格等待官方封面；拿不到则不再回退虚拟官方封面，避免假“一步到位”。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
                     val trustedRuntimeOfficialCover = if (verifiedOfficialCover.isBlank()) {
@@ -1196,7 +1196,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     val virtualOfficialCover = if (
                         titleNo.isNotBlank() &&
                         verifiedOfficialCover.isBlank() &&
-                        trustedRuntimeOfficialCover.isBlank()
+                        trustedRuntimeOfficialCover.isBlank() &&
+                        allowVirtualOfficialCoverFallbackInList()
                     ) {
                         val detailUrl = officialNewWorkDetailUrlForElement(item, titleNo)
                         buildOfficialCoverVirtualUrl(titleNo, detailUrl)
@@ -1212,8 +1213,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                             "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
                             "officialThumbnailPresent=${officialThumbnail.isNotBlank()} " +
+                            "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
                             "coverMode=${getHomeCoverMode()} " +
-                            "mainpathOfficialDetailRequests=${if (isHomeCoverOfficialFirst()) "limited-wait" else "0"} marketingRequests=0"
+                            "mainpathOfficialDetailRequests=${if (isHomeCoverOfficialFirst()) "strict-wait" else "0"} marketingRequests=0"
                     )
                     cached.copy(thumbnailUrl = officialThumbnail, hasNew = true)
                 }
@@ -1584,6 +1586,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
+
+    // v100.6：严格“一步到位”模式下，不再把失败项回退为虚拟官方封面。
+    // 这样列表阶段不是官方 cdn-sns 就会明确暴露为空/缺失，避免继续制造“进详情才换封面”的假一步到位。
+    private fun allowVirtualOfficialCoverFallbackInList(): Boolean = !isHomeCoverOfficialFirst()
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
@@ -2802,7 +2808,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             ""
         }
-        val virtualOfficialCover = if (needsOfficialCoverFallback && verifiedOfficialCover.isBlank() && trustedRuntimeOfficialCover.isBlank()) {
+        val virtualOfficialCover = if (
+            needsOfficialCoverFallback &&
+            verifiedOfficialCover.isBlank() &&
+            trustedRuntimeOfficialCover.isBlank() &&
+            allowVirtualOfficialCoverFallbackInList()
+        ) {
             val detailUrl = titleNo?.let { officialNewWorkDetailUrlForElement(element, it) }.orEmpty()
             buildOfficialCoverVirtualUrl(titleNo, detailUrl)
         } else {
@@ -2846,6 +2857,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "titleValid=$titleValid marketingTitle=$parsedTitle " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                     "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
+                    "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
                     "marketingThumbnailSuppressed=true " +
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
@@ -2858,6 +2870,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "popularBannerOnlyOfficialCover titleNo=${titleNo.orEmpty()} origin=$origin title=$title " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                     "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
+                    "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
                     "bannerThumbnailSuppressed=true blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
@@ -3237,6 +3250,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
                 "scheduled=${states.size} success=$success missing=$missing waited=${System.currentTimeMillis() - waitStartedAt}ms " +
                 "awaitMs=$waitedMs waitLimitMs=$OFFICIAL_FIRST_COVER_WAIT_MS limit=$OFFICIAL_FIRST_COVER_LIMIT " +
+                "strictNoVirtualFallback=${isHomeCoverOfficialFirst()} " +
                 "marketingRequests=0"
         )
         return OfficialCoverWaitStats(
@@ -4643,16 +4657,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 5
-        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 13
+        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 12
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 1
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
         private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
-        private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 2_500L
-        private const val OFFICIAL_FIRST_COVER_LIMIT = 8
-        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_200L
+        private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 4_000L
+        private const val OFFICIAL_FIRST_COVER_LIMIT = 32
+        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 4_500L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
