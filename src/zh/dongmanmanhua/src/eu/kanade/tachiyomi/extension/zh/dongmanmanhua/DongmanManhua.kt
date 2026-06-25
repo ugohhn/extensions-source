@@ -477,7 +477,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             entries = arrayOf("速度优先（当前模式）", "封面优先 / 一步到位（严格实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
-            bindEntrySummary(HOME_COVER_MODE_FAST)
+            bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
 
         MultiSelectListPreference(ctx).apply {
@@ -524,6 +524,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun ListPreference.updateEntrySummary(selectedValue: String?) {
         val index = findIndexOfValue(selectedValue ?: value)
         summary = if (index >= 0) entries[index] else ""
+    }
+
+    private fun ListPreference.bindHomeCoverModeSummary(defaultValue: String) {
+        updateHomeCoverModeSummary(this@DongmanManhua.preferences.getString(key, defaultValue) ?: defaultValue)
+        setOnPreferenceChangeListener { preference, newValue ->
+            val oldMode = getHomeCoverMode()
+            val newMode = normalizeHomeCoverMode(newValue as? String)
+            (preference as? ListPreference)?.updateHomeCoverModeSummary(newMode)
+            if (oldMode != newMode) {
+                clearCoverModeSensitiveCaches("home-cover-mode-change:$oldMode->$newMode")
+            }
+            true
+        }
+    }
+
+    private fun ListPreference.updateHomeCoverModeSummary(selectedValue: String?) {
+        val normalized = normalizeHomeCoverMode(selectedValue)
+        val index = findIndexOfValue(normalized)
+        val current = if (index >= 0) entries[index] else ""
+        summary = "当前：$current\n切换后刷新首页生效"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1597,12 +1617,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun getListInflightCoalesceEnable(): Boolean = preferences.getBoolean(PREF_LIST_INFLIGHT_COALESCE, false)
 
-    private fun getHomeCoverMode(): String {
-        val value = preferences.getString(PREF_HOME_COVER_MODE, HOME_COVER_MODE_FAST) ?: HOME_COVER_MODE_FAST
+    private fun normalizeHomeCoverMode(value: String?): String {
         return when (value) {
             HOME_COVER_MODE_OFFICIAL_FIRST -> HOME_COVER_MODE_OFFICIAL_FIRST
             else -> HOME_COVER_MODE_FAST
         }
+    }
+
+    private fun getHomeCoverMode(): String {
+        val value = preferences.getString(PREF_HOME_COVER_MODE, HOME_COVER_MODE_FAST) ?: HOME_COVER_MODE_FAST
+        return normalizeHomeCoverMode(value)
     }
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
@@ -2604,13 +2628,35 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // 元素解析（依赖 HttpSource 的 setUrlWithoutDomain）
     // ══════════════════════════════════════════════════════════════════════
 
+    private fun clearCoverModeSensitiveCaches(reason: String) {
+        val updateSize = synchronized(updatePageCache) {
+            val size = updatePageCache.size
+            updatePageCache.clear()
+            size
+        }
+        val genreSize = synchronized(genrePageCache) {
+            val size = genrePageCache.size
+            genrePageCache.clear()
+            size
+        }
+        cachedLastFilterSnapshot = null
+        dlog("coverModeSensitiveCachesCleared reason=$reason updateCaches=$updateSize genreCaches=$genreSize")
+    }
+
     private fun updateCacheWeekday(weekday: String): String {
         return weekday.ifBlank { currentWeekdayCode() }
     }
 
+    private fun coverModeCachePrefix(): String = "coverMode=${getHomeCoverMode()}"
+
     private fun updateCacheKey(weekday: String, sort: String): String {
         val normalizedWeekday = updateCacheWeekday(weekday)
-        return if (normalizedWeekday == "NEW") "NEW" else "$normalizedWeekday|$sort"
+        val baseKey = if (normalizedWeekday == "NEW") "NEW" else "$normalizedWeekday|$sort"
+        return "${coverModeCachePrefix()}|$baseKey"
+    }
+
+    private fun genreCacheKey(genre: String): String {
+        return "${coverModeCachePrefix()}|${genre.ifBlank { "UNKNOWN" }}"
     }
 
     private fun getValidUpdatePageCache(key: String): UpdatePageCache? {
@@ -2641,13 +2687,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun getValidGenrePageCache(genre: String): GenrePageCache? {
         if (genre.isBlank()) return null
+        val key = genreCacheKey(genre)
         val now = System.currentTimeMillis()
         return synchronized(genrePageCache) {
-            val cache = genrePageCache[genre] ?: return@synchronized null
+            val cache = genrePageCache[key] ?: return@synchronized null
             if (now - cache.createdAt <= GENRE_PAGE_CACHE_TTL_MS) {
                 cache
             } else {
-                genrePageCache.remove(genre)
+                genrePageCache.remove(key)
                 null
             }
         }
@@ -2655,14 +2702,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun putGenrePageCache(genre: String, items: List<CachedMangaItem>) {
         if (genre.isBlank() || items.isEmpty()) return
+        val key = genreCacheKey(genre)
         synchronized(genrePageCache) {
-            genrePageCache[genre] = GenrePageCache(genre, System.currentTimeMillis(), items)
+            genrePageCache[key] = GenrePageCache(genre, System.currentTimeMillis(), items)
             while (genrePageCache.size > GENRE_PAGE_CACHE_MAX_ENTRIES) {
                 val firstKey = genrePageCache.keys.firstOrNull() ?: break
                 genrePageCache.remove(firstKey)
             }
         }
-        dlog("putGenrePageCache genre=$genre total=${items.size}")
+        dlog("putGenrePageCache genre=$genre key=$key total=${items.size}")
     }
 
     private fun putGenrePageCachesFromDocument(document: org.jsoup.nodes.Document, includeAll: Boolean) {
@@ -2707,7 +2755,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             getThemeFilter().forEach { tag ->
                 val genre = tag.value
                 if (genre.isBlank() || genre == "ALL") return@forEach
-                val items = genrePageCache[genre]?.items.orEmpty()
+                val items = genrePageCache[genreCacheKey(genre)]?.items.orEmpty()
                 if (items.isNotEmpty()) result.addAll(items)
             }
         }
