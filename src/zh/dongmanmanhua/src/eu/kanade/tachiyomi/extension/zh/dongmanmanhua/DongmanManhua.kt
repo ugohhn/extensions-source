@@ -1563,7 +1563,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val isStoredEpisode = storedUrl.startsWith("/episodeList")
             val isDirtyStoredUrl = cleanAuditDirtyStoredUrl(storedUrl)
             val hasOssParam = thumbnail.contains("x-oss-process")
-            val hasListDetailCoverKey = thumbnail.contains("mihon_detail_cover=1")
+            val hasListDetailCoverKey = thumbnail.contains("dongman_detail_cover=1")
             val listDetailCoverKeyAllowed = isHomeCoverOfficialFirst()
             val hasEmptyTitle = manga.title.isBlank()
             val hasPlaceholderTitle = cleanAuditPlaceholderTitle(manga.title)
@@ -2340,12 +2340,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> "virtual-to-detail-key"
                     beforeCanonicalEqual && !beforeHasDetailKey -> {
                         if (isHomeCoverOfficialFirst()) {
-                            "strict-missing-detail-key-upgrade"
+                            "strict-list-not-final-key"
                         } else {
                             "fast-detail-upgrade-once"
                         }
                     }
                     else -> "official-detail-key-applied"
+                }
+                if (isHomeCoverOfficialFirst() && beforeCanonicalEqual && !beforeHasDetailKey && afterHasDetailKey) {
+                    dlog(
+                        "officialFirstViolation titleNo=${titleNo.orEmpty()} reason=list-emitted-without-detail-key " +
+                            "before=$thumbnailBefore after=$detailThumbnailForUi canonical=$finalDetailThumbnail"
+                    )
                 }
                 thumbnail_url = detailThumbnailForUi
                 rememberOfficialMangaMeta(titleNo, title, finalDetailThumbnail, "detail")
@@ -2723,8 +2729,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: scEventParameterValue(element, "recommended_titleNo")
         val identityPath = canonicalMangaIdentityPath(rawUrl = href, titleNoHint = titleNo)
         val titleText = mangaTitleFromElement(element)
-        val thumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
-        rememberOfficialMangaMetaFromList(titleNo, titleText, thumbnailUrl, origin)
+        val rawThumbnailUrl = extractThumbnailUrl(element, origin, titleNo)
+        val thumbnailUrl = officialListThumbnailForUi(rawThumbnailUrl)
+        rememberOfficialMangaMetaFromList(titleNo, titleText, rawThumbnailUrl, origin)
         val hasNew = hasNewBadge(element)
         logIdentityProbe(origin, titleNo, titleText, rawHref, href, identityPath)
         return CachedMangaItem(
@@ -2743,7 +2750,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val selectedThumbnail = if (detailOfficialCover.isNotBlank()) {
             officialListThumbnailForUi(detailOfficialCover)
         } else {
-            item.thumbnailUrl
+            officialListThumbnailForUi(item.thumbnailUrl)
         }
         thumbnail_url = selectedThumbnail
         logCoverLifecycleListEmit(
@@ -2845,8 +2852,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val parsedTitle = mangaTitleFromElement(element)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
         // 新作卡的 style-background 是营销图：严格模式下不读取、不赋值、更不会交给图片加载器。
-        val parsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
-        val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, parsedThumbnail, isMarketingNewWork)
+        val rawParsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
+        val parsedThumbnail = officialListThumbnailForUi(rawParsedThumbnail)
+        val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, rawParsedThumbnail, isMarketingNewWork)
         val nativeEventTitle = if (isMarketingNewWork) {
             nativeEventTitleForMarketingNewWork(element, titleNo)
         } else {
@@ -2878,7 +2886,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val officialCoverMissing = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank()
 
         if (!needsOfficialCoverFallback) {
-            rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
+            rememberOfficialMangaMetaFromList(titleNo, parsedTitle, rawParsedThumbnail, origin)
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
@@ -2894,7 +2902,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             titleNo = titleNo,
             title = title,
             storedUrl = url,
-            rawThumbnail = parsedThumbnail,
+            rawThumbnail = rawParsedThumbnail,
             finalThumbnail = thumbnail_url.orEmpty(),
             mode = getHomeCoverMode(),
             needsOfficialFallback = needsOfficialCoverFallback,
@@ -2973,9 +2981,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val stripped = stripImageProcessParams(url.trim())
         if (stripped.isBlank()) return ""
         val withoutDetailFlag = stripped
-            .replace("?mihon_detail_cover=1&", "?")
-            .replace("&mihon_detail_cover=1", "")
-            .replace("?mihon_detail_cover=1", "")
+            .replace("?dongman_detail_cover=1&", "?")
+            .replace("&dongman_detail_cover=1", "")
+            .replace("?dongman_detail_cover=1", "")
         return withoutDetailFlag.trimEnd('?')
     }
 
@@ -3766,7 +3774,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun hasDetailCoverKey(thumbnailUrl: String): Boolean {
-        return thumbnailUrl.contains("mihon_detail_cover=1")
+        return thumbnailUrl.contains("dongman_detail_cover=1")
     }
 
     private fun detailCoverCacheKeyUrl(thumbnailUrl: String): String {
@@ -3774,7 +3782,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (normalized.isBlank()) return ""
         if (hasDetailCoverKey(normalized)) return normalized
         val separator = if (normalized.contains("?")) "&" else "?"
-        return normalized + separator + "mihon_detail_cover=1"
+        return normalized + separator + "dongman_detail_cover=1"
     }
 
     private fun officialListThumbnailForUi(thumbnailUrl: String): String {
