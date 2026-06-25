@@ -474,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            summary = "%s"
+            summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
             entries = arrayOf("速度优先（当前模式）", "封面优先 / 一步到位（严格实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
@@ -493,7 +493,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
-            summary = "%s"
+            summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
             entries = arrayOf("移动版（默认）", "Windows Firefox", "禁用 User-Agent", "自定义（见下方输入框）")
             entryValues = arrayOf(UA_MOBILE, UA_DESKTOP, "", PREF_UA_CUSTOM_FLAG)
             setDefaultValue(UA_MOBILE)
@@ -1204,9 +1204,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     } else {
                         ""
                     }
-                    val officialThumbnail = verifiedOfficialCover.ifBlank {
+                    val rawOfficialThumbnail = verifiedOfficialCover.ifBlank {
                         trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover }
                     }
+                    val officialThumbnail = officialListThumbnailForUi(rawOfficialThumbnail)
                     dlog(
                         "latestUpdatesParse NEW officialCover titleNo=$titleNo " +
                             "marketingThumbnailSuppressed=${cached.thumbnailUrl.isNotBlank()} " +
@@ -1346,6 +1347,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         @Volatile
         var coverUrl: String = ""
+
+        @Volatile
+        var failureReason: String = ""
 
         @Volatile
         var submitted: Boolean = false
@@ -1547,6 +1551,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val isDirtyStoredUrl = cleanAuditDirtyStoredUrl(storedUrl)
             val hasOssParam = thumbnail.contains("x-oss-process")
             val hasListDetailCoverKey = thumbnail.contains("mihon_detail_cover=1")
+            val listDetailCoverKeyAllowed = isHomeCoverOfficialFirst()
             val hasEmptyTitle = manga.title.isBlank()
             val hasPlaceholderTitle = cleanAuditPlaceholderTitle(manga.title)
             if (isStoredEpisode) storedEpisode += 1
@@ -1555,7 +1560,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (hasListDetailCoverKey) listDetailCoverKey += 1
             if (hasEmptyTitle) emptyTitle += 1
             if (hasPlaceholderTitle) placeholderTitle += 1
-            val dirty = isStoredEpisode || isDirtyStoredUrl || hasOssParam || hasListDetailCoverKey || hasEmptyTitle || hasPlaceholderTitle
+            val dirty = isStoredEpisode || isDirtyStoredUrl || hasOssParam ||
+                (hasListDetailCoverKey && !listDetailCoverKeyAllowed) || hasEmptyTitle || hasPlaceholderTitle
             if (dirty && cleanAuditDirtyLogCount < CLEAN_AUDIT_DIRTY_LOG_LIMIT) {
                 cleanAuditDirtyLogCount += 1
                 dlog(
@@ -1569,6 +1575,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "cleanAuditSummary origin=$origin entries=${entries.size} storedEpisode=$storedEpisode " +
                 "dirtyStoredUrl=$dirtyStoredUrl ossParam=$ossParam listDetailCoverKey=$listDetailCoverKey " +
+                "listDetailCoverKeyAllowed=${isHomeCoverOfficialFirst()} " +
                 "emptyTitle=$emptyTitle placeholderTitle=$placeholderTitle"
         )
     }
@@ -1587,7 +1594,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
-    // v100.6：严格“一步到位”模式下，不再把失败项回退为虚拟官方封面。
+    // v100.7：严格“一步到位”模式下，不再把失败项回退为虚拟官方封面；成功项在列表阶段直接使用 detail-key SNS。
     // 这样列表阶段不是官方 cdn-sns 就会明确暴露为空/缺失，避免继续制造“进详情才换封面”的假一步到位。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = !isHomeCoverOfficialFirst()
 
@@ -2311,8 +2318,38 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 } else {
                     detailCoverCacheKeyUrl(finalDetailThumbnail)
                 }
+                val beforeCanonicalEqual = normalizeCoverKeyForCompare(thumbnailBefore) == normalizeCoverKeyForCompare(finalDetailThumbnail)
+                val beforeHasDetailKey = hasDetailCoverKey(thumbnailBefore)
+                val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
+                val coverKeyDecisionReason = when {
+                    keepExistingOfficial -> "already-detail-key"
+                    thumbnailBefore.isBlank() -> "missing-before-detail-key-applied"
+                    isVirtualOfficialCoverUrl(thumbnailBefore) -> "virtual-to-detail-key"
+                    beforeCanonicalEqual && !beforeHasDetailKey -> {
+                        if (isHomeCoverOfficialFirst()) {
+                            "strict-missing-detail-key-upgrade"
+                        } else {
+                            "fast-detail-upgrade-once"
+                        }
+                    }
+                    else -> "official-detail-key-applied"
+                }
                 thumbnail_url = detailThumbnailForUi
                 rememberOfficialMangaMeta(titleNo, title, finalDetailThumbnail, "detail")
+                dlog(
+                    "detailCoverKeyDecision mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
+                        "before=$thumbnailBefore after=$detailThumbnailForUi canonical=$finalDetailThumbnail " +
+                        "canonicalEqual=$beforeCanonicalEqual beforeHasDetailKey=$beforeHasDetailKey " +
+                        "afterHasDetailKey=$afterHasDetailKey changed=${thumbnailBefore != detailThumbnailForUi} " +
+                        "reason=$coverKeyDecisionReason"
+                )
+                dlog(
+                    "detailCoverFinalAssert mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
+                        "isCdnSns=${isVerifiedDetailOfficialCoverUrl(detailThumbnailForUi)} " +
+                        "hasOssParam=${detailThumbnailForUi.contains("x-oss-process")} " +
+                        "hasDetailKey=$afterHasDetailKey isVirtual=${isVirtualOfficialCoverUrl(detailThumbnailForUi)} " +
+                        "final=$detailThumbnailForUi"
+                )
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
@@ -2690,7 +2727,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         url = item.url
         title = item.title
         val detailOfficialCover = verifiedDetailOfficialCoverForTitleNo(item.titleNo)
-        val selectedThumbnail = detailOfficialCover.ifBlank { item.thumbnailUrl }
+        val selectedThumbnail = if (detailOfficialCover.isNotBlank()) {
+            officialListThumbnailForUi(detailOfficialCover)
+        } else {
+            item.thumbnailUrl
+        }
         thumbnail_url = selectedThumbnail
         logCoverLifecycleListEmit(
             origin = "cached-page",
@@ -2707,7 +2748,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (detailOfficialCover.isNotBlank() && detailOfficialCover != item.thumbnailUrl) {
             dlog(
                 "cachedPageDetailCoverOverride titleNo=${item.titleNo.orEmpty()} " +
-                    "title=$title oldThumbnail=${item.thumbnailUrl} finalThumbnail=$detailOfficialCover"
+                    "title=$title oldThumbnail=${item.thumbnailUrl} finalThumbnail=$selectedThumbnail canonicalThumbnail=$detailOfficialCover"
             )
         }
         logIdentityProbe("cached-page", item.titleNo, title, "", "", url)
@@ -2819,8 +2860,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } else {
             ""
         }
-        val selectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
-        val officialCoverMissing = needsOfficialCoverFallback && selectedOfficialCover.isBlank()
+        val rawSelectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
+        val selectedOfficialCover = officialListThumbnailForUi(rawSelectedOfficialCover)
+        val officialCoverMissing = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank()
 
         if (!needsOfficialCoverFallback) {
             rememberOfficialMangaMetaFromList(titleNo, parsedTitle, parsedThumbnail, origin)
@@ -2962,7 +3004,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "needsOfficialFallback=$needsOfficialFallback officialCoverPresent=$officialCoverPresent " +
                 "officialCoverVirtual=$officialCoverVirtual raw=$rawThumbnail final=$finalThumbnail " +
                 "hasOssParam=${finalThumbnail.contains("x-oss-process")} isCdnSns=${isVerifiedDetailOfficialCoverUrl(finalThumbnail)} " +
-                "storedUrl=$storedUrl"
+                "isDetailKey=${hasDetailCoverKey(finalThumbnail)} storedUrl=$storedUrl"
+        )
+        dlog(
+            "coverFinalUrlProbe mode=$mode origin=$origin titleNo=${titleNo.orEmpty()} " +
+                "final=$finalThumbnail isCdnSns=${isVerifiedDetailOfficialCoverUrl(finalThumbnail)} " +
+                "hasOssParam=${finalThumbnail.contains("x-oss-process")} " +
+                "isDetailKey=${hasDetailCoverKey(finalThumbnail)} " +
+                "isVirtual=${isVirtualOfficialCoverUrl(finalThumbnail)} " +
+                "source=${if (officialCoverPresent) "official-meta" else if (officialCoverVirtual) "virtual" else "list"}"
         )
     }
 
@@ -2973,10 +3023,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun shouldKeepExistingOfficialCoverInDetail(titleNo: String?, thumbnailBefore: String, finalDetailThumbnail: String): Boolean {
-        if (!isHomeCoverOfficialFirst()) return false
         if (titleNo.isNullOrBlank()) return false
         if (thumbnailBefore.isBlank() || isVirtualOfficialCoverUrl(thumbnailBefore)) return false
         if (!isVerifiedDetailOfficialCoverUrl(thumbnailBefore)) return false
+        if (!hasDetailCoverKey(thumbnailBefore)) return false
         return normalizeCoverKeyForCompare(thumbnailBefore) == normalizeCoverKeyForCompare(finalDetailThumbnail)
     }
 
@@ -3245,13 +3295,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() || trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isNotBlank()
         }
         val missing = targets.size - success
+        val pending = states.count { !it.completed }
+        val networkError = states.count { it.failed && it.failureReason.startsWith("networkError") }
+        val noMeta = states.count { it.failed && it.failureReason.startsWith("noMeta") }
+        val failedOther = states.count { it.failed && it.failureReason.isNotBlank() && !it.failureReason.startsWith("networkError") && !it.failureReason.startsWith("noMeta") }
+        val missingTitleNos = targets.filter {
+            verifiedDetailOfficialCoverForTitleNo(it.titleNo).isBlank() && trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isBlank()
+        }.joinToString("|") { it.titleNo }
         dlog(
             "coverModeProbe mode=${getHomeCoverMode()} origin=$origin targets=${targets.size} " +
                 "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
                 "scheduled=${states.size} success=$success missing=$missing waited=${System.currentTimeMillis() - waitStartedAt}ms " +
                 "awaitMs=$waitedMs waitLimitMs=$OFFICIAL_FIRST_COVER_WAIT_MS limit=$OFFICIAL_FIRST_COVER_LIMIT " +
                 "strictNoVirtualFallback=${isHomeCoverOfficialFirst()} " +
-                "marketingRequests=0"
+                "failurePending=$pending failureNetworkError=$networkError failureNoMeta=$noMeta failureOther=$failedOther " +
+                "missingTitleNos=$missingTitleNos marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -3478,6 +3536,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 if (scan.coverUrl.isNotBlank()) {
                     val remembered = rememberVerifiedDetailOfficialCover(titleNo, scan.coverUrl)
                     state.coverUrl = remembered
+                    state.failureReason = if (remembered.isNotBlank()) "" else "unverified"
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
                             "source=${scan.source} fetchKind=$fetchKind code=${response.code} requestedUrl=$requestUrl " +
@@ -3490,6 +3549,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     failed = remembered.isBlank()
                 } else {
                     failed = true
+                    state.failureReason = "noMeta:${scan.source.ifBlank { "detail-meta-fast-unverified" }}"
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=false " +
                             "source=${scan.source.ifBlank { "detail-meta-fast-unverified" }} code=${response.code} " +
@@ -3502,6 +3562,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         } catch (e: Exception) {
             failed = true
+            state.failureReason = "networkError:${e.javaClass.simpleName}"
             wlog(
                 "officialNewWorkCoverFetchFailed titleNo=$titleNo " +
                     "requestedUrl=$requestUrl elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
@@ -3691,12 +3752,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return normalized
     }
 
+    private fun hasDetailCoverKey(thumbnailUrl: String): Boolean {
+        return thumbnailUrl.contains("mihon_detail_cover=1")
+    }
+
     private fun detailCoverCacheKeyUrl(thumbnailUrl: String): String {
         val normalized = stripImageProcessParams(thumbnailUrl.trim())
         if (normalized.isBlank()) return ""
-        if (normalized.contains("mihon_detail_cover=1")) return normalized
+        if (hasDetailCoverKey(normalized)) return normalized
         val separator = if (normalized.contains("?")) "&" else "?"
         return normalized + separator + "mihon_detail_cover=1"
+    }
+
+    private fun officialListThumbnailForUi(thumbnailUrl: String): String {
+        val normalized = stripImageProcessParams(thumbnailUrl.trim())
+        if (normalized.isBlank()) return ""
+        return if (isHomeCoverOfficialFirst() && isVerifiedDetailOfficialCoverUrl(normalized)) {
+            detailCoverCacheKeyUrl(normalized)
+        } else {
+            normalized
+        }
     }
 
     private fun verifiedDetailOfficialCoverForTitleNo(titleNo: String?): String {
