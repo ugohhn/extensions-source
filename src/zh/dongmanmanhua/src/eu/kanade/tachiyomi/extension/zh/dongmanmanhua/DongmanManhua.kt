@@ -474,10 +474,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
             entries = arrayOf("速度优先（当前模式）", "封面优先 / 一步到位（严格实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
+            bindEntrySummary(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
 
         MultiSelectListPreference(ctx).apply {
@@ -493,10 +493,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_UA
             title = "User-Agent 预设"
-            summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
             entries = arrayOf("移动版（默认）", "Windows Firefox", "禁用 User-Agent", "自定义（见下方输入框）")
             entryValues = arrayOf(UA_MOBILE, UA_DESKTOP, "", PREF_UA_CUSTOM_FLAG)
             setDefaultValue(UA_MOBILE)
+            bindEntrySummary(UA_MOBILE)
         }.also(screen::addPreference)
 
         EditTextPreference(ctx).apply {
@@ -511,6 +511,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         Handler(Looper.getMainLooper()).postDelayed({
             syncLoginIndicator()
         }, 300L)
+    }
+
+    private fun ListPreference.bindEntrySummary(defaultValue: String) {
+        updateEntrySummary(this@DongmanManhua.preferences.getString(key, defaultValue) ?: defaultValue)
+        setOnPreferenceChangeListener { preference, newValue ->
+            (preference as? ListPreference)?.updateEntrySummary(newValue as? String)
+            true
+        }
+    }
+
+    private fun ListPreference.updateEntrySummary(selectedValue: String?) {
+        val index = findIndexOfValue(selectedValue ?: value)
+        summary = if (index >= 0) entries[index] else ""
     }
 
     // ══════════════════════════════════════════════════════════════════════
