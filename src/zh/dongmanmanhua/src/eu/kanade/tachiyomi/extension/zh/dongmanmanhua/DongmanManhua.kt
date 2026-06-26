@@ -480,6 +480,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
 
+        ListPreference(ctx).apply {
+            key = PREF_DETAIL_COVER_REFRESH_MODE
+            title = "详情页手动刷新封面"
+            entries = arrayOf("同步刷新封面（默认）", "保留现有封面")
+            entryValues = arrayOf(DETAIL_COVER_REFRESH_SYNC, DETAIL_COVER_REFRESH_PRESERVE)
+            setDefaultValue(DETAIL_COVER_REFRESH_SYNC)
+            bindDetailCoverRefreshModeSummary(DETAIL_COVER_REFRESH_SYNC)
+        }.also(screen::addPreference)
+
         MultiSelectListPreference(ctx).apply {
             key = PREF_POPULAR_GENRE_ENABLED
             title = "首页热门题材模块"
@@ -544,6 +553,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val index = findIndexOfValue(normalized)
         val current = if (index >= 0) entries[index] else ""
         summary = "当前：$current\n切换后刷新首页生效；列表保持真实可加载封面，详情页以详情解析的最终封面为准"
+    }
+
+    private fun ListPreference.bindDetailCoverRefreshModeSummary(defaultValue: String) {
+        updateDetailCoverRefreshModeSummary(this@DongmanManhua.preferences.getString(key, defaultValue) ?: defaultValue)
+        setOnPreferenceChangeListener { preference, newValue ->
+            val normalized = normalizeDetailCoverRefreshMode(newValue as? String)
+            (preference as? ListPreference)?.updateDetailCoverRefreshModeSummary(normalized)
+            true
+        }
+    }
+
+    private fun ListPreference.updateDetailCoverRefreshModeSummary(selectedValue: String?) {
+        val normalized = normalizeDetailCoverRefreshMode(selectedValue)
+        val index = findIndexOfValue(normalized)
+        val current = if (index >= 0) entries[index] else ""
+        summary = when (normalized) {
+            DETAIL_COVER_REFRESH_PRESERVE -> "当前：$current\n手动刷新详情时不写入 thumbnail_url；只更新简介、标签、状态、章节等。"
+            else -> "当前：$current\n手动刷新详情时检查官方封面；不同才更新，相同 canonical 只跳过重复写入。"
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1230,8 +1258,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
                     // .new_works_items 的 thumbnail 可能是营销封面。
-                    // v100.7.7：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
-                    // 若个别官方封面仍失败，回退为站点直连图，保证不空、不跳过、不把详情 key 交给列表卡片。
+                    // v100.7.10：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
+                    // 需要官方封面的条目只接受已验证官方封面；不把未验证图片包装成兜底。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
                     val trustedRuntimeOfficialCover = if (verifiedOfficialCover.isBlank()) {
@@ -1644,6 +1672,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
+
+    private fun normalizeDetailCoverRefreshMode(value: String?): String {
+        return when (value) {
+            DETAIL_COVER_REFRESH_PRESERVE -> DETAIL_COVER_REFRESH_PRESERVE
+            else -> DETAIL_COVER_REFRESH_SYNC
+        }
+    }
+
+    private fun getDetailCoverRefreshMode(): String {
+        val value = preferences.getString(PREF_DETAIL_COVER_REFRESH_MODE, DETAIL_COVER_REFRESH_SYNC) ?: DETAIL_COVER_REFRESH_SYNC
+        return normalizeDetailCoverRefreshMode(value)
+    }
+
+    private fun isDetailCoverRefreshPreserve(): Boolean = getDetailCoverRefreshMode() == DETAIL_COVER_REFRESH_PRESERVE
 
     // v100.7.7：所有列表模式都禁用虚拟官方封面回退。
     // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
@@ -2327,6 +2369,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "detailRefreshProbe action=request requestType=details seq=$seq titleNo=${titleNo.orEmpty()} " +
                 "deltaFromLast=${deltaFromLast}ms coverMode=${getHomeCoverMode()} " +
+                "detailCoverRefreshMode=${getDetailCoverRefreshMode()} " +
                 "thumbnailBefore=$thumbnailBefore storedUrl=${normalizeMangaPath(manga.url)} " +
                 "requestPath=$requestPath finalUrl=$finalUrl"
         )
@@ -2375,14 +2418,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val beforeCanonicalEqual = normalizeCoverKeyForCompare(thumbnailBefore) == detailThumbnailForUi
                 val beforeHasDetailKey = hasDetailCoverKey(thumbnailBefore)
                 val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
-                val shouldWriteDetailThumbnail = when {
+                val detailCoverRefreshMode = getDetailCoverRefreshMode()
+                val preserveExistingCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_PRESERVE
+                val wouldWriteDetailThumbnail = when {
                     thumbnailBefore.isBlank() -> true
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> true
                     beforeHasDetailKey -> true
                     !beforeCanonicalEqual -> true
                     else -> false
                 }
+                val shouldWriteDetailThumbnail = !preserveExistingCover && wouldWriteDetailThumbnail
                 val coverDecisionReason = when {
+                    preserveExistingCover -> "preserve-existing-cover-mode"
                     thumbnailBefore.isBlank() -> "detail-official-from-empty"
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> "detail-official-replaces-virtual"
                     beforeHasDetailKey -> "strip-old-detail-key"
@@ -2396,10 +2443,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 dlog(
                     "detailFinalCoverSelected mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
                         "source=${if (rememberedDetailThumbnail.isNotBlank()) "detail-html-og-twitter" else "runtime-cache"} " +
+                        "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
                         "librarySafeCover=true noExtraRequest=true sharedHtml=true " +
                         "before=$thumbnailBefore final=$detailThumbnailForUi canonicalEqual=$beforeCanonicalEqual " +
                         "beforeHasDetailKey=$beforeHasDetailKey afterHasDetailKey=$afterHasDetailKey " +
-                        "changed=$shouldWriteDetailThumbnail sameCanonicalSkipWrite=${!shouldWriteDetailThumbnail} " +
+                        "changed=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail " +
+                        "sameCanonicalSkipWrite=${!preserveExistingCover && !wouldWriteDetailThumbnail} " +
                         "reason=$coverDecisionReason"
                 )
                 dlog(
@@ -2412,15 +2461,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
-                        "finalThumbnailApplied=$shouldWriteDetailThumbnail detailCacheKeyApplied=false " +
-                        "sameCanonicalSkipWrite=${!shouldWriteDetailThumbnail} " +
+                        "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
+                        "finalThumbnailApplied=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail detailCacheKeyApplied=false " +
+                        "sameCanonicalSkipWrite=${!preserveExistingCover && !wouldWriteDetailThumbnail} " +
                         "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$detailThumbnailForUi " +
                         "thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
                 )
                 dlog(
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$detailThumbnailForUi " +
-                        "changed=$shouldWriteDetailThumbnail keepExistingOfficial=${!shouldWriteDetailThumbnail} " +
+                        "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
+                        "changed=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail keepExistingOfficial=${!shouldWriteDetailThumbnail} " +
                         "detailKeyApplied=false sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
                 )
             } else {
@@ -2459,6 +2510,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             )
             dlog(
                 "detailRefreshProbe action=parse titleNo=${titleNo.orEmpty()} coverMode=${getHomeCoverMode()} " +
+                    "detailCoverRefreshMode=${getDetailCoverRefreshMode()} " +
                     "source=networkOrDetailCache thumbnailBefore=${detailEntryThumbnailForTitleNo(titleNo)} " +
                     "thumbnailAfter=${thumbnail_url.orEmpty().ifBlank { detailEntryThumbnailForTitleNo(titleNo) }} " +
                     "detailCoverChanged=${thumbnail_url.orEmpty().isNotBlank()} " +
@@ -4981,6 +5033,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_HOME_COVER_MODE = "pref_home_cover_mode"
         internal const val HOME_COVER_MODE_FAST = "fast"
         internal const val HOME_COVER_MODE_OFFICIAL_FIRST = "official_first"
+        internal const val PREF_DETAIL_COVER_REFRESH_MODE = "pref_detail_cover_refresh_mode"
+        internal const val DETAIL_COVER_REFRESH_SYNC = "sync"
+        internal const val DETAIL_COVER_REFRESH_PRESERVE = "preserve"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
