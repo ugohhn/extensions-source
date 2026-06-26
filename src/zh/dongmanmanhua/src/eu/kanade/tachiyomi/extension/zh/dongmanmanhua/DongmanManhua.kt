@@ -480,6 +480,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
 
+        ListPreference(ctx).apply {
+            key = PREF_COVER_CACHE_PROBE_MODE
+            title = "封面缓存归因测试"
+            entries = arrayOf(
+                "关闭（默认）",
+                "仅详情加诊断 Key",
+                "列表/详情分离 Key",
+            )
+            entryValues = arrayOf(
+                COVER_CACHE_PROBE_OFF,
+                COVER_CACHE_PROBE_DETAIL_ONLY,
+                COVER_CACHE_PROBE_SPLIT_LIST_DETAIL,
+            )
+            setDefaultValue(COVER_CACHE_PROBE_OFF)
+            bindCoverCacheProbeSummary(COVER_CACHE_PROBE_OFF)
+        }.also(screen::addPreference)
+
         MultiSelectListPreference(ctx).apply {
             key = PREF_POPULAR_GENRE_ENABLED
             title = "首页热门题材模块"
@@ -544,6 +561,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val index = findIndexOfValue(normalized)
         val current = if (index >= 0) entries[index] else ""
         summary = "当前：$current\n切换后刷新首页生效"
+    }
+
+    private fun ListPreference.bindCoverCacheProbeSummary(defaultValue: String) {
+        updateCoverCacheProbeSummary(this@DongmanManhua.preferences.getString(key, defaultValue) ?: defaultValue)
+        setOnPreferenceChangeListener { preference, newValue ->
+            val oldMode = getCoverCacheProbeMode()
+            val newMode = normalizeCoverCacheProbeMode(newValue as? String)
+            (preference as? ListPreference)?.updateCoverCacheProbeSummary(newMode)
+            if (oldMode != newMode) {
+                clearCoverModeSensitiveCaches("cover-cache-probe-change:$oldMode->$newMode")
+                dlog("coverCacheProbeModeChanged old=$oldMode new=$newMode")
+            }
+            true
+        }
+    }
+
+    private fun ListPreference.updateCoverCacheProbeSummary(selectedValue: String?) {
+        val normalized = normalizeCoverCacheProbeMode(selectedValue)
+        val index = findIndexOfValue(normalized)
+        val current = if (index >= 0) entries[index] else ""
+        summary = "当前：$current\n只用于确认封面空白是否来自宿主图片缓存；测试完请关闭"
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1631,6 +1669,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
+    private fun normalizeCoverCacheProbeMode(value: String?): String {
+        return when (value) {
+            COVER_CACHE_PROBE_DETAIL_ONLY -> COVER_CACHE_PROBE_DETAIL_ONLY
+            COVER_CACHE_PROBE_SPLIT_LIST_DETAIL -> COVER_CACHE_PROBE_SPLIT_LIST_DETAIL
+            else -> COVER_CACHE_PROBE_OFF
+        }
+    }
+
+    private fun getCoverCacheProbeMode(): String {
+        val value = preferences.getString(PREF_COVER_CACHE_PROBE_MODE, COVER_CACHE_PROBE_OFF) ?: COVER_CACHE_PROBE_OFF
+        return normalizeCoverCacheProbeMode(value)
+    }
+
+    private fun isDetailOnlyCoverCacheProbe(): Boolean = getCoverCacheProbeMode() == COVER_CACHE_PROBE_DETAIL_ONLY
+
+    private fun isSplitListDetailCoverCacheProbe(): Boolean = getCoverCacheProbeMode() == COVER_CACHE_PROBE_SPLIT_LIST_DETAIL
+
+    private fun isAnyCoverCacheProbeEnabled(): Boolean = getCoverCacheProbeMode() != COVER_CACHE_PROBE_OFF
+
     // v100.7：严格“一步到位”模式下，不再把失败项回退为虚拟官方封面；成功项在列表阶段直接使用 detail-key SNS。
     // 这样列表阶段不是官方 cdn-sns 就会明确暴露为空/缺失，避免继续制造“进详情才换封面”的假一步到位。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = !isHomeCoverOfficialFirst()
@@ -2350,15 +2407,26 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     .ifBlank { verifiedDetailThumbnail }
                 val thumbnailBefore = detailEntryThumbnailForTitleNo(titleNo)
                 val keepExistingOfficial = shouldKeepExistingOfficialCoverInDetail(titleNo, thumbnailBefore, finalDetailThumbnail)
-                val detailThumbnailForUi = if (keepExistingOfficial) {
+                val baseDetailThumbnailForUi = if (keepExistingOfficial) {
                     thumbnailBefore
                 } else {
                     detailCoverCacheKeyUrl(finalDetailThumbnail)
                 }
+                val detailThumbnailForUi = if (isDetailOnlyCoverCacheProbe() || isSplitListDetailCoverCacheProbe()) {
+                    detailCoverProbeKeyUrl(finalDetailThumbnail)
+                } else {
+                    baseDetailThumbnailForUi
+                }
                 val beforeCanonicalEqual = normalizeCoverKeyForCompare(thumbnailBefore) == normalizeCoverKeyForCompare(finalDetailThumbnail)
                 val beforeHasDetailKey = hasDetailCoverKey(thumbnailBefore)
+                val beforeHasListKey = hasListCoverKey(thumbnailBefore)
                 val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
+                val afterHasProbeKey = hasCoverProbeKey(detailThumbnailForUi)
+                val probeApplied = detailThumbnailForUi != baseDetailThumbnailForUi
+                val splitProbeExpectedListToDetailChange = isSplitListDetailCoverCacheProbe() && beforeCanonicalEqual && beforeHasListKey && afterHasDetailKey
                 val coverKeyDecisionReason = when {
+                    probeApplied && isSplitListDetailCoverCacheProbe() -> "probe-split-list-to-detail-key"
+                    probeApplied && isDetailOnlyCoverCacheProbe() -> "probe-detail-key-applied"
                     keepExistingOfficial -> "already-detail-key"
                     thumbnailBefore.isBlank() -> "missing-before-detail-key-applied"
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> "virtual-to-detail-key"
@@ -2371,7 +2439,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                     else -> "official-detail-key-applied"
                 }
-                if (isHomeCoverOfficialFirst() && beforeCanonicalEqual && !beforeHasDetailKey && afterHasDetailKey) {
+                if (
+                    isHomeCoverOfficialFirst() &&
+                    beforeCanonicalEqual &&
+                    !beforeHasDetailKey &&
+                    afterHasDetailKey &&
+                    !splitProbeExpectedListToDetailChange
+                ) {
                     dlog(
                         "officialFirstViolation titleNo=${titleNo.orEmpty()} reason=list-emitted-without-detail-key " +
                             "before=$thumbnailBefore after=$detailThumbnailForUi canonical=$finalDetailThumbnail"
@@ -2380,17 +2454,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 thumbnail_url = detailThumbnailForUi
                 rememberOfficialMangaMeta(titleNo, title, finalDetailThumbnail, "detail")
                 dlog(
-                    "detailCoverKeyDecision mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
+                    "detailCoverKeyDecision mode=${getHomeCoverMode()} probeMode=${getCoverCacheProbeMode()} titleNo=${titleNo.orEmpty()} " +
                         "before=$thumbnailBefore after=$detailThumbnailForUi canonical=$finalDetailThumbnail " +
-                        "canonicalEqual=$beforeCanonicalEqual beforeHasDetailKey=$beforeHasDetailKey " +
-                        "afterHasDetailKey=$afterHasDetailKey changed=${thumbnailBefore != detailThumbnailForUi} " +
+                        "canonicalEqual=$beforeCanonicalEqual beforeHasDetailKey=$beforeHasDetailKey beforeHasListKey=$beforeHasListKey " +
+                        "afterHasDetailKey=$afterHasDetailKey afterHasProbeKey=$afterHasProbeKey " +
+                        "changed=${thumbnailBefore != detailThumbnailForUi} probeApplied=$probeApplied " +
                         "reason=$coverKeyDecisionReason"
                 )
                 dlog(
-                    "detailCoverFinalAssert mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
+                    "detailCoverFinalAssert mode=${getHomeCoverMode()} probeMode=${getCoverCacheProbeMode()} titleNo=${titleNo.orEmpty()} " +
                         "isCdnSns=${isVerifiedDetailOfficialCoverUrl(detailThumbnailForUi)} " +
                         "hasOssParam=${detailThumbnailForUi.contains("x-oss-process")} " +
-                        "hasDetailKey=$afterHasDetailKey isVirtual=${isVirtualOfficialCoverUrl(detailThumbnailForUi)} " +
+                        "hasDetailKey=$afterHasDetailKey hasProbeKey=$afterHasProbeKey " +
+                        "isVirtual=${isVirtualOfficialCoverUrl(detailThumbnailForUi)} " +
                         "final=$detailThumbnailForUi"
                 )
                 dlog(
@@ -2398,14 +2474,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
                         "finalThumbnailApplied=true detailCacheKeyApplied=${detailThumbnailForUi != finalDetailThumbnail} " +
                         "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$finalDetailThumbnail " +
-                        "thumbnailBefore=$thumbnailBefore keepExistingOfficial=$keepExistingOfficial coverMode=${getHomeCoverMode()}"
+                        "thumbnailBefore=$thumbnailBefore keepExistingOfficial=$keepExistingOfficial coverMode=${getHomeCoverMode()} " +
+                        "probeMode=${getCoverCacheProbeMode()} probeApplied=$probeApplied"
                 )
                 dlog(
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$finalDetailThumbnail " +
                         "changed=${thumbnailBefore != detailThumbnailForUi} keepExistingOfficial=$keepExistingOfficial " +
-                        "detailKeyApplied=${detailThumbnailForUi != finalDetailThumbnail} sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
+                        "detailKeyApplied=${detailThumbnailForUi != finalDetailThumbnail} sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)} " +
+                        "probeMode=${getCoverCacheProbeMode()} probeApplied=$probeApplied beforeHasListKey=$beforeHasListKey afterHasProbeKey=$afterHasProbeKey"
                 )
+                if (isAnyCoverCacheProbeEnabled()) {
+                    dlog(
+                        "coverCacheAttributionProbe stage=detail titleNo=${titleNo.orEmpty()} " +
+                            "probeMode=${getCoverCacheProbeMode()} before=$thumbnailBefore after=$detailThumbnailForUi " +
+                            "canonical=$finalDetailThumbnail sameCanonical=${normalizeCoverKeyForCompare(thumbnailBefore) == normalizeCoverKeyForCompare(detailThumbnailForUi)} " +
+                            "changed=${thumbnailBefore != detailThumbnailForUi} beforeHasDetailKey=$beforeHasDetailKey beforeHasListKey=$beforeHasListKey " +
+                            "afterHasDetailKey=$afterHasDetailKey afterHasProbeKey=$afterHasProbeKey expectedSignal=no-memory-small-warning-if-url-keyed"
+                    )
+                }
             } else {
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
@@ -3025,14 +3112,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     )
 
 
+    private fun removeCoverQueryParam(url: String, param: String): String {
+        val clean = url.trim()
+        val queryIndex = clean.indexOf('?')
+        if (queryIndex < 0) return clean
+        val base = clean.substring(0, queryIndex)
+        val query = clean.substring(queryIndex + 1)
+        val kept = query
+            .split('&')
+            .filter { it.isNotBlank() && it.substringBefore('=') != param }
+        return if (kept.isEmpty()) base else base + "?" + kept.joinToString("&")
+    }
+
     private fun normalizeCoverKeyForCompare(url: String): String {
-        val stripped = stripImageProcessParams(url.trim())
+        var stripped = stripImageProcessParams(url.trim())
         if (stripped.isBlank()) return ""
-        val withoutDetailFlag = stripped
-            .replace("?dongman_detail_cover=1&", "?")
-            .replace("&dongman_detail_cover=1", "")
-            .replace("?dongman_detail_cover=1", "")
-        return withoutDetailFlag.trimEnd('?')
+        stripped = removeCoverQueryParam(stripped, "dongman_detail_cover")
+        stripped = removeCoverQueryParam(stripped, "dongman_list_cover")
+        stripped = removeCoverQueryParam(stripped, "dongman_cover_probe")
+        return stripped.trimEnd('?')
     }
 
     private fun sameCoverImageDifferentKey(left: String, right: String): Boolean {
@@ -3073,16 +3171,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "needsOfficialFallback=$needsOfficialFallback officialCoverPresent=$officialCoverPresent " +
                 "officialCoverVirtual=$officialCoverVirtual raw=$rawThumbnail final=$finalThumbnail " +
                 "hasOssParam=${finalThumbnail.contains("x-oss-process")} isCdnSns=${isVerifiedDetailOfficialCoverUrl(finalThumbnail)} " +
-                "isDetailKey=${hasDetailCoverKey(finalThumbnail)} storedUrl=$storedUrl"
+                "isDetailKey=${hasDetailCoverKey(finalThumbnail)} isListKey=${hasListCoverKey(finalThumbnail)} " +
+                "hasProbeKey=${hasCoverProbeKey(finalThumbnail)} probeMode=${getCoverCacheProbeMode()} storedUrl=$storedUrl"
         )
         dlog(
             "coverFinalUrlProbe mode=$mode origin=$origin titleNo=${titleNo.orEmpty()} " +
                 "final=$finalThumbnail isCdnSns=${isVerifiedDetailOfficialCoverUrl(finalThumbnail)} " +
                 "hasOssParam=${finalThumbnail.contains("x-oss-process")} " +
                 "isDetailKey=${hasDetailCoverKey(finalThumbnail)} " +
+                "isListKey=${hasListCoverKey(finalThumbnail)} " +
+                "hasProbeKey=${hasCoverProbeKey(finalThumbnail)} " +
                 "isVirtual=${isVirtualOfficialCoverUrl(finalThumbnail)} " +
+                "probeMode=${getCoverCacheProbeMode()} " +
                 "source=${if (officialCoverPresent) "official-meta" else if (officialCoverVirtual) "virtual" else "list"}"
         )
+        if (isAnyCoverCacheProbeEnabled()) {
+            dlog(
+                "coverCacheAttributionProbe stage=list origin=$origin titleNo=${titleNo.orEmpty()} " +
+                    "probeMode=${getCoverCacheProbeMode()} final=$finalThumbnail canonical=${normalizeCoverKeyForCompare(finalThumbnail)} " +
+                    "isDetailKey=${hasDetailCoverKey(finalThumbnail)} isListKey=${hasListCoverKey(finalThumbnail)} " +
+                    "hasProbeKey=${hasCoverProbeKey(finalThumbnail)} source=${if (officialCoverPresent) "official-meta" else if (officialCoverVirtual) "virtual" else "list"}"
+            )
+        }
     }
 
     private fun detailEntryThumbnailForTitleNo(titleNo: String?): String {
@@ -3825,6 +3935,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return thumbnailUrl.contains("dongman_detail_cover=1")
     }
 
+    private fun hasListCoverKey(thumbnailUrl: String): Boolean {
+        return thumbnailUrl.contains("dongman_list_cover=1")
+    }
+
+    private fun hasCoverProbeKey(thumbnailUrl: String): Boolean {
+        return thumbnailUrl.contains("dongman_cover_probe=")
+    }
+
+    private fun appendCoverQueryParam(thumbnailUrl: String, param: String, value: String): String {
+        val normalized = stripImageProcessParams(thumbnailUrl.trim())
+        if (normalized.isBlank()) return ""
+        val withoutParam = removeCoverQueryParam(normalized, param)
+        val separator = if (withoutParam.contains("?")) "&" else "?"
+        return withoutParam + separator + param + "=" + value
+    }
+
     private fun detailCoverCacheKeyUrl(thumbnailUrl: String): String {
         val normalized = stripImageProcessParams(thumbnailUrl.trim())
         if (normalized.isBlank()) return ""
@@ -3833,11 +3959,29 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return normalized + separator + "dongman_detail_cover=1"
     }
 
+    private fun listCoverCacheKeyUrl(thumbnailUrl: String): String {
+        val normalized = stripImageProcessParams(thumbnailUrl.trim())
+        if (normalized.isBlank()) return ""
+        if (hasListCoverKey(normalized)) return normalized
+        val withoutDetailKey = removeCoverQueryParam(normalized, "dongman_detail_cover")
+        return appendCoverQueryParam(withoutDetailKey, "dongman_list_cover", "1")
+    }
+
+    private fun detailCoverProbeKeyUrl(thumbnailUrl: String): String {
+        val withDetailKey = detailCoverCacheKeyUrl(thumbnailUrl)
+        if (withDetailKey.isBlank()) return ""
+        return appendCoverQueryParam(withDetailKey, "dongman_cover_probe", "detail")
+    }
+
     private fun officialListThumbnailForUi(thumbnailUrl: String): String {
         val normalized = stripImageProcessParams(thumbnailUrl.trim())
         if (normalized.isBlank()) return ""
         return if (isHomeCoverOfficialFirst() && isVerifiedDetailOfficialCoverUrl(normalized)) {
-            detailCoverCacheKeyUrl(normalized)
+            if (isSplitListDetailCoverCacheProbe()) {
+                listCoverCacheKeyUrl(normalized)
+            } else {
+                detailCoverCacheKeyUrl(normalized)
+            }
         } else {
             normalized
         }
@@ -4847,6 +4991,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_HOME_COVER_MODE = "pref_home_cover_mode"
         internal const val HOME_COVER_MODE_FAST = "fast"
         internal const val HOME_COVER_MODE_OFFICIAL_FIRST = "official_first"
+        internal const val PREF_COVER_CACHE_PROBE_MODE = "pref_cover_cache_probe_mode"
+        internal const val COVER_CACHE_PROBE_OFF = "off"
+        internal const val COVER_CACHE_PROBE_DETAIL_ONLY = "detail_only"
+        internal const val COVER_CACHE_PROBE_SPLIT_LIST_DETAIL = "split_list_detail"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
