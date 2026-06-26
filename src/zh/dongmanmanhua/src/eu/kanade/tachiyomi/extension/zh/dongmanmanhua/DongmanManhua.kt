@@ -474,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            entries = arrayOf("速度优先（等待+不空）", "真实封面优先（实验）")
+            entries = arrayOf("速度优先（可见封面等待）", "真实封面优先（实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
@@ -814,7 +814,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             scheduleCanonicalMangaIdentityStoreLoadAsync()
             scheduleLegacyNewWorkPersistentCachesClear()
             // v96：首页标题只使用本次 home HTML 的 data-sc-event-parameter。
-            // 新作封面不在 popularMangaParse 阶段等待；列表返回后立即后台预解析首屏官方封面，图片加载器复用同一个 in-flight 结果。
+            // v100.7.9：封面只接受已验证官方来源；不使用虚拟 URL、detail key、空封面伪装或未验证兜底。
         }
         return GET("$baseUrl/?pageName=home", headersBuilder().build())
     }
@@ -832,11 +832,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
         val coverMode = getHomeCoverMode()
+        val foregroundOfficialLimit = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
+            OFFICIAL_FIRST_COVER_LIMIT
+        } else {
+            OFFICIAL_FAST_COVER_WAIT_LIMIT
+        }
         val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
             prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
         } else {
             prepareOfficialNewWorkCoversForPopularVisibleNoBlank(elements)
         }
+        val backgroundOfficialStats = scheduleRemainingOfficialNewWorkCoversForPopularAsync(elements, foregroundOfficialLimit)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -856,6 +862,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "warmupAlreadyReady=${warmupStats.alreadyReady} " +
                 "warmupTrusted=${warmupStats.trustedReady} " +
                 "warmupScheduled=${warmupStats.scheduled} " +
+                "backgroundOfficialTargets=${backgroundOfficialStats.titleNos} " +
+                "backgroundOfficialScheduled=${backgroundOfficialStats.scheduled} " +
                 "coverMode=$coverMode " +
                 "coverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
                 "marketingRequests=0 " +
@@ -1222,7 +1230,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
                     // .new_works_items 的 thumbnail 可能是营销封面。
-                    // v100.7.8：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
+                    // v100.7.7：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
                     // 若个别官方封面仍失败，回退为站点直连图，保证不空、不跳过、不把详情 key 交给列表卡片。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
@@ -1637,7 +1645,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
-    // v100.7.8：所有列表模式都禁用虚拟官方封面回退。
+    // v100.7.7：所有列表模式都禁用虚拟官方封面回退。
     // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
     // 速度优先也先等可见官方封面，避免 __mihon_official_cover 和 blank 两个旧坑复发。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = false
@@ -2367,14 +2375,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val beforeCanonicalEqual = normalizeCoverKeyForCompare(thumbnailBefore) == detailThumbnailForUi
                 val beforeHasDetailKey = hasDetailCoverKey(thumbnailBefore)
                 val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
+                val shouldWriteDetailThumbnail = when {
+                    thumbnailBefore.isBlank() -> true
+                    isVirtualOfficialCoverUrl(thumbnailBefore) -> true
+                    beforeHasDetailKey -> true
+                    !beforeCanonicalEqual -> true
+                    else -> false
+                }
                 val coverDecisionReason = when {
                     thumbnailBefore.isBlank() -> "detail-official-from-empty"
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> "detail-official-replaces-virtual"
                     beforeHasDetailKey -> "strip-old-detail-key"
-                    beforeCanonicalEqual -> "canonical-official-already-current"
+                    beforeCanonicalEqual -> "same-canonical-skip-write"
                     else -> "detail-official-refresh"
                 }
-                thumbnail_url = detailThumbnailForUi
+                if (shouldWriteDetailThumbnail) {
+                    thumbnail_url = detailThumbnailForUi
+                }
                 rememberOfficialMangaMeta(titleNo, title, detailThumbnailForUi, "detail")
                 dlog(
                     "detailFinalCoverSelected mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
@@ -2382,7 +2399,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         "librarySafeCover=true noExtraRequest=true sharedHtml=true " +
                         "before=$thumbnailBefore final=$detailThumbnailForUi canonicalEqual=$beforeCanonicalEqual " +
                         "beforeHasDetailKey=$beforeHasDetailKey afterHasDetailKey=$afterHasDetailKey " +
-                        "changed=${thumbnailBefore != detailThumbnailForUi} reason=$coverDecisionReason"
+                        "changed=$shouldWriteDetailThumbnail sameCanonicalSkipWrite=${!shouldWriteDetailThumbnail} " +
+                        "reason=$coverDecisionReason"
                 )
                 dlog(
                     "detailCoverFinalAssert mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
@@ -2394,14 +2412,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
-                        "finalThumbnailApplied=true detailCacheKeyApplied=false " +
+                        "finalThumbnailApplied=$shouldWriteDetailThumbnail detailCacheKeyApplied=false " +
+                        "sameCanonicalSkipWrite=${!shouldWriteDetailThumbnail} " +
                         "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$detailThumbnailForUi " +
                         "thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
                 )
                 dlog(
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$detailThumbnailForUi " +
-                        "changed=${thumbnailBefore != detailThumbnailForUi} keepExistingOfficial=false " +
+                        "changed=$shouldWriteDetailThumbnail keepExistingOfficial=${!shouldWriteDetailThumbnail} " +
                         "detailKeyApplied=false sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
                 )
             } else {
@@ -2435,13 +2454,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             dlog(
                 "detailHealthProbe parse titleNo=${titleNo.orEmpty()} title=$title " +
                     "authorEmpty=${author.isNullOrBlank()} descEmpty=${description.isNullOrBlank()} " +
-                    "genreEmpty=${genre.isNullOrBlank()} status=$status thumbnail=${thumbnail_url.orEmpty()} " +
+                    "genreEmpty=${genre.isNullOrBlank()} status=$status thumbnail=${thumbnail_url.orEmpty().ifBlank { detailEntryThumbnailForTitleNo(titleNo) }} " +
                     "networkMs=$networkMs parseMs=${System.currentTimeMillis() - parseStartedAt}"
             )
             dlog(
                 "detailRefreshProbe action=parse titleNo=${titleNo.orEmpty()} coverMode=${getHomeCoverMode()} " +
                     "source=networkOrDetailCache thumbnailBefore=${detailEntryThumbnailForTitleNo(titleNo)} " +
-                    "thumbnailAfter=${thumbnail_url.orEmpty()} detailCoverChanged=${detailEntryThumbnailForTitleNo(titleNo) != thumbnail_url.orEmpty()} " +
+                    "thumbnailAfter=${thumbnail_url.orEmpty().ifBlank { detailEntryThumbnailForTitleNo(titleNo) }} " +
+                    "detailCoverChanged=${thumbnail_url.orEmpty().isNotBlank()} " +
                     "networkMs=$networkMs parseMs=${System.currentTimeMillis() - parseStartedAt}"
             )
         }
@@ -2807,7 +2827,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             rawThumbnail = item.thumbnailUrl,
             finalThumbnail = selectedThumbnail,
             mode = getHomeCoverMode(),
-            needsOfficialFallback = item.thumbnailUrl.startsWith(baseUrl + OFFICIAL_COVER_VIRTUAL_PATH),
+            officialCoverRequired = item.thumbnailUrl.startsWith(baseUrl + OFFICIAL_COVER_VIRTUAL_PATH),
             officialCoverVirtual = selectedThumbnail.startsWith(baseUrl + OFFICIAL_COVER_VIRTUAL_PATH),
             officialCoverPresent = detailOfficialCover.isNotBlank(),
         )
@@ -2897,12 +2917,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNew = hasNewBadge(element)
         val parsedTitle = mangaTitleFromElement(element)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
-        // 新作卡/轮播图可能不是可信竖封面：优先等详情官方封面。
-        // 但列表绝不能输出空封面；极端失败时回退为站点直连图，只作为可加载兜底。
-        val rawEmergencyThumbnail = extractThumbnailUrlAllowBanner(element, origin, titleNo)
+        // 新作卡/轮播图可能不是可信竖封面：只接受详情官方封面或已验证运行时封面。
+        // 不使用虚拟 URL、不使用 detail key、不把未验证图片包装成兜底。
         val rawParsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
         val parsedThumbnail = officialListThumbnailForUi(rawParsedThumbnail)
-        val emergencyThumbnail = officialListThumbnailForUi(rawEmergencyThumbnail)
         val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, rawParsedThumbnail, isMarketingNewWork)
         val nativeEventTitle = if (isMarketingNewWork) {
             nativeEventTitleForMarketingNewWork(element, titleNo)
@@ -2932,9 +2950,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val rawSelectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
         val selectedOfficialCover = officialListThumbnailForUi(rawSelectedOfficialCover)
-            .ifBlank { officialListThumbnailForUi(rawParsedThumbnail) }
-            .ifBlank { emergencyThumbnail }
-        val emergencyFallbackUsed = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank() && selectedOfficialCover.isNotBlank()
         val officialCoverMissing = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank()
 
         if (!needsOfficialCoverFallback) {
@@ -2942,8 +2957,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v100.7.8：列表不再给虚拟官方封面 URL。
-        // 正常路径等到官方封面；极端失败时用站点直连图兜底，禁止空封面。
+        // v100.7.9：列表不再给虚拟官方封面 URL，也不把未验证图片包装成兜底。
+        // 需要官方封面的条目只接受 verified/runtime official cover；缺失会写明 missing，不能伪装。
         thumbnail_url = if (needsOfficialCoverFallback) {
             selectedOfficialCover
         } else {
@@ -2957,7 +2972,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             rawThumbnail = rawParsedThumbnail,
             finalThumbnail = thumbnail_url.orEmpty(),
             mode = getHomeCoverMode(),
-            needsOfficialFallback = needsOfficialCoverFallback,
+            officialCoverRequired = needsOfficialCoverFallback,
             officialCoverVirtual = virtualOfficialCover.isNotBlank(),
             officialCoverPresent = verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank(),
         )
@@ -2977,7 +2992,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
-                    "emergencyFallbackUsed=$emergencyFallbackUsed " +
+                    "unverifiedSubstituteUsed=false strictVerifiedOnly=true " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
@@ -2989,7 +3004,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
                     "bannerThumbnailSuppressed=true blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
-                    "emergencyFallbackUsed=$emergencyFallbackUsed " +
+                    "unverifiedSubstituteUsed=false strictVerifiedOnly=true " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
@@ -3050,13 +3065,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return url.contains(OFFICIAL_COVER_VIRTUAL_PATH)
     }
 
-    private fun coverLifecycleThumbKind(url: String, needsOfficialFallback: Boolean, officialCoverVirtual: Boolean, officialCoverPresent: Boolean): String {
+    private fun coverLifecycleThumbKind(url: String, officialCoverRequired: Boolean, officialCoverVirtual: Boolean, officialCoverPresent: Boolean): String {
         return when {
             url.isBlank() -> "blank"
             isVirtualOfficialCoverUrl(url) || officialCoverVirtual -> "virtual-official"
             officialCoverPresent && isVerifiedDetailOfficialCoverUrl(url) -> "official-cdn-sns"
             isVerifiedDetailOfficialCoverUrl(url) -> "cdn-sns"
-            needsOfficialFallback -> "fallback"
+            officialCoverRequired -> "official-missing"
             else -> "normal"
         }
     }
@@ -3069,14 +3084,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         rawThumbnail: String,
         finalThumbnail: String,
         mode: String,
-        needsOfficialFallback: Boolean,
+        officialCoverRequired: Boolean,
         officialCoverVirtual: Boolean,
         officialCoverPresent: Boolean,
     ) {
         dlog(
             "coverLifecycleProbe stage=listEmit origin=$origin titleNo=${titleNo.orEmpty()} title=$title " +
-                "mode=$mode thumbKind=${coverLifecycleThumbKind(finalThumbnail, needsOfficialFallback, officialCoverVirtual, officialCoverPresent)} " +
-                "needsOfficialFallback=$needsOfficialFallback officialCoverPresent=$officialCoverPresent " +
+                "mode=$mode thumbKind=${coverLifecycleThumbKind(finalThumbnail, officialCoverRequired, officialCoverVirtual, officialCoverPresent)} " +
+                "officialCoverRequired=$officialCoverRequired officialCoverPresent=$officialCoverPresent " +
                 "officialCoverVirtual=$officialCoverVirtual raw=$rawThumbnail final=$finalThumbnail " +
                 "hasOssParam=${finalThumbnail.contains("x-oss-process")} isCdnSns=${isVerifiedDetailOfficialCoverUrl(finalThumbnail)} " +
                 "isDetailKey=${hasDetailCoverKey(finalThumbnail)} storedUrl=$storedUrl"
@@ -3087,7 +3102,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "hasOssParam=${finalThumbnail.contains("x-oss-process")} " +
                 "isDetailKey=${hasDetailCoverKey(finalThumbnail)} " +
                 "isVirtual=${isVirtualOfficialCoverUrl(finalThumbnail)} " +
-                "source=${if (officialCoverPresent) "official-meta" else if (officialCoverVirtual) "virtual" else "list"}"
+                "source=${if (officialCoverPresent) "official-meta" else if (officialCoverVirtual) "virtual" else if (officialCoverRequired) "missing-official" else "list"}"
         )
     }
 
@@ -3417,7 +3432,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
                 "scheduled=${states.size} success=$success missing=$missing waited=${System.currentTimeMillis() - waitStartedAt}ms " +
                 "awaitMs=$waitedMs waitLimitMs=$waitMs limit=$limitForLog " +
-                "strictNoVirtualFallback=${!allowVirtualOfficialCoverFallbackInList()} " +
+                "strictNoVirtual=${!allowVirtualOfficialCoverFallbackInList()} " +
                 "failurePending=$pending failureNetworkError=$networkError failureNoMeta=$noMeta failureOther=$failedOther " +
                 "missingTitleNos=$missingTitleNos marketingRequests=0"
         )
@@ -3428,6 +3443,49 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             success = success,
             missing = missing,
             waitedMs = System.currentTimeMillis() - waitStartedAt,
+        )
+    }
+
+    private fun scheduleRemainingOfficialNewWorkCoversForPopularAsync(
+        elements: List<Element>,
+        foregroundLimit: Int,
+    ): OfficialCoverWaitStats {
+        val targets = selectedOfficialNewWorkTargets(elements)
+            .drop(foregroundLimit)
+            .take(OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT)
+        if (targets.isEmpty()) {
+            dlog("officialCoverBackgroundSchedule origin=popular targets=0 scheduled=0 mode=${getHomeCoverMode()} strictVerifiedOnly=true")
+            return OfficialCoverWaitStats()
+        }
+        var alreadyReady = 0
+        var trustedReady = 0
+        var scheduled = 0
+        val scheduledTitleNos = mutableListOf<String>()
+        targets.forEach { target ->
+            when {
+                verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
+                trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
+                else -> {
+                    val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, OfficialCoverFetchPriority.PREFETCH)
+                    if (state != null) {
+                        scheduled += 1
+                        scheduledTitleNos += target.titleNo
+                    }
+                }
+            }
+        }
+        dlog(
+            "officialCoverBackgroundSchedule origin=popular targets=${targets.size} " +
+                "foregroundLimit=$foregroundLimit alreadyReady=$alreadyReady trustedReady=$trustedReady " +
+                "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
+                "limit=$OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT strictVerifiedOnly=true unverifiedSubstituteUsed=false " +
+                "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM marketingRequests=0"
+        )
+        return OfficialCoverWaitStats(
+            titleNos = targets.size,
+            alreadyReady = alreadyReady,
+            trustedReady = trustedReady,
+            scheduled = scheduled,
         )
     }
 
@@ -3480,7 +3538,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "demandParallelism=$OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM " +
                 "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM " +
                 "totalParallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
-                "mode=demand4-prefetch1-virtual-prefetch wait=0ms marketingRequests=0"
+                "mode=demand-prefetch-strict-official wait=0ms strictVerifiedOnly=true unverifiedSubstituteUsed=false marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -4040,7 +4098,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
             if (finished && state.completed) {
                 val status = if (state.failed) "ownerFailed" else "ownerCompletedNoBody"
-                wlog("listInflightFallback key=$key status=$status waited=${System.currentTimeMillis() - startedAt}ms")
+                wlog("listInflightDirectProceed key=$key status=$status waited=${System.currentTimeMillis() - startedAt}ms")
             } else {
                 wlog("listInflightTimeout key=$key waited=${System.currentTimeMillis() - startedAt}ms")
             }
@@ -4176,7 +4234,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
             if (finished && state.completed) {
                 val status = if (state.failed) "ownerFailed" else "ownerCompletedNoCache"
-                wlog("detailHtmlInflightFallback titleNo=$titleNo status=$status waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                wlog("detailHtmlInflightDirectProceed titleNo=$titleNo status=$status waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
             } else {
                 wlog("detailHtmlInflightTimeout titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
             }
@@ -4874,11 +4932,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 13
-        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 12
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 1
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 20
+        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 16
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 32
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 12
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
