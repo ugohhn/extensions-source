@@ -2420,23 +2420,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
                 val detailCoverRefreshMode = getDetailCoverRefreshMode()
                 val preserveExistingCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_PRESERVE
-                val wouldWriteDetailThumbnail = when {
-                    thumbnailBefore.isBlank() -> true
-                    isVirtualOfficialCoverUrl(thumbnailBefore) -> true
-                    beforeHasDetailKey -> true
-                    !beforeCanonicalEqual -> true
-                    else -> false
-                }
-                val shouldWriteDetailThumbnail = !preserveExistingCover && wouldWriteDetailThumbnail
+                val detailThumbnailUrlChanged = thumbnailBefore != detailThumbnailForUi
+                val shouldApplyDetailThumbnail = !preserveExistingCover
+                val sameCanonicalRewrite = shouldApplyDetailThumbnail && beforeCanonicalEqual &&
+                    thumbnailBefore.isNotBlank() &&
+                    !isVirtualOfficialCoverUrl(thumbnailBefore) &&
+                    !beforeHasDetailKey
                 val coverDecisionReason = when {
                     preserveExistingCover -> "preserve-existing-cover-mode"
                     thumbnailBefore.isBlank() -> "detail-official-from-empty"
                     isVirtualOfficialCoverUrl(thumbnailBefore) -> "detail-official-replaces-virtual"
                     beforeHasDetailKey -> "strip-old-detail-key"
-                    beforeCanonicalEqual -> "same-canonical-skip-write"
+                    beforeCanonicalEqual -> "sync-refresh-same-canonical-applied"
                     else -> "detail-official-refresh"
                 }
-                if (shouldWriteDetailThumbnail) {
+                if (shouldApplyDetailThumbnail) {
                     thumbnail_url = detailThumbnailForUi
                 }
                 rememberOfficialMangaMeta(titleNo, title, detailThumbnailForUi, "detail")
@@ -2447,8 +2445,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         "librarySafeCover=true noExtraRequest=true sharedHtml=true " +
                         "before=$thumbnailBefore final=$detailThumbnailForUi canonicalEqual=$beforeCanonicalEqual " +
                         "beforeHasDetailKey=$beforeHasDetailKey afterHasDetailKey=$afterHasDetailKey " +
-                        "changed=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail " +
-                        "sameCanonicalSkipWrite=${!preserveExistingCover && !wouldWriteDetailThumbnail} " +
+                        "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail " +
+                        "sameCanonicalRewrite=$sameCanonicalRewrite " +
                         "reason=$coverDecisionReason"
                 )
                 dlog(
@@ -2462,8 +2460,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "finalThumbnailApplied=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail detailCacheKeyApplied=false " +
-                        "sameCanonicalSkipWrite=${!preserveExistingCover && !wouldWriteDetailThumbnail} " +
+                        "finalThumbnailApplied=$shouldApplyDetailThumbnail detailCacheKeyApplied=false " +
+                        "sameCanonicalRewrite=$sameCanonicalRewrite urlChanged=$detailThumbnailUrlChanged " +
                         "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$detailThumbnailForUi " +
                         "thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
                 )
@@ -2471,7 +2469,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$detailThumbnailForUi " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "changed=$shouldWriteDetailThumbnail wouldWrite=$wouldWriteDetailThumbnail keepExistingOfficial=${!shouldWriteDetailThumbnail} " +
+                        "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail keepExistingOfficial=$preserveExistingCover " +
                         "detailKeyApplied=false sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
                 )
             } else {
