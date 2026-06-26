@@ -474,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            entries = arrayOf("速度优先（当前模式）", "真实封面优先（实验）")
+            entries = arrayOf("速度优先（直连封面）", "真实封面优先（实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
@@ -1216,9 +1216,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         )
                     }
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
-                    // 但 .new_works_items 的 thumbnail 是营销封面：这里不写入 cache，也不交给 UI。
-                    // 速度优先：不做同步详情请求，只生成虚拟官方封面 URL；图片加载阶段再按现有 in-flight 逻辑解析官方封面。
-                    // 真实封面优先：本轮 parse 前等待官方封面元信息；列表只输出真实可加载图片，不把详情封面缓存入口交给列表小卡片。
+                    // .new_works_items 的 thumbnail 可能是营销封面。
+                    // v100.7.6：列表禁止虚拟官方封面；速度优先拿不到详情官方封面时，回退为站点直连图片，保证不空、不虚拟、不跳过。
+                    // 真实封面优先：本轮 parse 前等待官方封面元信息；列表只输出可直接加载图片，不把详情封面缓存入口交给列表小卡片。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
                     val trustedRuntimeOfficialCover = if (verifiedOfficialCover.isBlank()) {
@@ -1248,7 +1248,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                             "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
                             "officialThumbnailPresent=${officialThumbnail.isNotBlank()} " +
-                            "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
+                            "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                             "coverMode=${getHomeCoverMode()} " +
                             "mainpathOfficialDetailRequests=${if (isHomeCoverOfficialFirst()) "strict-wait" else "0"} marketingRequests=0"
                     )
@@ -1632,9 +1632,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
-    // v100.7.5：真实封面优先模式下禁止虚拟官方封面回退；列表只用可直接加载的真实图片，详情最终封面由详情解析覆盖。
-    // 不再把 dongman_detail_cover=1 写进列表 thumbnail_url，避免列表小尺寸图污染详情封面。
-    private fun allowVirtualOfficialCoverFallbackInList(): Boolean = !isHomeCoverOfficialFirst()
+    // v100.7.6：所有列表模式都禁用虚拟官方封面回退。
+    // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
+    // 这样避免 __mihon_official_cover 被列表小卡片先解码后污染详情封面。
+    private fun allowVirtualOfficialCoverFallbackInList(): Boolean = false
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val weekdayFilter = filters.firstOrNull { it is WeekdayFilter } as? WeekdayFilter
@@ -2891,9 +2892,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNew = hasNewBadge(element)
         val parsedTitle = mangaTitleFromElement(element)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
-        // 新作卡的 style-background 是营销图：严格模式下不读取、不赋值、更不会交给图片加载器。
+        // 新作卡的 style-background 可能是营销图：优先不用它当“官方封面”。
+        // 但 v100.7.6 禁止空占位/虚拟 URL/跳过卡片；当详情官方封面缺失时，只能回退为站点直连图，保证列表可加载。
+        val rawMarketingFallbackThumbnail = if (isMarketingNewWork) extractThumbnailUrl(element, origin, titleNo) else ""
         val rawParsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
         val parsedThumbnail = officialListThumbnailForUi(rawParsedThumbnail)
+        val marketingFallbackThumbnail = officialListThumbnailForUi(rawMarketingFallbackThumbnail)
         val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, rawParsedThumbnail, isMarketingNewWork)
         val nativeEventTitle = if (isMarketingNewWork) {
             nativeEventTitleForMarketingNewWork(element, titleNo)
@@ -2923,7 +2927,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val rawSelectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
         val selectedOfficialCover = officialListThumbnailForUi(rawSelectedOfficialCover)
+            .ifBlank { if (isMarketingNewWork) marketingFallbackThumbnail else "" }
             .ifBlank { officialListThumbnailForUi(rawParsedThumbnail) }
+        val marketingFallbackUsed = needsOfficialCoverFallback &&
+            rawSelectedOfficialCover.isBlank() &&
+            isMarketingNewWork &&
+            marketingFallbackThumbnail.isNotBlank()
         val officialCoverMissing = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank()
 
         if (!needsOfficialCoverFallback) {
@@ -2931,8 +2940,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v97.2：首页里只要当前图片不能作为可信竖封面，但有 titleNo，就给虚拟官方封面 URL。
-        // 这覆盖新作营销卡和轮播独占条目，避免 thumbnail_url 为空导致 Mihon Invalid image。
+        // v100.7.6：列表不再给虚拟官方封面 URL。
+        // 如果详情官方封面未就绪，则使用站点直连图兜底；不空、不虚拟、不跳过。
         thumbnail_url = if (needsOfficialCoverFallback) {
             selectedOfficialCover
         } else {
@@ -2961,11 +2970,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "titleValid=$titleValid marketingTitle=$parsedTitle " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                     "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
-                    "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
+                    "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                     "marketingThumbnailSuppressed=true " +
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
+                    "marketingFallbackUsed=$marketingFallbackUsed " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
@@ -2974,7 +2984,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "popularBannerOnlyOfficialCover titleNo=${titleNo.orEmpty()} origin=$origin title=$title " +
                     "officialCoverPresent=${verifiedOfficialCover.isNotBlank() || trustedRuntimeOfficialCover.isNotBlank()} " +
                     "officialCoverVirtual=${virtualOfficialCover.isNotBlank()} " +
-                    "strictOfficialFirstNoVirtual=${isHomeCoverOfficialFirst()} " +
+                    "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                     "bannerThumbnailSuppressed=true blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
