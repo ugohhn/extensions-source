@@ -474,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            entries = arrayOf("速度优先（直连封面）", "真实封面优先（实验）")
+            entries = arrayOf("速度优先（修复保护）", "真实封面优先（实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
@@ -832,11 +832,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
         val coverMode = getHomeCoverMode()
-        val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
-            prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
-        } else {
-            prewarmOfficialNewWorkCoversForPopularAsync(elements)
-        }
+        // v100.7.7：先修正确性。速度优先也不再走“0ms 预热 + 虚拟 URL”。
+        // 列表输出前等待新作/轮播这类风险卡片的官方封面 meta，避免空封面、虚拟封面和详情 key 污染。
+        val warmupStats = prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -851,7 +849,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "officialCoverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
                 "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
                 "mainpathExtraRequests=0 " +
-                "mainpathOfficialDetailRequests=0 " +
+                "mainpathOfficialDetailRequests=${warmupStats.scheduled} " +
+                "officialCoverGuardRequests=${warmupStats.scheduled} " +
                 "warmupTargets=${warmupStats.titleNos} " +
                 "warmupAlreadyReady=${warmupStats.alreadyReady} " +
                 "warmupTrusted=${warmupStats.trustedReady} " +
@@ -1196,9 +1195,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 source = "new-page-list",
             )
             val newItems = document.select(".new_works_items")
-            if (isHomeCoverOfficialFirst()) {
-                prepareOfficialNewWorkCoversForNewPageOfficialFirst(newItems)
-            }
+            // v100.7.7：/new 列表不再输出虚拟封面，也不允许空封面。
+            // 无论当前模式是什么，都先用同一批详情 meta 请求把可见新作官方封面等回来；速度后续再优化。
+            val newPageCoverStats = prepareOfficialNewWorkCoversForNewPageOfficialFirst(newItems)
+            dlog(
+                "latestUpdatesParse NEW officialCoverPrewait mode=${getHomeCoverMode()} " +
+                    "targets=${newPageCoverStats.titleNos} success=${newPageCoverStats.success} " +
+                    "missing=${newPageCoverStats.missing} waited=${newPageCoverStats.waitedMs}ms " +
+                    "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} noBlankListCover=true"
+            )
             val cachedItems = newItems
                 .mapNotNull { item ->
                     val cached = cachedMangaItemFromElement(item, "new")
@@ -1216,9 +1221,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                         )
                     }
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
-                    // .new_works_items 的 thumbnail 可能是营销封面。
-                    // v100.7.6：列表禁止虚拟官方封面；速度优先拿不到详情官方封面时，回退为站点直连图片，保证不空、不虚拟、不跳过。
-                    // 真实封面优先：本轮 parse 前等待官方封面元信息；列表只输出可直接加载图片，不把详情封面缓存入口交给列表小卡片。
+                    // 但 .new_works_items 的 thumbnail 可能是营销封面，不能作为首选官方封面。
+                    // v100.7.7：列表不输出虚拟 URL、不输出空封面；前面已经等待详情 meta，正常情况下直接使用官方 SNS 封面。
+                    // 若官方封面极端失败，才回退到站点直连 thumbnail，避免封面加载不出来。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
                     val trustedRuntimeOfficialCover = if (verifiedOfficialCover.isBlank()) {
@@ -1250,7 +1255,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                             "officialThumbnailPresent=${officialThumbnail.isNotBlank()} " +
                             "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                             "coverMode=${getHomeCoverMode()} " +
-                            "mainpathOfficialDetailRequests=${if (isHomeCoverOfficialFirst()) "strict-wait" else "0"} marketingRequests=0"
+                            "mainpathOfficialDetailRequests=${newPageCoverStats.scheduled} marketingRequests=0"
                     )
                     cached.copy(thumbnailUrl = officialThumbnail, hasNew = true)
                 }
@@ -1261,7 +1266,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             dlog(
                 "latestUpdatesParse NEW url=${response.request.url} count=${entries.size} newCount=$newCount " +
                     "cacheWrite=true detailSnapshot=true source=new-page-official-cover " +
-                    "mainpathOfficialDetailRequests=0 marketingRequests=0"
+                    "mainpathOfficialDetailRequests=${newPageCoverStats.scheduled} marketingRequests=0"
             )
             logCleanAuditSummary("new-page", entries)
             return MangasPage(entries, false)
@@ -1632,9 +1637,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
-    // v100.7.6：所有列表模式都禁用虚拟官方封面回退。
-    // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
-    // 这样避免 __mihon_official_cover 被列表小卡片先解码后污染详情封面。
+    // v100.7.7：所有列表模式都禁止虚拟官方封面回退。
+    // 列表必须输出可直接加载的真实图片 URL；详情最终封面仍由详情 HTML 尽早覆盖。
+    // 注意：不能空、不能跳过、不能 detail key；官方封面未就绪时只能走站点直连应急兜底，并打日志。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = false
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -2892,12 +2897,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val hasNew = hasNewBadge(element)
         val parsedTitle = mangaTitleFromElement(element)
         val isMarketingNewWork = origin == "popular-common-card" && isPopularCommonCardNewWork(element)
-        // 新作卡的 style-background 可能是营销图：优先不用它当“官方封面”。
-        // 但 v100.7.6 禁止空占位/虚拟 URL/跳过卡片；当详情官方封面缺失时，只能回退为站点直连图，保证列表可加载。
-        val rawMarketingFallbackThumbnail = if (isMarketingNewWork) extractThumbnailUrl(element, origin, titleNo) else ""
-        val rawParsedThumbnail = if (isMarketingNewWork) "" else extractThumbnailUrl(element, origin, titleNo)
+        // 新作卡的 style/background 可能是营销图：不能作为首选官方封面。
+        // 但列表绝不能空封面。v100.7.7 会先等待官方封面；若仍失败，才用站点直连图应急兜底。
+        val rawEmergencyListThumbnail = extractThumbnailUrl(element, origin, titleNo)
+        val rawParsedThumbnail = if (isMarketingNewWork) "" else rawEmergencyListThumbnail
         val parsedThumbnail = officialListThumbnailForUi(rawParsedThumbnail)
-        val marketingFallbackThumbnail = officialListThumbnailForUi(rawMarketingFallbackThumbnail)
+        val emergencyListThumbnail = officialListThumbnailForUi(rawEmergencyListThumbnail)
         val needsOfficialCoverFallback = needsPopularOfficialCoverFallback(origin, titleNo, rawParsedThumbnail, isMarketingNewWork)
         val nativeEventTitle = if (isMarketingNewWork) {
             nativeEventTitleForMarketingNewWork(element, titleNo)
@@ -2927,12 +2932,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         val rawSelectedOfficialCover = verifiedOfficialCover.ifBlank { trustedRuntimeOfficialCover.ifBlank { virtualOfficialCover } }
         val selectedOfficialCover = officialListThumbnailForUi(rawSelectedOfficialCover)
-            .ifBlank { if (isMarketingNewWork) marketingFallbackThumbnail else "" }
+            .ifBlank { if (needsOfficialCoverFallback) emergencyListThumbnail else "" }
             .ifBlank { officialListThumbnailForUi(rawParsedThumbnail) }
-        val marketingFallbackUsed = needsOfficialCoverFallback &&
-            rawSelectedOfficialCover.isBlank() &&
-            isMarketingNewWork &&
-            marketingFallbackThumbnail.isNotBlank()
+        val emergencyListFallbackUsed = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank() && selectedOfficialCover.isNotBlank()
         val officialCoverMissing = needsOfficialCoverFallback && rawSelectedOfficialCover.isBlank()
 
         if (!needsOfficialCoverFallback) {
@@ -2940,8 +2942,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v100.7.6：列表不再给虚拟官方封面 URL。
-        // 如果详情官方封面未就绪，则使用站点直连图兜底；不空、不虚拟、不跳过。
+        // v100.7.7：首页风险卡片先等官方封面；正常输出官方 SNS 直连图。
+        // 如果官方封面极端失败，使用站点直连图应急兜底；禁止空封面、虚拟 URL、detail key。
         thumbnail_url = if (needsOfficialCoverFallback) {
             selectedOfficialCover
         } else {
@@ -2975,7 +2977,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "officialDetailFetchEnabled=true " +
                     "blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
-                    "marketingFallbackUsed=$marketingFallbackUsed " +
+                    "emergencyListFallbackUsed=$emergencyListFallbackUsed " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
@@ -2987,6 +2989,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                     "bannerThumbnailSuppressed=true blankPlaceholderApplied=false " +
                     "officialCoverMissing=$officialCoverMissing " +
+                    "emergencyListFallbackUsed=$emergencyListFallbackUsed " +
                     "uiCoverMode=${popularNewWorkCoverMode(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)} " +
                     "coverClass=${popularNewWorkCoverClass(verifiedOfficialCover, trustedRuntimeOfficialCover, virtualOfficialCover)}"
             )
@@ -3379,7 +3382,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
                 "scheduled=${states.size} success=$success missing=$missing waited=${System.currentTimeMillis() - waitStartedAt}ms " +
                 "awaitMs=$waitedMs waitLimitMs=$OFFICIAL_FIRST_COVER_WAIT_MS limit=$OFFICIAL_FIRST_COVER_LIMIT " +
-                "strictNoVirtualFallback=${isHomeCoverOfficialFirst()} " +
+                "virtualFallbackDisabled=${!allowVirtualOfficialCoverFallbackInList()} " +
                 "failurePending=$pending failureNetworkError=$networkError failureNoMeta=$noMeta failureOther=$failedOther " +
                 "missingTitleNos=$missingTitleNos marketingRequests=0"
         )
@@ -3442,7 +3445,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "demandParallelism=$OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM " +
                 "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM " +
                 "totalParallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
-                "mode=demand4-prefetch1-virtual-prefetch wait=0ms marketingRequests=0"
+                "mode=demand4-prefetch1-no-virtual wait=blocking-at-parse marketingRequests=0"
         )
         return OfficialCoverWaitStats(
             titleNos = targets.size,
@@ -4805,8 +4808,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 13
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 12
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 1
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 32
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 12
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 4_000L
