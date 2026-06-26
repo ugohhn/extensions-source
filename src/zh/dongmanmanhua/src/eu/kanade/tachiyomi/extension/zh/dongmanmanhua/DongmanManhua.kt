@@ -4937,6 +4937,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 4
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 32
         private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 12
+        private const val OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT = 20
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
