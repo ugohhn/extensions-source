@@ -474,7 +474,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_HOME_COVER_MODE
             title = "首页封面获取模式"
-            entries = arrayOf("速度优先（可见封面等待）", "真实封面优先（实验）")
+            entries = arrayOf("速度优先（等待+不空）", "真实封面优先（实验）")
             entryValues = arrayOf(HOME_COVER_MODE_FAST, HOME_COVER_MODE_OFFICIAL_FIRST)
             setDefaultValue(HOME_COVER_MODE_FAST)
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
@@ -1222,7 +1222,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     }
                     // v100：/new 的真实响应本身就是当前新作集合；标题已经是真实标题。
                     // .new_works_items 的 thumbnail 可能是营销封面。
-                    // v100.7.7：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
+                    // v100.7.8：列表禁用虚拟封面；输出前先等待可见/新作官方封面元信息。
                     // 若个别官方封面仍失败，回退为站点直连图，保证不空、不跳过、不把详情 key 交给列表卡片。
                     val titleNo = cached.titleNo?.trim().orEmpty()
                     val verifiedOfficialCover = verifiedDetailOfficialCoverForTitleNo(titleNo)
@@ -1637,7 +1637,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isHomeCoverOfficialFirst(): Boolean = getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST
 
-    // v100.7.7：所有列表模式都禁用虚拟官方封面回退。
+    // v100.7.8：所有列表模式都禁用虚拟官方封面回退。
     // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
     // 速度优先也先等可见官方封面，避免 __mihon_official_cover 和 blank 两个旧坑复发。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = false
@@ -2942,7 +2942,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         url = identityPath
         title = if (isMarketingNewWork) nativeEventTitle else parsedTitle
-        // v100.7.7：列表不再给虚拟官方封面 URL。
+        // v100.7.8：列表不再给虚拟官方封面 URL。
         // 正常路径等到官方封面；极端失败时用站点直连图兜底，禁止空封面。
         thumbnail_url = if (needsOfficialCoverFallback) {
             selectedOfficialCover
