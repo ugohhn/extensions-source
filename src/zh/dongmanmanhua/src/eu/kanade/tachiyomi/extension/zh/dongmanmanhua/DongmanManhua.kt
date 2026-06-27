@@ -2419,10 +2419,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val detailThumbnailForUi = normalizeCoverKeyForCompare(finalDetailThumbnail)
                 val detailCoverRefreshMode = getDetailCoverRefreshMode()
                 val preserveExistingCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_PRESERVE
-                val shouldApplyDetailThumbnail = !preserveExistingCover
                 val detailThumbnailUrlChanged = thumbnailBefore != detailThumbnailForUi
+                val shouldApplyDetailThumbnail = !preserveExistingCover && detailThumbnailUrlChanged
                 val coverDecisionReason = if (preserveExistingCover) {
                     "preserve-existing-cover-mode"
+                } else if (!detailThumbnailUrlChanged) {
+                    "sync-refresh-same-canonical-skip"
                 } else {
                     "sync-refresh-normal-official-canonical"
                 }
