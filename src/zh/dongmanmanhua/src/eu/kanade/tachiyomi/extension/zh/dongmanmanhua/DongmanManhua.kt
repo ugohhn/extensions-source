@@ -1373,6 +1373,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
     private val detailHtmlCacheTtlMs = 2500L
+    private val detailHtmlPreserveCacheTtlMs = 8_000L
     private val detailHtmlInflightWaitMs = 12 * 1000L
     private val detailHtmlCacheMaxEntries = 24
 
@@ -4198,12 +4199,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return titleNo.takeIf { it.isNotEmpty() }
     }
 
+    private fun currentDetailHtmlCacheTtlMs(): Long {
+        return if (isDetailCoverRefreshPreserve()) detailHtmlPreserveCacheTtlMs else detailHtmlCacheTtlMs
+    }
+
     private fun getValidDetailHtmlCache(titleNo: String): DetailHtmlCache? {
         if (titleNo.isBlank()) return null
         val now = System.currentTimeMillis()
+        val ttlMs = currentDetailHtmlCacheTtlMs()
         return synchronized(detailHtmlCache) {
             val cache = detailHtmlCache[titleNo] ?: return@synchronized null
-            if (now - cache.createdAt <= detailHtmlCacheTtlMs) {
+            if (now - cache.createdAt <= ttlMs) {
                 cache
             } else {
                 detailHtmlCache.remove(titleNo)
@@ -4242,8 +4248,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         chain: okhttp3.Interceptor.Chain,
     ): Response {
         getValidDetailHtmlCache(titleNo)?.let { cache ->
-            dlog("detailHtmlCacheHit titleNo=$titleNo age=${System.currentTimeMillis() - cache.createdAt}ms url=${request.url}")
-            dlog("detailRefreshProbe action=html titleNo=$titleNo source=cacheHit cacheAge=${System.currentTimeMillis() - cache.createdAt}ms owner=false url=${request.url}")
+            val cacheAge = System.currentTimeMillis() - cache.createdAt
+            val preserveDebounce = isDetailCoverRefreshPreserve()
+            val ttlMs = currentDetailHtmlCacheTtlMs()
+            dlog(
+                "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
+                    "preserveDebounce=$preserveDebounce url=${request.url}"
+            )
+            dlog(
+                "detailRefreshProbe action=html titleNo=$titleNo source=cacheHit cacheAge=${cacheAge}ms " +
+                    "ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+            )
             return cachedDetailHtmlResponse(request, cache)
         }
 
@@ -4267,8 +4282,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightWait owner=false url=${request.url}")
             val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
             if (cacheBeforeWait != null) {
-                dlog("detailHtmlCacheHit titleNo=$titleNo age=${System.currentTimeMillis() - cacheBeforeWait.createdAt}ms url=${request.url}")
-                dlog("detailRefreshProbe action=html titleNo=$titleNo source=cacheHitBeforeWait cacheAge=${System.currentTimeMillis() - cacheBeforeWait.createdAt}ms owner=false url=${request.url}")
+                val cacheAge = System.currentTimeMillis() - cacheBeforeWait.createdAt
+                val preserveDebounce = isDetailCoverRefreshPreserve()
+                val ttlMs = currentDetailHtmlCacheTtlMs()
+                dlog(
+                    "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
+                        "preserveDebounce=$preserveDebounce url=${request.url}"
+                )
+                dlog(
+                    "detailRefreshProbe action=html titleNo=$titleNo source=cacheHitBeforeWait cacheAge=${cacheAge}ms " +
+                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+                )
                 return cachedDetailHtmlResponse(request, cacheBeforeWait)
             }
 
@@ -4277,8 +4301,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }.getOrDefault(false)
 
             getValidDetailHtmlCache(titleNo)?.let { cache ->
-                dlog("detailHtmlInflightJoined titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
-                dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightJoined waited=${System.currentTimeMillis() - startedAt}ms owner=false url=${request.url}")
+                val waited = System.currentTimeMillis() - startedAt
+                val cacheAge = System.currentTimeMillis() - cache.createdAt
+                val preserveDebounce = isDetailCoverRefreshPreserve()
+                val ttlMs = currentDetailHtmlCacheTtlMs()
+                dlog(
+                    "detailHtmlInflightJoined titleNo=$titleNo waited=${waited}ms cacheAge=${cacheAge}ms " +
+                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce url=${request.url}"
+                )
+                dlog(
+                    "detailRefreshProbe action=html titleNo=$titleNo source=inflightJoined waited=${waited}ms " +
+                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+                )
                 return cachedDetailHtmlResponse(request, cache)
             }
 
