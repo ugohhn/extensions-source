@@ -483,8 +483,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         ListPreference(ctx).apply {
             key = PREF_DETAIL_COVER_REFRESH_MODE
             title = "详情页手动刷新封面"
-            entries = arrayOf("智能同步封面（默认）", "强制重写封面", "保留现有封面")
-            entryValues = arrayOf(DETAIL_COVER_REFRESH_SYNC, DETAIL_COVER_REFRESH_FORCE, DETAIL_COVER_REFRESH_PRESERVE)
+            entries = arrayOf("同步刷新封面（默认）", "保留现有封面")
+            entryValues = arrayOf(DETAIL_COVER_REFRESH_SYNC, DETAIL_COVER_REFRESH_PRESERVE)
             setDefaultValue(DETAIL_COVER_REFRESH_SYNC)
             bindDetailCoverRefreshModeSummary(DETAIL_COVER_REFRESH_SYNC)
         }.also(screen::addPreference)
@@ -569,9 +569,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val index = findIndexOfValue(normalized)
         val current = if (index >= 0) entries[index] else ""
         summary = when (normalized) {
-            DETAIL_COVER_REFRESH_PRESERVE -> "当前：$current\n手动刷新详情时不写入 thumbnail_url；只更新简介、标签、状态、章节等。"
-            DETAIL_COVER_REFRESH_FORCE -> "当前：$current\n手动刷新详情时强制重写已验证官方封面；仅用于封面异常时修复。"
-            else -> "当前：$current\n手动刷新详情时检查官方封面；封面变化、旧封面脏、旧封面为空时才写入；相同 clean canonical 不重复重写。"
+            DETAIL_COVER_REFRESH_PRESERVE -> "当前：$current\n手动刷新详情时不写入 thumbnail_url；简介、标签、状态、章节照常刷新，不用长缓存压住刷新。"
+            else -> "当前：$current\n手动刷新详情照常刷新；已有封面不参与等待，只有官方封面真正变化或当前封面为空时才写入。"
         }
     }
 
@@ -1373,9 +1372,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
-    private val detailHtmlCacheTtlMs = 2500L
-    private val detailHtmlPreserveCacheTtlMs = 3_500L
-    private val detailHtmlInflightWaitMs = 12 * 1000L
+    private val detailHtmlCacheTtlMs = 900L
+    private val detailHtmlInflightWaitMs = 3500L
     private val detailHtmlCacheMaxEntries = 24
 
     private val listInflight = mutableMapOf<String, ListInflightState>()
@@ -1678,7 +1676,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun normalizeDetailCoverRefreshMode(value: String?): String {
         return when (value) {
             DETAIL_COVER_REFRESH_PRESERVE -> DETAIL_COVER_REFRESH_PRESERVE
-            DETAIL_COVER_REFRESH_FORCE -> DETAIL_COVER_REFRESH_FORCE
             else -> DETAIL_COVER_REFRESH_SYNC
         }
     }
@@ -2423,31 +2420,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
                 val detailCoverRefreshMode = getDetailCoverRefreshMode()
                 val preserveExistingCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_PRESERVE
-                val forceRewriteCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_FORCE
+                val thumbnailHasVirtualKey = isVirtualOfficialCoverUrl(thumbnailBefore)
                 val detailThumbnailUrlChanged = thumbnailBefore != detailThumbnailForUi
                 val shouldApplyDetailThumbnail = when {
                     preserveExistingCover -> false
-                    forceRewriteCover -> true
                     thumbnailBefore.isBlank() -> true
-                    isVirtualOfficialCoverUrl(thumbnailBefore) -> true
-                    beforeHasDetailKey -> true
+                    beforeHasDetailKey || thumbnailHasVirtualKey -> true
                     !beforeCanonicalEqual -> true
                     else -> false
                 }
-                val sameCanonicalRewrite = shouldApplyDetailThumbnail && beforeCanonicalEqual &&
-                    thumbnailBefore.isNotBlank() &&
-                    !isVirtualOfficialCoverUrl(thumbnailBefore) &&
-                    !beforeHasDetailKey
+                val sameCanonicalRewrite = false
                 val sameCanonicalSkipWrite = !shouldApplyDetailThumbnail && beforeCanonicalEqual &&
                     thumbnailBefore.isNotBlank() &&
                     !preserveExistingCover
                 val coverDecisionReason = when {
                     preserveExistingCover -> "preserve-existing-cover-mode"
-                    forceRewriteCover && beforeCanonicalEqual -> "force-refresh-same-canonical-applied"
-                    forceRewriteCover -> "force-refresh-official-cover-applied"
                     thumbnailBefore.isBlank() -> "detail-official-from-empty"
-                    isVirtualOfficialCoverUrl(thumbnailBefore) -> "detail-official-replaces-virtual"
-                    beforeHasDetailKey -> "strip-old-detail-key"
+                    beforeHasDetailKey || thumbnailHasVirtualKey -> "strip-low-cost-cover-key"
                     beforeCanonicalEqual -> "sync-refresh-same-canonical-skip-write"
                     else -> "detail-official-refresh"
                 }
@@ -2459,8 +2448,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "detailFinalCoverSelected mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
                         "source=${if (rememberedDetailThumbnail.isNotBlank()) "detail-html-og-twitter" else "runtime-cache"} " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "forceRewriteCover=$forceRewriteCover " +
-                        "librarySafeCover=true noExtraRequest=true sharedHtml=true " +
+                        "librarySafeCover=true noExtraRequest=true sharedHtml=true coverDecoupled=true " +
                         "before=$thumbnailBefore final=$detailThumbnailForUi canonicalEqual=$beforeCanonicalEqual " +
                         "beforeHasDetailKey=$beforeHasDetailKey afterHasDetailKey=$afterHasDetailKey " +
                         "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail " +
@@ -2478,8 +2466,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "forceRewriteCover=$forceRewriteCover " +
-                        "finalThumbnailApplied=$shouldApplyDetailThumbnail detailCacheKeyApplied=false " +
+                        "finalThumbnailApplied=$shouldApplyDetailThumbnail detailCacheKeyApplied=false coverDecoupled=true " +
                         "sameCanonicalRewrite=$sameCanonicalRewrite sameCanonicalSkipWrite=$sameCanonicalSkipWrite urlChanged=$detailThumbnailUrlChanged " +
                         "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$detailThumbnailForUi " +
                         "thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
@@ -2488,7 +2475,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$detailThumbnailForUi " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "forceRewriteCover=$forceRewriteCover " +
                         "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail keepExistingOfficial=$preserveExistingCover " +
                         "detailKeyApplied=false sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
                 )
@@ -4218,9 +4204,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         return titleNo.takeIf { it.isNotEmpty() }
     }
 
-    private fun currentDetailHtmlCacheTtlMs(): Long {
-        return if (isDetailCoverRefreshPreserve()) detailHtmlPreserveCacheTtlMs else detailHtmlCacheTtlMs
-    }
+    private fun currentDetailHtmlCacheTtlMs(): Long = detailHtmlCacheTtlMs
 
     private fun getValidDetailHtmlCache(titleNo: String): DetailHtmlCache? {
         if (titleNo.isBlank()) return null
@@ -4268,15 +4252,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     ): Response {
         getValidDetailHtmlCache(titleNo)?.let { cache ->
             val cacheAge = System.currentTimeMillis() - cache.createdAt
-            val preserveDebounce = isDetailCoverRefreshPreserve()
+            val preserveDebounce = false
             val ttlMs = currentDetailHtmlCacheTtlMs()
             dlog(
                 "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
-                    "preserveDebounce=$preserveDebounce url=${request.url}"
+                    "preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
             )
             dlog(
                 "detailRefreshProbe action=html titleNo=$titleNo source=cacheHit cacheAge=${cacheAge}ms " +
-                    "ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+                    "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
             )
             return cachedDetailHtmlResponse(request, cache)
         }
@@ -4302,15 +4286,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
             if (cacheBeforeWait != null) {
                 val cacheAge = System.currentTimeMillis() - cacheBeforeWait.createdAt
-                val preserveDebounce = isDetailCoverRefreshPreserve()
+                val preserveDebounce = false
                 val ttlMs = currentDetailHtmlCacheTtlMs()
                 dlog(
                     "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
-                        "preserveDebounce=$preserveDebounce url=${request.url}"
+                        "preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
                 )
                 dlog(
                     "detailRefreshProbe action=html titleNo=$titleNo source=cacheHitBeforeWait cacheAge=${cacheAge}ms " +
-                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
                 )
                 return cachedDetailHtmlResponse(request, cacheBeforeWait)
             }
@@ -4322,15 +4306,15 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             getValidDetailHtmlCache(titleNo)?.let { cache ->
                 val waited = System.currentTimeMillis() - startedAt
                 val cacheAge = System.currentTimeMillis() - cache.createdAt
-                val preserveDebounce = isDetailCoverRefreshPreserve()
+                val preserveDebounce = false
                 val ttlMs = currentDetailHtmlCacheTtlMs()
                 dlog(
                     "detailHtmlInflightJoined titleNo=$titleNo waited=${waited}ms cacheAge=${cacheAge}ms " +
-                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce url=${request.url}"
+                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
                 )
                 dlog(
                     "detailRefreshProbe action=html titleNo=$titleNo source=inflightJoined waited=${waited}ms " +
-                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs preserveDebounce=$preserveDebounce owner=false url=${request.url}"
+                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
                 )
                 return cachedDetailHtmlResponse(request, cache)
             }
@@ -5086,7 +5070,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val HOME_COVER_MODE_OFFICIAL_FIRST = "official_first"
         internal const val PREF_DETAIL_COVER_REFRESH_MODE = "pref_detail_cover_refresh_mode"
         internal const val DETAIL_COVER_REFRESH_SYNC = "sync"
-        internal const val DETAIL_COVER_REFRESH_FORCE = "force"
         internal const val DETAIL_COVER_REFRESH_PRESERVE = "preserve"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
