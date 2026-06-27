@@ -2347,7 +2347,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // ══════════════════════════════════════════════════════════════════════
 
     override fun mangaDetailsRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().build()
+        val reqHeaders = headersBuilder()
+            .set(DETAIL_REQUEST_TYPE_HEADER, DETAIL_REQUEST_TYPE_DETAILS)
+            .build()
         val cleanPath = cleanMangaDetailPath(manga.url)
         val requestPath = canonicalDetailRequestPath(manga.url)
         val finalUrl = baseUrl + requestPath
@@ -2504,7 +2506,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val dateFormat = SimpleDateFormat("yyyy-M-d", Locale.ENGLISH)
 
     override fun chapterListRequest(manga: SManga): Request {
-        val reqHeaders = headersBuilder().build()
+        val reqHeaders = headersBuilder()
+            .set(DETAIL_REQUEST_TYPE_HEADER, DETAIL_REQUEST_TYPE_CHAPTERS)
+            .build()
         val cleanPath = cleanMangaDetailPath(manga.url)
         val requestPath = canonicalDetailRequestPath(manga.url)
         val finalUrl = baseUrl + requestPath
@@ -4180,16 +4184,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun currentDetailHtmlCacheTtlMs(): Long = detailHtmlCacheTtlMs
 
-    private fun getValidDetailHtmlCache(titleNo: String): DetailHtmlCache? {
+    private fun detailRequestType(request: Request): String = request.header(DETAIL_REQUEST_TYPE_HEADER).orEmpty()
+
+    private fun detailNetworkRequest(request: Request): Request = request.newBuilder()
+        .removeHeader(DETAIL_REQUEST_TYPE_HEADER)
+        .build()
+
+    private fun getValidDetailHtmlCache(titleNo: String, minCreatedAt: Long = 0L): DetailHtmlCache? {
         if (titleNo.isBlank()) return null
         val now = System.currentTimeMillis()
         val ttlMs = currentDetailHtmlCacheTtlMs()
         return synchronized(detailHtmlCache) {
             val cache = detailHtmlCache[titleNo] ?: return@synchronized null
-            if (now - cache.createdAt <= ttlMs) {
+            if (now - cache.createdAt <= ttlMs && cache.createdAt >= minCreatedAt) {
                 cache
             } else {
-                detailHtmlCache.remove(titleNo)
+                if (now - cache.createdAt > ttlMs) detailHtmlCache.remove(titleNo)
                 null
             }
         }
@@ -4224,19 +4234,28 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         request: Request,
         chain: okhttp3.Interceptor.Chain,
     ): Response {
-        getValidDetailHtmlCache(titleNo)?.let { cache ->
-            val cacheAge = System.currentTimeMillis() - cache.createdAt
-            val preserveDebounce = false
-            val ttlMs = currentDetailHtmlCacheTtlMs()
+        val requestType = detailRequestType(request).ifBlank { "unknown" }
+        val allowHandoffCache = requestType == DETAIL_REQUEST_TYPE_CHAPTERS
+        val ttlMs = currentDetailHtmlCacheTtlMs()
+
+        if (allowHandoffCache) {
+            getValidDetailHtmlCache(titleNo)?.let { cache ->
+                val cacheAge = System.currentTimeMillis() - cache.createdAt
+                dlog(
+                    "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
+                        "requestType=$requestType detailsBypassCache=false chapterHandoff=true url=${request.url}"
+                )
+                dlog(
+                    "detailRefreshProbe action=html titleNo=$titleNo source=chapterHandoffCache cacheAge=${cacheAge}ms " +
+                        "ttlMs=$ttlMs requestType=$requestType owner=false url=${request.url}"
+                )
+                return cachedDetailHtmlResponse(request, cache)
+            }
+        } else {
             dlog(
-                "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
-                    "preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
+                "detailRefreshProbe action=html titleNo=$titleNo source=cacheBypass " +
+                    "ttlMs=$ttlMs requestType=$requestType detailsBypassCache=true owner=false url=${request.url}"
             )
-            dlog(
-                "detailRefreshProbe action=html titleNo=$titleNo source=cacheHit cacheAge=${cacheAge}ms " +
-                    "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
-            )
-            return cachedDetailHtmlResponse(request, cache)
         }
 
         val state: DetailHtmlInflightState
@@ -4255,58 +4274,61 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         if (!isOwner) {
             val startedAt = System.currentTimeMillis()
-            dlog("detailHealthProbe html action=wait titleNo=$titleNo url=${request.url}")
-            dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightWait owner=false url=${request.url}")
-            val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
-            if (cacheBeforeWait != null) {
-                val cacheAge = System.currentTimeMillis() - cacheBeforeWait.createdAt
-                val preserveDebounce = false
-                val ttlMs = currentDetailHtmlCacheTtlMs()
-                dlog(
-                    "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
-                        "preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
-                )
-                dlog(
-                    "detailRefreshProbe action=html titleNo=$titleNo source=cacheHitBeforeWait cacheAge=${cacheAge}ms " +
-                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
-                )
-                return cachedDetailHtmlResponse(request, cacheBeforeWait)
+            dlog("detailHealthProbe html action=wait titleNo=$titleNo requestType=$requestType url=${request.url}")
+            dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightWait requestType=$requestType owner=false url=${request.url}")
+            if (allowHandoffCache) {
+                val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
+                if (cacheBeforeWait != null) {
+                    val cacheAge = System.currentTimeMillis() - cacheBeforeWait.createdAt
+                    dlog(
+                        "detailHtmlCacheHit titleNo=$titleNo age=${cacheAge}ms ttlMs=$ttlMs " +
+                            "requestType=$requestType detailsBypassCache=false chapterHandoff=true url=${request.url}"
+                    )
+                    dlog(
+                        "detailRefreshProbe action=html titleNo=$titleNo source=chapterHandoffCacheBeforeWait cacheAge=${cacheAge}ms " +
+                            "ttlMs=$ttlMs requestType=$requestType owner=false url=${request.url}"
+                    )
+                    return cachedDetailHtmlResponse(request, cacheBeforeWait)
+                }
             }
 
             val finished = runCatching {
                 state.latch.await(detailHtmlInflightWaitMs, TimeUnit.MILLISECONDS)
             }.getOrDefault(false)
 
-            getValidDetailHtmlCache(titleNo)?.let { cache ->
+            val joinedCache = if (allowHandoffCache) {
+                getValidDetailHtmlCache(titleNo)
+            } else {
+                getValidDetailHtmlCache(titleNo, minCreatedAt = startedAt)
+            }
+            joinedCache?.let { cache ->
                 val waited = System.currentTimeMillis() - startedAt
                 val cacheAge = System.currentTimeMillis() - cache.createdAt
-                val preserveDebounce = false
-                val ttlMs = currentDetailHtmlCacheTtlMs()
                 dlog(
                     "detailHtmlInflightJoined titleNo=$titleNo waited=${waited}ms cacheAge=${cacheAge}ms " +
-                        "ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true url=${request.url}"
+                        "ttlMs=$ttlMs requestType=$requestType freshOwnerHtml=${cache.createdAt >= startedAt} url=${request.url}"
                 )
                 dlog(
                     "detailRefreshProbe action=html titleNo=$titleNo source=inflightJoined waited=${waited}ms " +
-                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs preserveDebounce=$preserveDebounce shortHandoff=true owner=false url=${request.url}"
+                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs requestType=$requestType owner=false url=${request.url}"
                 )
                 return cachedDetailHtmlResponse(request, cache)
             }
 
             if (finished && state.completed) {
-                val status = if (state.failed) "ownerFailed" else "ownerCompletedNoCache"
-                wlog("detailHtmlInflightDirectProceed titleNo=$titleNo status=$status waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                val status = if (state.failed) "ownerFailed" else "ownerCompletedNoFreshCache"
+                wlog("detailHtmlInflightDirectProceed titleNo=$titleNo status=$status requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
             } else {
-                wlog("detailHtmlInflightTimeout titleNo=$titleNo waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                wlog("detailHtmlInflightTimeout titleNo=$titleNo requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
             }
-            return chain.proceed(request)
+            return chain.proceed(detailNetworkRequest(request))
         }
 
         var ownerFailed = false
         try {
-            dlog("detailHealthProbe html action=owner titleNo=$titleNo url=${request.url}")
-            dlog("detailRefreshProbe action=html titleNo=$titleNo source=networkOwner owner=true url=${request.url}")
-            val response = chain.proceed(request)
+            dlog("detailHealthProbe html action=owner titleNo=$titleNo requestType=$requestType url=${request.url}")
+            dlog("detailRefreshProbe action=html titleNo=$titleNo source=networkOwner requestType=$requestType owner=true url=${request.url}")
+            val response = chain.proceed(detailNetworkRequest(request))
             val contentType = response.body.contentType()?.toString().orEmpty().ifBlank { "text/html;charset=UTF-8" }
             val bodyString = response.body.string()
             val cacheable = response.isSuccessful && bodyString.isNotBlank()
@@ -4314,9 +4336,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 putDetailHtmlCache(titleNo, bodyString, contentType)
             } else {
                 ownerFailed = true
-                wlog("detailHtmlOwnerNoCache titleNo=$titleNo code=${response.code} bytes=${bodyString.length} url=${request.url}")
+                wlog("detailHtmlOwnerNoCache titleNo=$titleNo requestType=$requestType code=${response.code} bytes=${bodyString.length} url=${request.url}")
             }
             return response.newBuilder()
+                .request(request)
                 .body(bodyString.toResponseBody(contentType.toMediaType()))
                 .build()
         } catch (e: Exception) {
@@ -5045,6 +5068,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_DETAIL_COVER_REFRESH_MODE = "pref_detail_cover_refresh_mode"
         internal const val DETAIL_COVER_REFRESH_SYNC = "sync"
         internal const val DETAIL_COVER_REFRESH_PRESERVE = "preserve"
+        private const val DETAIL_REQUEST_TYPE_HEADER = "X-Dongman-Detail-Request-Type"
+        private const val DETAIL_REQUEST_TYPE_DETAILS = "details"
+        private const val DETAIL_REQUEST_TYPE_CHAPTERS = "chapters"
         internal const val PREF_POPULAR_GENRE_ENABLED = "pref_popular_genre_enabled"
         private const val PREF_CANONICAL_IDENTITY_MAP = "pref_canonical_identity_map"
         private const val CANONICAL_IDENTITY_STORE_MAX_ENTRIES = 1200
