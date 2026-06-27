@@ -570,7 +570,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val current = if (index >= 0) entries[index] else ""
         summary = when (normalized) {
             DETAIL_COVER_REFRESH_PRESERVE -> "当前：$current\n手动刷新详情时不写入 thumbnail_url；简介、标签、状态、章节照常刷新，不用长缓存压住刷新。"
-            else -> "当前：$current\n手动刷新详情照常刷新；已有封面不参与等待，只有官方封面真正变化或当前封面为空时才写入。"
+            else -> "当前：$current\n手动刷新详情照常刷新；解析到详情页官方 canonical 封面就正常写入，不做旧封面状态检测。"
         }
     }
 
@@ -2415,30 +2415,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (finalDetailThumbnail.isNotBlank()) {
                 val thumbnailBefore = detailEntryThumbnailForTitleNo(titleNo)
                 val detailThumbnailForUi = normalizeCoverKeyForCompare(finalDetailThumbnail)
-                val beforeCanonicalEqual = normalizeCoverKeyForCompare(thumbnailBefore) == detailThumbnailForUi
-                val beforeHasDetailKey = hasDetailCoverKey(thumbnailBefore)
-                val afterHasDetailKey = hasDetailCoverKey(detailThumbnailForUi)
                 val detailCoverRefreshMode = getDetailCoverRefreshMode()
                 val preserveExistingCover = detailCoverRefreshMode == DETAIL_COVER_REFRESH_PRESERVE
-                val thumbnailHasVirtualKey = isVirtualOfficialCoverUrl(thumbnailBefore)
+                val shouldApplyDetailThumbnail = !preserveExistingCover
                 val detailThumbnailUrlChanged = thumbnailBefore != detailThumbnailForUi
-                val shouldApplyDetailThumbnail = when {
-                    preserveExistingCover -> false
-                    thumbnailBefore.isBlank() -> true
-                    beforeHasDetailKey || thumbnailHasVirtualKey -> true
-                    !beforeCanonicalEqual -> true
-                    else -> false
-                }
-                val sameCanonicalRewrite = false
-                val sameCanonicalSkipWrite = !shouldApplyDetailThumbnail && beforeCanonicalEqual &&
-                    thumbnailBefore.isNotBlank() &&
-                    !preserveExistingCover
-                val coverDecisionReason = when {
-                    preserveExistingCover -> "preserve-existing-cover-mode"
-                    thumbnailBefore.isBlank() -> "detail-official-from-empty"
-                    beforeHasDetailKey || thumbnailHasVirtualKey -> "strip-low-cost-cover-key"
-                    beforeCanonicalEqual -> "sync-refresh-same-canonical-skip-write"
-                    else -> "detail-official-refresh"
+                val coverDecisionReason = if (preserveExistingCover) {
+                    "preserve-existing-cover-mode"
+                } else {
+                    "sync-refresh-normal-official-canonical"
                 }
                 if (shouldApplyDetailThumbnail) {
                     thumbnail_url = detailThumbnailForUi
@@ -2448,35 +2432,25 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     "detailFinalCoverSelected mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
                         "source=${if (rememberedDetailThumbnail.isNotBlank()) "detail-html-og-twitter" else "runtime-cache"} " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "librarySafeCover=true noExtraRequest=true sharedHtml=true coverDecoupled=true " +
-                        "before=$thumbnailBefore final=$detailThumbnailForUi canonicalEqual=$beforeCanonicalEqual " +
-                        "beforeHasDetailKey=$beforeHasDetailKey afterHasDetailKey=$afterHasDetailKey " +
+                        "noExtraRequest=true sharedHtml=true cleanNormalRefresh=true " +
+                        "before=$thumbnailBefore final=$detailThumbnailForUi " +
                         "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail " +
-                        "sameCanonicalRewrite=$sameCanonicalRewrite sameCanonicalSkipWrite=$sameCanonicalSkipWrite " +
                         "reason=$coverDecisionReason"
-                )
-                dlog(
-                    "detailCoverFinalAssert mode=${getHomeCoverMode()} titleNo=${titleNo.orEmpty()} " +
-                        "isCdnSns=${isVerifiedDetailOfficialCoverUrl(detailThumbnailForUi)} " +
-                        "hasOssParam=${detailThumbnailForUi.contains("x-oss-process")} " +
-                        "hasDetailKey=$afterHasDetailKey isVirtual=${isVirtualOfficialCoverUrl(detailThumbnailForUi)} " +
-                        "final=$detailThumbnailForUi"
                 )
                 dlog(
                     "detailOfficialCoverRuntime titleNo=${titleNo.orEmpty()} " +
                         "coverPresent=true source=og-twitter-cdn-sns runtimeOnly=true " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
-                        "finalThumbnailApplied=$shouldApplyDetailThumbnail detailCacheKeyApplied=false coverDecoupled=true " +
-                        "sameCanonicalRewrite=$sameCanonicalRewrite sameCanonicalSkipWrite=$sameCanonicalSkipWrite urlChanged=$detailThumbnailUrlChanged " +
-                        "thumbnailUrl=$detailThumbnailForUi canonicalThumbnail=$detailThumbnailForUi " +
-                        "thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
+                        "finalThumbnailApplied=$shouldApplyDetailThumbnail detailCacheKeyApplied=false cleanNormalRefresh=true " +
+                        "urlChanged=$detailThumbnailUrlChanged thumbnailUrl=$detailThumbnailForUi " +
+                        "canonicalThumbnail=$detailThumbnailForUi thumbnailBefore=$thumbnailBefore coverMode=${getHomeCoverMode()}"
                 )
                 dlog(
                     "coverLifecycleProbe stage=detailAfter titleNo=${titleNo.orEmpty()} mode=${getHomeCoverMode()} " +
                         "oldThumb=$thumbnailBefore newThumb=$detailThumbnailForUi canonical=$detailThumbnailForUi " +
                         "detailCoverRefreshMode=$detailCoverRefreshMode preserveExistingCover=$preserveExistingCover " +
                         "changed=$detailThumbnailUrlChanged applied=$shouldApplyDetailThumbnail keepExistingOfficial=$preserveExistingCover " +
-                        "detailKeyApplied=false sameImageDifferentKey=${sameCoverImageDifferentKey(thumbnailBefore, detailThumbnailForUi)}"
+                        "cleanNormalRefresh=true"
                 )
             } else {
                 dlog(
