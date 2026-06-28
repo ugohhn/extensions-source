@@ -863,7 +863,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val foregroundOfficialLimit = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
             OFFICIAL_FIRST_COVER_LIMIT
         } else {
-            0
+            OFFICIAL_FAST_COVER_WAIT_LIMIT
         }
         val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
             prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
@@ -1373,8 +1373,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val detailHtmlCache = mutableMapOf<String, DetailHtmlCache>()
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
     private val detailHtmlCacheTtlMs = 900L
-    private val detailHtmlInflightWaitMs = 1200L
-    private val chapterHtmlInflightWaitMs = 0L
+    private val detailHtmlInflightWaitMs = 3500L
+    private val chapterHtmlInflightWaitMs = 1200L
     private val detailHtmlCacheMaxEntries = 24
 
     private val listInflight = mutableMapOf<String, ListInflightState>()
@@ -3394,9 +3394,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun prepareOfficialNewWorkCoversForPopularVisibleNoBlank(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_FAST_COVER_WAIT_LIMIT)
-        return prepareOfficialCoverTargetsReadyOnly(
-            origin = "popular-fast-ready-only",
+        return prepareOfficialCoverTargetsForListBlocking(
+            origin = "popular-fast-no-virtual",
             targets = targets,
+            waitMs = OFFICIAL_FAST_COVER_WAIT_MS,
             limitForLog = OFFICIAL_FAST_COVER_WAIT_LIMIT,
         )
     }
@@ -3423,59 +3424,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun prepareOfficialNewWorkCoversForNewPageVisibleNoBlank(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedNewPageOfficialCoverTargets(elements).take(OFFICIAL_FAST_COVER_WAIT_LIMIT)
-        return if (isHomeCoverOfficialFirst()) {
-            prepareOfficialCoverTargetsForListBlocking(
-                origin = "new-page-official-first",
-                targets = targets,
-                waitMs = OFFICIAL_FIRST_COVER_WAIT_MS,
-                limitForLog = OFFICIAL_FAST_COVER_WAIT_LIMIT,
-            )
-        } else {
-            prepareOfficialCoverTargetsReadyOnly(
-                origin = "new-page-fast-ready-only",
-                targets = targets,
-                limitForLog = OFFICIAL_FAST_COVER_WAIT_LIMIT,
-            )
-        }
-    }
-
-    private fun prepareOfficialCoverTargetsReadyOnly(
-        origin: String,
-        targets: List<OfficialNewWorkCoverTarget>,
-        limitForLog: Int,
-    ): OfficialCoverWaitStats {
-        if (targets.isEmpty()) {
-            dlog("coverModeProbe mode=${getHomeCoverMode()} origin=$origin targets=0 waited=0ms success=0 missing=0 readyOnly=true")
-            return OfficialCoverWaitStats()
-        }
-        val alreadyReady = targets.count { verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() }
-        val trustedReady = targets.count {
-            verifiedDetailOfficialCoverForTitleNo(it.titleNo).isBlank() && trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isNotBlank()
-        }
-        val success = targets.count {
-            verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() || trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isNotBlank()
-        }
-        val missing = targets.size - success
-        val missingTitleNos = targets.filter {
-            verifiedDetailOfficialCoverForTitleNo(it.titleNo).isBlank() && trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isBlank()
-        }.joinToString("|") { it.titleNo }
-        dlog(
-            "coverModeProbe mode=${getHomeCoverMode()} origin=$origin targets=${targets.size} " +
-                "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
-                "trustedReady=$trustedReady scheduled=0 success=$success missing=$missing waited=0ms " +
-                "awaitMs=0 waitLimitMs=0 limit=$limitForLog " +
-                "strictNoVirtual=${!allowVirtualOfficialCoverFallbackInList()} readyOnly=true " +
-                "failurePending=0 failureNetworkError=0 failureNoMeta=0 failureOther=0 " +
-                "missingTitleNos=$missingTitleNos marketingRequests=0"
-        )
-        return OfficialCoverWaitStats(
-            titleNos = targets.size,
-            alreadyReady = alreadyReady,
-            trustedReady = trustedReady,
-            scheduled = 0,
-            success = success,
-            missing = missing,
-            waitedMs = 0L,
+        return prepareOfficialCoverTargetsForListBlocking(
+            origin = "new-page-no-virtual",
+            targets = targets,
+            waitMs = if (isHomeCoverOfficialFirst()) OFFICIAL_FIRST_COVER_WAIT_MS else OFFICIAL_FAST_COVER_WAIT_MS,
+            limitForLog = OFFICIAL_FAST_COVER_WAIT_LIMIT,
         )
     }
 
@@ -5074,7 +5027,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 8
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
         private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 2
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 12
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
         private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
         private const val OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT = 8
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
@@ -5085,10 +5038,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
         private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
-        private const val LOG_THUMBNAIL_NORMALIZE = false
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 96
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 64
+        private const val LOG_THUMBNAIL_NORMALIZE = false
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
