@@ -1374,6 +1374,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private val detailHtmlInflight = mutableMapOf<String, DetailHtmlInflightState>()
     private val detailHtmlCacheTtlMs = 900L
     private val detailHtmlInflightWaitMs = 3500L
+    private val chapterHtmlInflightWaitMs = 1200L
     private val detailHtmlCacheMaxEntries = 24
 
     private val listInflight = mutableMapOf<String, ListInflightState>()
@@ -4276,8 +4277,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         if (!isOwner) {
             val startedAt = System.currentTimeMillis()
-            dlog("detailHealthProbe html action=wait titleNo=$titleNo requestType=$requestType url=${request.url}")
-            dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightWait requestType=$requestType owner=false url=${request.url}")
+            val inflightWaitMs = when (requestType) {
+                DETAIL_REQUEST_TYPE_CHAPTERS -> chapterHtmlInflightWaitMs
+                else -> detailHtmlInflightWaitMs
+            }
+
+            dlog("detailHealthProbe html action=wait titleNo=$titleNo requestType=$requestType waitLimitMs=$inflightWaitMs url=${request.url}")
+            dlog("detailRefreshProbe action=html titleNo=$titleNo source=inflightWait requestType=$requestType owner=false waitLimitMs=$inflightWaitMs url=${request.url}")
             if (allowHandoffCache) {
                 val cacheBeforeWait = getValidDetailHtmlCache(titleNo)
                 if (cacheBeforeWait != null) {
@@ -4295,7 +4301,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
 
             val finished = runCatching {
-                state.latch.await(detailHtmlInflightWaitMs, TimeUnit.MILLISECONDS)
+                state.latch.await(inflightWaitMs, TimeUnit.MILLISECONDS)
             }.getOrDefault(false)
 
             val joinedCache = if (allowHandoffCache) {
@@ -4308,20 +4314,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val cacheAge = System.currentTimeMillis() - cache.createdAt
                 dlog(
                     "detailHtmlInflightJoined titleNo=$titleNo waited=${waited}ms cacheAge=${cacheAge}ms " +
-                        "ttlMs=$ttlMs requestType=$requestType freshOwnerHtml=${cache.createdAt >= startedAt} url=${request.url}"
+                        "ttlMs=$ttlMs requestType=$requestType waitLimitMs=$inflightWaitMs freshOwnerHtml=${cache.createdAt >= startedAt} url=${request.url}"
                 )
                 dlog(
                     "detailRefreshProbe action=html titleNo=$titleNo source=inflightJoined waited=${waited}ms " +
-                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs requestType=$requestType owner=false url=${request.url}"
+                        "cacheAge=${cacheAge}ms ttlMs=$ttlMs requestType=$requestType owner=false waitLimitMs=$inflightWaitMs url=${request.url}"
                 )
                 return cachedDetailHtmlResponse(request, cache)
             }
 
             if (finished && state.completed) {
                 val status = if (state.failed) "ownerFailed" else "ownerCompletedNoFreshCache"
-                wlog("detailHtmlInflightDirectProceed titleNo=$titleNo status=$status requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                wlog("detailHtmlInflightDirectProceed titleNo=$titleNo status=$status requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms waitLimitMs=$inflightWaitMs url=${request.url}")
             } else {
-                wlog("detailHtmlInflightTimeout titleNo=$titleNo requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms url=${request.url}")
+                wlog("detailHtmlInflightTimeout titleNo=$titleNo requestType=$requestType waited=${System.currentTimeMillis() - startedAt}ms waitLimitMs=$inflightWaitMs url=${request.url}")
             }
             return chain.proceed(detailNetworkRequest(request))
         }
@@ -5018,19 +5024,19 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 20
-        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 16
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 4
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 32
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 12
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 8
+        private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 2
+        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 12
+        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
         private const val OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT = 20
         private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
-        private const val OFFICIAL_FIRST_COVER_LIMIT = 32
-        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 4_500L
-        private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 24
-        private const val OFFICIAL_FAST_COVER_WAIT_MS = 6_500L
+        private const val OFFICIAL_FIRST_COVER_LIMIT = 8
+        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_200L
+        private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
+        private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
