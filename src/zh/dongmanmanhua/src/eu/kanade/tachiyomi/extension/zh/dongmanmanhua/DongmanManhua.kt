@@ -860,17 +860,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val afterHomeMetaAt = System.currentTimeMillis()
         val elements = selectPopularMangaElements(rawElements)
         val coverMode = getHomeCoverMode()
-        val foregroundOfficialLimit = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
-            OFFICIAL_FIRST_COVER_LIMIT
-        } else {
-            OFFICIAL_FAST_COVER_WAIT_LIMIT
-        }
         val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
             prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
         } else {
             prepareOfficialNewWorkCoversForPopularVisibleNoBlank(elements)
         }
-        val backgroundOfficialStats = scheduleRemainingOfficialNewWorkCoversForPopularAsync(elements, foregroundOfficialLimit)
+        val backgroundOfficialStats = OfficialCoverWaitStats()
+        dlog(
+            "officialCoverQueuePruned origin=popular mode=$coverMode " +
+                "backgroundQueue=false prefetchQueue=false reason=single-visible-batch-only"
+        )
         val afterCoverWaitAt = System.currentTimeMillis()
         val entries = elements
             .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
@@ -892,6 +891,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "warmupScheduled=${warmupStats.scheduled} " +
                 "backgroundOfficialTargets=${backgroundOfficialStats.titleNos} " +
                 "backgroundOfficialScheduled=${backgroundOfficialStats.scheduled} " +
+                "backgroundOfficialQueue=false prefetchQueue=false " +
                 "coverMode=$coverMode " +
                 "coverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
                 "marketingRequests=0 " +
@@ -1434,13 +1434,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         var demandSubmitted: Boolean = false
 
         @Volatile
-        var prefetchSubmitted: Boolean = false
-
-        @Volatile
         var running: Boolean = false
 
         @Volatile
-        var fetchKind: String = "prefetch-inflight"
+        var fetchKind: String = "demand-inflight"
 
         val latch = CountDownLatch(1)
     }
@@ -1448,7 +1445,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private enum class OfficialCoverFetchPriority {
         DEMAND,
         VISIBLE,
-        PREFETCH,
     }
 
     private data class OfficialCoverWaitStats(
@@ -1477,7 +1473,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
     private val officialNewWorkCoverDemandExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM)
-    private val officialNewWorkCoverPrefetchExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM)
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -3483,164 +3478,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         )
     }
 
-    private fun scheduleRemainingOfficialNewWorkCoversForPopularAsync(
-        elements: List<Element>,
-        foregroundLimit: Int,
-    ): OfficialCoverWaitStats {
-        val targets = selectedOfficialNewWorkTargets(elements)
-            .drop(foregroundLimit)
-            .take(OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT)
-        if (targets.isEmpty()) {
-            dlog("officialCoverBackgroundSchedule origin=popular targets=0 scheduled=0 mode=${getHomeCoverMode()} strictVerifiedOnly=true")
-            return OfficialCoverWaitStats()
-        }
-        var alreadyReady = 0
-        var trustedReady = 0
-        var scheduled = 0
-        val scheduledTitleNos = mutableListOf<String>()
-        targets.forEach { target ->
-            when {
-                verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
-                trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
-                else -> {
-                    val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, OfficialCoverFetchPriority.PREFETCH)
-                    if (state != null) {
-                        scheduled += 1
-                        scheduledTitleNos += target.titleNo
-                    }
-                }
-            }
-        }
-        dlog(
-            "officialCoverBackgroundSchedule origin=popular targets=${targets.size} " +
-                "foregroundLimit=$foregroundLimit alreadyReady=$alreadyReady trustedReady=$trustedReady " +
-                "scheduled=$scheduled scheduledTitleNos=${scheduledTitleNos.joinToString("|")} " +
-                "limit=$OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT strictVerifiedOnly=true unverifiedSubstituteUsed=false " +
-                "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM marketingRequests=0"
-        )
-        return OfficialCoverWaitStats(
-            titleNos = targets.size,
-            alreadyReady = alreadyReady,
-            trustedReady = trustedReady,
-            scheduled = scheduled,
-        )
-    }
-
-    private fun prewarmOfficialNewWorkCoversForPopularAsync(elements: List<Element>): OfficialCoverWaitStats {
-        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT)
-        if (targets.isEmpty()) return OfficialCoverWaitStats()
-        val visibleTargets = visibleFirstOfficialCoverTargets(targets)
-        val visibleTitleNos = visibleTargets.map { it.titleNo }.toSet()
-        val backgroundTargets = targets.filter { it.titleNo !in visibleTitleNos }
-
-        var alreadyReady = 0
-        var trustedReady = 0
-        var demandScheduled = 0
-        var prefetchScheduled = 0
-        val demandTitleNos = mutableListOf<String>()
-        val prefetchTitleNos = mutableListOf<String>()
-
-        fun scheduleTarget(target: OfficialNewWorkCoverTarget, priority: OfficialCoverFetchPriority) {
-            when {
-                verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> alreadyReady += 1
-                trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank() -> trustedReady += 1
-                else -> {
-                    val state = ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, priority)
-                    if (state != null) {
-                        if (priority == OfficialCoverFetchPriority.PREFETCH) {
-                            prefetchScheduled += 1
-                            prefetchTitleNos += target.titleNo
-                        } else {
-                            demandScheduled += 1
-                            demandTitleNos += target.titleNo
-                        }
-                    }
-                }
-            }
-        }
-
-        visibleTargets.forEach { scheduleTarget(it, OfficialCoverFetchPriority.VISIBLE) }
-        backgroundTargets.forEach { scheduleTarget(it, OfficialCoverFetchPriority.PREFETCH) }
-
-        dlog(
-            "officialCoverWarmupSchedule titleNos=${targets.joinToString("|") { it.titleNo }} " +
-                "visibleTitleNos=${visibleTargets.joinToString("|") { it.titleNo }} " +
-                "backgroundTitleNos=${backgroundTargets.joinToString("|") { it.titleNo }} " +
-                "alreadyReady=$alreadyReady trustedReady=$trustedReady " +
-                "demandScheduled=$demandScheduled prefetchScheduled=$prefetchScheduled " +
-                "demandTitleNos=${demandTitleNos.joinToString("|")} " +
-                "prefetchTitleNos=${prefetchTitleNos.joinToString("|")} " +
-                "limit=$OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT " +
-                "visibleLimit=$OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT " +
-                "demandParallelism=$OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM " +
-                "prefetchParallelism=$OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM " +
-                "totalParallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM " +
-                "mode=demand-prefetch-strict-official wait=0ms strictVerifiedOnly=true unverifiedSubstituteUsed=false marketingRequests=0"
-        )
-        return OfficialCoverWaitStats(
-            titleNos = targets.size,
-            alreadyReady = alreadyReady,
-            trustedReady = trustedReady,
-            scheduled = demandScheduled + prefetchScheduled,
-        )
-    }
-
-    private fun visibleFirstOfficialCoverTargets(targets: List<OfficialNewWorkCoverTarget>): List<OfficialNewWorkCoverTarget> {
-        val result = linkedMapOf<String, OfficialNewWorkCoverTarget>()
-        fun add(target: OfficialNewWorkCoverTarget) {
-            if (result.size < OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT) {
-                result.putIfAbsent(target.titleNo, target)
-            }
-        }
-
-        // 轮播第一张和新作卡属于更可能被立刻看到的目标，走 demand/visible 队列。
-        targets.filter { it.origin == "popular-banner" }.take(1).forEach(::add)
-        targets.filter { it.origin == "popular-common-card" }.forEach(::add)
-        targets.sortedBy { it.rawIndex }.forEach(::add)
-        return result.values.toList()
-    }
-
-    private fun prepareOfficialNewWorkCoversForPopular(elements: List<Element>): OfficialCoverWaitStats {
-        val targets = selectedOfficialNewWorkTargets(elements)
-        if (targets.isEmpty()) return OfficialCoverWaitStats()
-        var alreadyReady = 0
-        val states = mutableListOf<OfficialNewWorkCoverFetchState>()
-        targets.forEach { target ->
-            if (verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank()) {
-                alreadyReady += 1
-            } else {
-                ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, OfficialCoverFetchPriority.DEMAND)?.let { states.add(it) }
-            }
-        }
-
-        val waitStartedAt = System.currentTimeMillis()
-        val primaryWaitMs = awaitOfficialNewWorkCoverStates(states, OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS)
-        val incompleteAfterPrimary = states.count { !it.completed }
-        val tailWaitMs = if (incompleteAfterPrimary > 0) {
-            awaitOfficialNewWorkCoverStates(states.filter { !it.completed }, OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS)
-        } else {
-            0L
-        }
-        val waitedMs = System.currentTimeMillis() - waitStartedAt
-        val success = targets.count { verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() }
-        val missing = targets.size - success
-        dlog(
-            "officialNewWorkCoverWait titleNos=${targets.joinToString("|") { it.titleNo }} " +
-                "alreadyReady=$alreadyReady scheduled=${states.size} success=$success missing=$missing " +
-                "waited=${waitedMs}ms primaryWait=${primaryWaitMs}ms tailWait=${tailWaitMs}ms " +
-                "primaryTimeoutMs=$OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS " +
-                "tailTimeoutMs=$OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS " +
-                "parallelism=$OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM mode=legacy-fast-meta-unused marketingRequests=0"
-        )
-        return OfficialCoverWaitStats(
-            titleNos = targets.size,
-            alreadyReady = alreadyReady,
-            scheduled = states.size,
-            success = success,
-            missing = missing,
-            waitedMs = waitedMs,
-        )
-    }
+    // v100.7.23：删掉首页官方封面的后台/预取/旧等待外壳。
+    // 保留前台 fast meta 批次、现有封面过滤、新标签、详情刷新和章节/详情合并。
 
     private fun awaitOfficialNewWorkCoverStates(states: List<OfficialNewWorkCoverFetchState>, timeoutMs: Long): Long {
         if (states.isEmpty() || timeoutMs <= 0L) return 0L
@@ -3683,21 +3522,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     ) {
         synchronized(state) {
             if (state.completed) return
-            val isDemandLike = priority == OfficialCoverFetchPriority.DEMAND || priority == OfficialCoverFetchPriority.VISIBLE
-            if (isDemandLike) {
-                if (!state.demandSubmitted && !state.running) {
-                    state.demandSubmitted = true
-                    state.submitted = true
-                    state.fetchKind = if (priority == OfficialCoverFetchPriority.VISIBLE) "visible-inflight" else "demand-inflight"
-                    officialNewWorkCoverDemandExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
-                }
-            } else {
-                if (!state.prefetchSubmitted && !state.demandSubmitted && !state.running) {
-                    state.prefetchSubmitted = true
-                    state.submitted = true
-                    state.fetchKind = "prefetch-inflight"
-                    officialNewWorkCoverPrefetchExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
-                }
+            if (!state.demandSubmitted && !state.running) {
+                state.demandSubmitted = true
+                state.submitted = true
+                state.fetchKind = if (priority == OfficialCoverFetchPriority.VISIBLE) "visible-inflight" else "demand-inflight"
+                officialNewWorkCoverDemandExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
             }
         }
     }
@@ -4794,7 +4623,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: ""
         if (rawUrl.isNotBlank() && !rawUrl.contains("/banner/")) {
             val thumbnail = buildThumbnailUrl(rawUrl, cdnBase)
-            if (LOG_THUMBNAIL_NORMALIZE && thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && rawUrl.contains("cdn.dongmanmanhua.cn")) {
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && rawUrl.contains("cdn.dongmanmanhua.cn")) {
                 dlog(
                     "thumbnailCdnSnsNormalize origin=$origin titleNo=${titleNo.orEmpty()} " +
                         "raw=$rawUrl final=$thumbnail"
@@ -4808,7 +4637,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
         return if (styleUrl.isNotBlank() && !styleUrl.contains("/banner/")) {
             val thumbnail = buildThumbnailUrl(styleUrl, cdnBase)
-            if (LOG_THUMBNAIL_NORMALIZE && thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && styleUrl.contains("cdn.dongmanmanhua.cn")) {
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && styleUrl.contains("cdn.dongmanmanhua.cn")) {
                 dlog(
                     "thumbnailCdnSnsNormalize origin=$origin titleNo=${titleNo.orEmpty()} " +
                         "raw=$styleUrl final=$thumbnail"
@@ -4828,7 +4657,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             ?: ""
         if (rawUrl.isNotBlank()) {
             val thumbnail = buildThumbnailUrl(rawUrl, cdnBase)
-            if (LOG_THUMBNAIL_NORMALIZE && thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && rawUrl.contains("cdn.dongmanmanhua.cn")) {
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && rawUrl.contains("cdn.dongmanmanhua.cn")) {
                 dlog(
                     "thumbnailCdnSnsNormalizeEmergency origin=$origin titleNo=${titleNo.orEmpty()} " +
                         "raw=$rawUrl final=$thumbnail"
@@ -4842,7 +4671,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
         return if (styleUrl.isNotBlank()) {
             val thumbnail = buildThumbnailUrl(styleUrl, cdnBase)
-            if (LOG_THUMBNAIL_NORMALIZE && thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && styleUrl.contains("cdn.dongmanmanhua.cn")) {
+            if (thumbnail.startsWith("http://cdn-sns.dongmanmanhua.cn/") && styleUrl.contains("cdn.dongmanmanhua.cn")) {
                 dlog(
                     "thumbnailCdnSnsNormalizeEmergency origin=$origin titleNo=${titleNo.orEmpty()} " +
                         "raw=$styleUrl final=$thumbnail"
@@ -5024,14 +4853,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val UPDATE_PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
         private const val UPDATE_PAGE_CACHE_MAX_ENTRIES = 10
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_PARALLELISM = 8
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_PARALLELISM = 2
-        private const val OFFICIAL_NEW_WORK_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_VISIBLE_PREFETCH_LIMIT = 4
-        private const val OFFICIAL_BACKGROUND_COVER_PREFETCH_LIMIT = 8
-        private const val OFFICIAL_NEW_WORK_COVER_PRIMARY_WAIT_MS = 0L
-        private const val OFFICIAL_NEW_WORK_COVER_TAIL_WAIT_MS = 0L
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
         private const val OFFICIAL_FIRST_COVER_LIMIT = 8
         private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_200L
@@ -5040,8 +4862,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
         private const val OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS = 30_000L
-        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 64
-        private const val LOG_THUMBNAIL_NORMALIZE = false
+        private const val OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES = 96
         private const val SLOW_NETWORK_LOG_MS = 10_000L
         private const val LOCAL_GENRE_CACHE_PATH = "/__dongman_cache__/genre"
         private const val LOCAL_UPDATE_CACHE_PATH = "/__dongman_cache__/update"
