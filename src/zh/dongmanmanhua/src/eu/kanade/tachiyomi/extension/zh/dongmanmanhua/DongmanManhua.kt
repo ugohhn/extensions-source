@@ -4856,7 +4856,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
         private const val OFFICIAL_FIRST_COVER_LIMIT = 8
-        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_200L
+        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_800L
         private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
         private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
