@@ -480,6 +480,31 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             bindHomeCoverModeSummary(HOME_COVER_MODE_FAST)
         }.also(screen::addPreference)
 
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_HOME_COVER_DIAGNOSTIC_LOG
+            title = "首页封面分组诊断日志（测试）"
+            summary = "只打分组日志，不改封面URL、不改顺序、不新增图片预热；用于对照普通列表/新作/轮播/首屏/后排"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_HOME_COVER_DIAGNOSTIC_PROBE
+            title = "首页封面网络探针（测试）"
+            summary = "默认关闭；开启后仅在诊断日志开启时，对少量样本发HEAD探针，比较不同分组的CDN响应；会产生额外请求"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(ctx).apply {
+            key = PREF_HOME_COVER_RUNTIME_CLEAR
+            title = "清理首页封面运行时缓存（测试）"
+            summary = "只清扩展运行期首页/官方封面状态，便于做无缓存对照；不清新标签、详情/章节handoff，也不清Mihon图片缓存"
+            setDefaultValue(false)
+            setOnPreferenceChangeListener { _, _ ->
+                clearHomeCoverRuntimeCaches("manual-test")
+                false
+            }
+        }.also(screen::addPreference)
+
         ListPreference(ctx).apply {
             key = PREF_DETAIL_COVER_REFRESH_MODE
             title = "详情页手动刷新封面"
@@ -871,11 +896,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "backgroundQueue=false prefetchQueue=false reason=single-visible-batch-only"
         )
         val afterCoverWaitAt = System.currentTimeMillis()
+        val diagnosticOfficialTargets = if (getHomeCoverDiagnosticLogEnable()) {
+            selectedOfficialNewWorkTargets(elements).mapTo(mutableSetOf()) { it.titleNo }
+        } else {
+            emptySet()
+        }
+        val diagnosticItems = mutableListOf<PopularCoverDiagnosticItem>()
         val entries = elements
-            .map { mangaFromElement(it, it.attr("data-mihon-origin").ifBlank { "popular" }) }
+            .mapIndexed { index, element ->
+                val origin = element.attr("data-mihon-origin").ifBlank { "popular" }
+                val manga = mangaFromElement(element, origin)
+                if (getHomeCoverDiagnosticLogEnable()) {
+                    diagnosticItems += buildPopularCoverDiagnosticItem(index, element, origin, manga, diagnosticOfficialTargets, coverMode)
+                }
+                manga
+            }
             .filter { it.title.isNotEmpty() }
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         val afterEntriesAt = System.currentTimeMillis()
+        if (getHomeCoverDiagnosticLogEnable()) {
+            logPopularCoverDiagnostics(diagnosticItems, entries.size, coverMode, afterEntriesAt - parseStartedAt)
+        }
         dlog("popularMangaParse modules raw=${rawElements.size} selected=${elements.size} entries=${entries.size}")
         dlog(
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
@@ -1464,6 +1505,24 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawIndex: Int,
     )
 
+    private data class RawThumbnailDiagnostic(
+        val rawUrl: String,
+        val source: String,
+    )
+
+    private data class PopularCoverDiagnosticItem(
+        val index: Int,
+        val origin: String,
+        val titleNo: String,
+        val title: String,
+        val storedUrl: String,
+        val rawThumbnail: String,
+        val rawSource: String,
+        val finalThumbnail: String,
+        val officialTarget: Boolean,
+        val mode: String,
+    )
+
     private data class FastOfficialCoverScanResult(
         val coverUrl: String,
         val bytesScanned: Int,
@@ -1473,6 +1532,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private val officialNewWorkCoverFetchStates = mutableMapOf<String, OfficialNewWorkCoverFetchState>()
     private val officialNewWorkCoverDemandExecutor = Executors.newFixedThreadPool(OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM)
+    private val homeCoverDiagnosticProbeExecutor = Executors.newFixedThreadPool(HOME_COVER_DIAGNOSTIC_PROBE_PARALLELISM)
     private val legacyNewWorkPersistentCacheClearLock = Any()
 
     @Volatile
@@ -1654,6 +1714,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     private fun isMixedMode() = preferences.getBoolean(PREF_SEARCH_MODE, false)
 
     private fun getListInflightCoalesceEnable(): Boolean = preferences.getBoolean(PREF_LIST_INFLIGHT_COALESCE, false)
+
+    private fun getHomeCoverDiagnosticLogEnable(): Boolean = preferences.getBoolean(PREF_HOME_COVER_DIAGNOSTIC_LOG, false)
+
+    private fun getHomeCoverDiagnosticProbeEnable(): Boolean =
+        getHomeCoverDiagnosticLogEnable() && preferences.getBoolean(PREF_HOME_COVER_DIAGNOSTIC_PROBE, false)
 
     private fun normalizeHomeCoverMode(value: String?): String {
         return when (value) {
@@ -3046,6 +3111,234 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "mangaFromElement rawHref=$rawHref absHref=$href cleanPath=$cleanPath storedUrl=$url " +
                     "titleNo=$titleNo hasNew=$hasNew title=$title"
             )
+        }
+    }
+
+    private fun buildPopularCoverDiagnosticItem(
+        index: Int,
+        element: Element,
+        origin: String,
+        manga: SManga,
+        officialTargets: Set<String>,
+        mode: String,
+    ): PopularCoverDiagnosticItem {
+        val titleNo = titleNoFromUrl(manga.url).orEmpty()
+        val raw = rawThumbnailDiagnostic(element)
+        return PopularCoverDiagnosticItem(
+            index = index,
+            origin = origin,
+            titleNo = titleNo,
+            title = manga.title,
+            storedUrl = manga.url,
+            rawThumbnail = raw.rawUrl,
+            rawSource = raw.source,
+            finalThumbnail = manga.thumbnail_url.orEmpty(),
+            officialTarget = titleNo.isNotBlank() && officialTargets.contains(titleNo),
+            mode = mode,
+        )
+    }
+
+    private fun rawThumbnailDiagnostic(element: Element): RawThumbnailDiagnostic {
+        val img = element.selectFirst("img")
+        val rawUrl = img?.attr("data-original")
+            ?.ifEmpty { img.attr("data-src") }
+            ?.ifEmpty { img.attr("src") }
+            ?: ""
+        if (rawUrl.isNotBlank()) return RawThumbnailDiagnostic(rawUrl, "img")
+
+        val style = element.selectFirst("[style*=background]")?.attr("style").orEmpty()
+        val match = Regex("""url\(['"]?([^)'" ]+)['"]?\)""").find(style)
+        val styleUrl = match?.groupValues?.getOrNull(1).orEmpty()
+        return RawThumbnailDiagnostic(styleUrl, if (styleUrl.isNotBlank()) "style" else "none")
+    }
+
+    private fun logPopularCoverDiagnostics(
+        items: List<PopularCoverDiagnosticItem>,
+        emittedCount: Int,
+        mode: String,
+        totalMs: Long,
+    ) {
+        val nonEmpty = items.filter { it.finalThumbnail.isNotBlank() }
+        val officialTargets = items.count { it.officialTarget }
+        val normalList = items.count { !it.officialTarget && it.finalThumbnail.isNotBlank() }
+        val missing = items.count { it.finalThumbnail.isBlank() }
+        dlog(
+            "homeCoverExperimentPlan version=v100.7.26 mode=$mode items=${items.size} emitted=$emittedCount " +
+                "officialTargets=$officialTargets normalList=$normalList missing=$missing total=${totalMs}ms " +
+                "urlChange=false orderChange=false warmup=false extraProbe=${getHomeCoverDiagnosticProbeEnable()}"
+        )
+
+        logPopularCoverDiagnosticGroup("origin", items.groupBy { it.origin })
+        logPopularCoverDiagnosticGroup("position", items.groupBy { positionBucket(it.index) })
+        logPopularCoverDiagnosticGroup("finalHost", items.groupBy { hostOfUrl(it.finalThumbnail).ifBlank { "blank" } })
+        logPopularCoverDiagnosticGroup("pathShape", items.groupBy { imagePathShape(it.finalThumbnail) })
+        logPopularCoverDiagnosticGroup("official", items.groupBy { if (it.officialTarget) "official-target" else "list-thumbnail" })
+
+        items.take(HOME_COVER_DIAGNOSTIC_ITEM_LOG_LIMIT).forEach { item ->
+            dlog(
+                "homeCoverExperimentItem idx=${item.index} pos=${positionBucket(item.index)} origin=${item.origin} " +
+                    "titleNo=${item.titleNo} title=${item.title} mode=${item.mode} officialTarget=${item.officialTarget} " +
+                    "rawSource=${item.rawSource} rawHost=${hostOfUrl(item.rawThumbnail)} rawHasOss=${item.rawThumbnail.contains("x-oss-process")} " +
+                    "finalHost=${hostOfUrl(item.finalThumbnail)} finalKind=${diagnosticFinalKind(item.finalThumbnail)} " +
+                    "finalShape=${imagePathShape(item.finalThumbnail)} finalHasOss=${item.finalThumbnail.contains("x-oss-process")} " +
+                    "storedUrl=${item.storedUrl}"
+            )
+        }
+
+        if (getHomeCoverDiagnosticProbeEnable()) {
+            scheduleHomeCoverDiagnosticProbe(nonEmpty)
+        }
+    }
+
+    private fun logPopularCoverDiagnosticGroup(label: String, groups: Map<String, List<PopularCoverDiagnosticItem>>) {
+        groups.entries
+            .sortedWith(compareByDescending<Map.Entry<String, List<PopularCoverDiagnosticItem>>> { it.value.size }.thenBy { it.key })
+            .take(HOME_COVER_DIAGNOSTIC_GROUP_LOG_LIMIT)
+            .forEach { (key, values) ->
+                val cdnSns = values.count { hostOfUrl(it.finalThumbnail) == "cdn-sns.dongmanmanhua.cn" }
+                val blank = values.count { it.finalThumbnail.isBlank() }
+                val official = values.count { it.officialTarget }
+                val rawOss = values.count { it.rawThumbnail.contains("x-oss-process") }
+                dlog(
+                    "homeCoverExperimentGroup label=$label key=$key count=${values.size} " +
+                        "cdnSns=$cdnSns blank=$blank officialTarget=$official rawOss=$rawOss"
+                )
+            }
+    }
+
+    private fun scheduleHomeCoverDiagnosticProbe(items: List<PopularCoverDiagnosticItem>) {
+        val samples = selectHomeCoverDiagnosticProbeItems(items)
+        dlog(
+            "homeCoverDiagProbePlan count=${samples.size} groups=${samples.joinToString("|") { it.first }} " +
+                "method=HEAD maxPerRun=$HOME_COVER_DIAGNOSTIC_PROBE_LIMIT"
+        )
+        samples.forEach { (group, item) ->
+            homeCoverDiagnosticProbeExecutor.execute {
+                runHomeCoverDiagnosticProbe(group, item)
+            }
+        }
+    }
+
+    private fun selectHomeCoverDiagnosticProbeItems(items: List<PopularCoverDiagnosticItem>): List<Pair<String, PopularCoverDiagnosticItem>> {
+        val result = mutableListOf<Pair<String, PopularCoverDiagnosticItem>>()
+        fun add(group: String, predicate: (PopularCoverDiagnosticItem) -> Boolean) {
+            val item = items.firstOrNull { it.finalThumbnail.isNotBlank() && predicate(it) } ?: return
+            if (result.none { it.second.finalThumbnail == item.finalThumbnail }) {
+                result += group to item
+            }
+        }
+        add("top-list", { !it.officialTarget && it.index < 8 })
+        add("mid-list", { !it.officialTarget && it.index in 8..23 })
+        add("late-list", { !it.officialTarget && it.index >= 24 })
+        add("official-meta", { it.officialTarget })
+        add("uuid-path", { imagePathShape(it.finalThumbnail) == "uuid" })
+        add("legacy-thumb", { imagePathShape(it.finalThumbnail) == "legacy-thumb" })
+        add("legacy-date", { imagePathShape(it.finalThumbnail) == "legacy-date" })
+        return result.take(HOME_COVER_DIAGNOSTIC_PROBE_LIMIT)
+    }
+
+    private fun runHomeCoverDiagnosticProbe(group: String, item: PopularCoverDiagnosticItem) {
+        val startedAt = System.currentTimeMillis()
+        try {
+            val requestHeaders = headersBuilder()
+                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .build()
+            val request = Request.Builder()
+                .url(item.finalThumbnail)
+                .headers(requestHeaders)
+                .head()
+                .build()
+            val call = client.newCall(request)
+            call.timeout().timeout(HOME_COVER_DIAGNOSTIC_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
+                val elapsed = System.currentTimeMillis() - startedAt
+                dlog(
+                    "homeCoverDiagProbeResult group=$group idx=${item.index} origin=${item.origin} titleNo=${item.titleNo} " +
+                        "host=${hostOfUrl(item.finalThumbnail)} shape=${imagePathShape(item.finalThumbnail)} code=${response.code} " +
+                        "elapsed=${elapsed}ms contentLength=${response.header("Content-Length").orEmpty()} " +
+                        "contentType=${response.header("Content-Type").orEmpty()} cache=${response.header("Cache-Control").orEmpty()}"
+                )
+            }
+        } catch (e: Exception) {
+            dlog(
+                "homeCoverDiagProbeResult group=$group idx=${item.index} origin=${item.origin} titleNo=${item.titleNo} " +
+                    "host=${hostOfUrl(item.finalThumbnail)} shape=${imagePathShape(item.finalThumbnail)} " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}"
+            )
+        }
+    }
+
+    private fun positionBucket(index: Int): String = when {
+        index < 8 -> "top0-7"
+        index < 24 -> "mid8-23"
+        else -> "late24+"
+    }
+
+    private fun hostOfUrl(url: String): String {
+        if (url.isBlank()) return ""
+        return Regex("""^https?://([^/]+)""").find(url)?.groupValues?.getOrNull(1).orEmpty()
+    }
+
+    private fun imagePathShape(url: String): String {
+        if (url.isBlank()) return "blank"
+        val path = url.substringAfter("//", url).substringAfter('/', "")
+        return when {
+            Regex("""[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""").containsMatchIn(path) -> "uuid"
+            path.contains("thumb_", ignoreCase = true) || path.contains("thumb", ignoreCase = true) -> "legacy-thumb"
+            Regex("""20\d{6}_\d+|201\d{5}_\d+|202\d{5}_\d+""").containsMatchIn(path) -> "legacy-date"
+            path.contains("/") -> "nested-name"
+            else -> "flat-name"
+        }
+    }
+
+    private fun diagnosticFinalKind(url: String): String = when {
+        url.isBlank() -> "blank"
+        isVirtualOfficialCoverUrl(url) -> "virtual"
+        hasDetailCoverKey(url) -> "detail-key"
+        hostOfUrl(url) == "cdn-sns.dongmanmanhua.cn" -> "cdn-sns"
+        hostOfUrl(url).contains("dongmanmanhua.cn") -> "dongman-cdn"
+        else -> "other"
+    }
+
+    private fun clearHomeCoverRuntimeCaches(reason: String) {
+        val updateCount = synchronized(updatePageCache) {
+            val count = updatePageCache.size
+            updatePageCache.clear()
+            count
+        }
+        val genreCount = synchronized(genrePageCache) {
+            val count = genrePageCache.size
+            genrePageCache.clear()
+            count
+        }
+        val officialMetaCount = synchronized(officialMangaMetaByTitleNo) {
+            val count = officialMangaMetaByTitleNo.size
+            officialMangaMetaByTitleNo.clear()
+            count
+        }
+        val verifiedCoverCount = synchronized(verifiedDetailOfficialCoverByTitleNo) {
+            val count = verifiedDetailOfficialCoverByTitleNo.size
+            verifiedDetailOfficialCoverByTitleNo.clear()
+            count
+        }
+        val detailUrlCount = synchronized(officialCoverDetailUrlByTitleNo) {
+            val count = officialCoverDetailUrlByTitleNo.size
+            officialCoverDetailUrlByTitleNo.clear()
+            count
+        }
+        val fetchStateCount = synchronized(officialNewWorkCoverFetchStates) {
+            val count = officialNewWorkCoverFetchStates.size
+            officialNewWorkCoverFetchStates.clear()
+            count
+        }
+        cachedLastFilterSnapshot = null
+        dlog(
+            "homeCoverRuntimeCachesCleared reason=$reason updatePageCache=$updateCount genrePageCache=$genreCount " +
+                "officialMeta=$officialMetaCount verifiedOfficialCover=$verifiedCoverCount detailUrl=$detailUrlCount " +
+                "fetchStates=$fetchStateCount newLabelSnapshotUntouched=true detailHtmlHandoffUntouched=true mihonImageCacheUntouched=true"
+        )
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "已清理首页封面运行时缓存（测试）", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -4876,6 +5169,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val IDENTITY_PROBE_SEEN_LOG_LIMIT = 120
         private const val IDENTITY_PROBE_CONFLICT_LOG_LIMIT = 240
         private const val CLEAN_AUDIT_DIRTY_LOG_LIMIT = 240
+        private const val HOME_COVER_DIAGNOSTIC_ITEM_LOG_LIMIT = 96
+        private const val HOME_COVER_DIAGNOSTIC_GROUP_LOG_LIMIT = 16
+        private const val HOME_COVER_DIAGNOSTIC_PROBE_LIMIT = 7
+        private const val HOME_COVER_DIAGNOSTIC_PROBE_PARALLELISM = 2
+        private const val HOME_COVER_DIAGNOSTIC_PROBE_TIMEOUT_MS = 4_000L
 
         internal const val PREF_UA = "pref_user_agent"
         internal const val PREF_UA_CUSTOM = "pref_user_agent_custom"
@@ -4893,6 +5191,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         internal const val PREF_AUTO_PAY = "pref_auto_pay"
         internal const val PREF_LIST_INFLIGHT_COALESCE = "pref_list_inflight_coalesce"
         internal const val PREF_HOME_COVER_MODE = "pref_home_cover_mode"
+        internal const val PREF_HOME_COVER_DIAGNOSTIC_LOG = "pref_home_cover_diagnostic_log"
+        internal const val PREF_HOME_COVER_DIAGNOSTIC_PROBE = "pref_home_cover_diagnostic_probe"
+        internal const val PREF_HOME_COVER_RUNTIME_CLEAR = "pref_home_cover_runtime_clear"
         internal const val HOME_COVER_MODE_FAST = "fast"
         internal const val HOME_COVER_MODE_OFFICIAL_FIRST = "official_first"
         internal const val PREF_DETAIL_COVER_REFRESH_MODE = "pref_detail_cover_refresh_mode"
