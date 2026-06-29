@@ -496,8 +496,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
         SwitchPreferenceCompat(ctx).apply {
             key = PREF_HOME_COVER_RUNTIME_CLEAR
-            title = "清理首页封面运行时缓存（测试）"
-            summary = "只清扩展运行期首页/官方封面状态，便于做无缓存对照；不清新标签、详情/章节handoff，也不清Mihon图片缓存"
+            title = "清理列表封面测试缓存（测试）"
+            summary = "清首页/更新/题材列表缓存与首页官方封面运行期状态；不清新标签、详情/章节handoff，也不清Mihon图片缓存"
             setDefaultValue(false)
             setOnPreferenceChangeListener { _, _ ->
                 clearHomeCoverRuntimeCaches("manual-test")
@@ -1455,6 +1455,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val titleNo: String,
         val detailUrl: String,
         val createdAt: Long = System.currentTimeMillis(),
+        val clearEpoch: Long,
     ) {
         @Volatile
         var completed: Boolean = false
@@ -1537,6 +1538,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     @Volatile
     private var legacyNewWorkPersistentCacheCleared = false
+
+    @Volatile
+    private var homeCoverRuntimeClearEpoch = 0L
 
     private data class GenrePageCache(
         val genre: String,
@@ -3301,44 +3305,45 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun clearHomeCoverRuntimeCaches(reason: String) {
-        val updateCount = synchronized(updatePageCache) {
-            val count = updatePageCache.size
-            updatePageCache.clear()
-            count
-        }
-        val genreCount = synchronized(genrePageCache) {
-            val count = genrePageCache.size
-            genrePageCache.clear()
-            count
-        }
-        val officialMetaCount = synchronized(officialMangaMetaByTitleNo) {
-            val count = officialMangaMetaByTitleNo.size
-            officialMangaMetaByTitleNo.clear()
-            count
-        }
-        val verifiedCoverCount = synchronized(verifiedDetailOfficialCoverByTitleNo) {
-            val count = verifiedDetailOfficialCoverByTitleNo.size
-            verifiedDetailOfficialCoverByTitleNo.clear()
-            count
-        }
-        val detailUrlCount = synchronized(officialCoverDetailUrlByTitleNo) {
-            val count = officialCoverDetailUrlByTitleNo.size
-            officialCoverDetailUrlByTitleNo.clear()
-            count
-        }
-        val fetchStateCount = synchronized(officialNewWorkCoverFetchStates) {
-            val count = officialNewWorkCoverFetchStates.size
-            officialNewWorkCoverFetchStates.clear()
-            count
-        }
-        cachedLastFilterSnapshot = null
+        val epochBefore = homeCoverRuntimeClearEpoch
+        val updateBefore = synchronized(updatePageCache) { updatePageCache.size }
+        val genreBefore = synchronized(genrePageCache) { genrePageCache.size }
+        val officialMetaBefore = synchronized(officialMangaMetaByTitleNo) { officialMangaMetaByTitleNo.size }
+        val verifiedCoverBefore = synchronized(verifiedDetailOfficialCoverByTitleNo) { verifiedDetailOfficialCoverByTitleNo.size }
+        val detailUrlBefore = synchronized(officialCoverDetailUrlByTitleNo) { officialCoverDetailUrlByTitleNo.size }
+        val fetchStateBefore = synchronized(officialNewWorkCoverFetchStates) { officialNewWorkCoverFetchStates.size }
+
+        homeCoverRuntimeClearEpoch = epochBefore + 1L
         dlog(
-            "homeCoverRuntimeCachesCleared reason=$reason updatePageCache=$updateCount genrePageCache=$genreCount " +
-                "officialMeta=$officialMetaCount verifiedOfficialCover=$verifiedCoverCount detailUrl=$detailUrlCount " +
-                "fetchStates=$fetchStateCount newLabelSnapshotUntouched=true detailHtmlHandoffUntouched=true mihonImageCacheUntouched=true"
+            "homeCoverTestCachesClearStart reason=$reason epochBefore=$epochBefore epochAfter=$homeCoverRuntimeClearEpoch " +
+                "updatePageCache=$updateBefore genrePageCache=$genreBefore officialMeta=$officialMetaBefore " +
+                "verifiedOfficialCover=$verifiedCoverBefore detailUrl=$detailUrlBefore fetchStates=$fetchStateBefore " +
+                "scope=popular-update-genre-official-runtime"
+        )
+
+        synchronized(updatePageCache) { updatePageCache.clear() }
+        synchronized(genrePageCache) { genrePageCache.clear() }
+        synchronized(officialMangaMetaByTitleNo) { officialMangaMetaByTitleNo.clear() }
+        synchronized(verifiedDetailOfficialCoverByTitleNo) { verifiedDetailOfficialCoverByTitleNo.clear() }
+        synchronized(officialCoverDetailUrlByTitleNo) { officialCoverDetailUrlByTitleNo.clear() }
+        synchronized(officialNewWorkCoverFetchStates) { officialNewWorkCoverFetchStates.clear() }
+        cachedLastFilterSnapshot = null
+
+        val updateAfter = synchronized(updatePageCache) { updatePageCache.size }
+        val genreAfter = synchronized(genrePageCache) { genrePageCache.size }
+        val officialMetaAfter = synchronized(officialMangaMetaByTitleNo) { officialMangaMetaByTitleNo.size }
+        val verifiedCoverAfter = synchronized(verifiedDetailOfficialCoverByTitleNo) { verifiedDetailOfficialCoverByTitleNo.size }
+        val detailUrlAfter = synchronized(officialCoverDetailUrlByTitleNo) { officialCoverDetailUrlByTitleNo.size }
+        val fetchStateAfter = synchronized(officialNewWorkCoverFetchStates) { officialNewWorkCoverFetchStates.size }
+        dlog(
+            "homeCoverTestCachesClearDone reason=$reason epoch=$homeCoverRuntimeClearEpoch " +
+                "afterUpdatePageCache=$updateAfter afterGenrePageCache=$genreAfter afterOfficialMeta=$officialMetaAfter " +
+                "afterVerifiedOfficialCover=$verifiedCoverAfter afterDetailUrl=$detailUrlAfter afterFetchStates=$fetchStateAfter " +
+                "snapshotCleared=${cachedLastFilterSnapshot == null} updateAndLatestCachesCleared=true genreCachesCleared=true " +
+                "newLabelSnapshotUntouched=true detailHtmlHandoffUntouched=true mihonImageCacheUntouched=true"
         )
         Handler(Looper.getMainLooper()).post {
-            Toast.makeText(appContext, "已清理首页封面运行时缓存（测试）", Toast.LENGTH_SHORT).show()
+            Toast.makeText(appContext, "已清理列表封面测试缓存；刷新页面后生效", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -3740,7 +3745,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         val waitStartedAt = System.currentTimeMillis()
-        val waitedMs = awaitOfficialNewWorkCoverStates(states, waitMs)
+        val adaptiveMinReady = if (origin == "popular" && getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST) {
+            minOf(OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_READY, targets.size)
+        } else {
+            Int.MAX_VALUE
+        }
+        val waitedMs = awaitOfficialNewWorkCoverStates(
+            states = states,
+            timeoutMs = waitMs,
+            initialReady = alreadyReady,
+            adaptiveMinReady = adaptiveMinReady,
+        )
         val success = targets.count {
             verifiedDetailOfficialCoverForTitleNo(it.titleNo).isNotBlank() || trustedRuntimeOfficialCoverForTitleNo(it.titleNo).isNotBlank()
         }
@@ -3756,7 +3771,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             "coverModeProbe mode=${getHomeCoverMode()} origin=$origin targets=${targets.size} " +
                 "titleNos=${targets.joinToString("|") { it.titleNo }} alreadyReady=$alreadyReady " +
                 "scheduled=${states.size} success=$success missing=$missing waited=${System.currentTimeMillis() - waitStartedAt}ms " +
-                "awaitMs=$waitedMs waitLimitMs=$waitMs limit=$limitForLog " +
+                "awaitMs=$waitedMs waitLimitMs=$waitMs limit=$limitForLog adaptiveMinReady=$adaptiveMinReady " +
                 "strictNoVirtual=${!allowVirtualOfficialCoverFallbackInList()} " +
                 "failurePending=$pending failureNetworkError=$networkError failureNoMeta=$noMeta failureOther=$failedOther " +
                 "missingTitleNos=$missingTitleNos marketingRequests=0"
@@ -3774,15 +3789,43 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     // v100.7.23：删掉首页官方封面的后台/预取/旧等待外壳。
     // 保留前台 fast meta 批次、现有封面过滤、新标签、详情刷新和章节/详情合并。
 
-    private fun awaitOfficialNewWorkCoverStates(states: List<OfficialNewWorkCoverFetchState>, timeoutMs: Long): Long {
+    private fun awaitOfficialNewWorkCoverStates(
+        states: List<OfficialNewWorkCoverFetchState>,
+        timeoutMs: Long,
+        initialReady: Int = 0,
+        adaptiveMinReady: Int = Int.MAX_VALUE,
+    ): Long {
         if (states.isEmpty() || timeoutMs <= 0L) return 0L
         val startedAt = System.currentTimeMillis()
-        states.forEach { state ->
-            val elapsed = System.currentTimeMillis() - startedAt
-            val remaining = timeoutMs - elapsed
-            if (remaining > 0 && !state.completed) {
-                runCatching { state.latch.await(remaining, TimeUnit.MILLISECONDS) }
+        var lastReady = initialReady + states.count { it.completed && it.coverUrl.isNotBlank() }
+        var lastProgressAt = startedAt
+        while (true) {
+            val now = System.currentTimeMillis()
+            val elapsed = now - startedAt
+            if (elapsed >= timeoutMs) break
+            val ready = initialReady + states.count { it.completed && it.coverUrl.isNotBlank() }
+            if (ready > lastReady) {
+                lastReady = ready
+                lastProgressAt = now
             }
+            val pending = states.count { !it.completed }
+            if (pending <= 0) break
+            if (
+                adaptiveMinReady != Int.MAX_VALUE &&
+                elapsed >= OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS &&
+                ready >= adaptiveMinReady &&
+                now - lastProgressAt >= OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS
+            ) {
+                dlog(
+                    "officialCoverAdaptiveWaitStop mode=${getHomeCoverMode()} ready=$ready pending=$pending " +
+                        "waited=${elapsed}ms waitLimitMs=$timeoutMs minReady=$adaptiveMinReady " +
+                        "quietMs=${now - lastProgressAt} reason=ready-and-quiet"
+                )
+                break
+            }
+            val sliceMs = minOf(OFFICIAL_FIRST_COVER_ADAPTIVE_POLL_MS, timeoutMs - elapsed)
+            val next = states.firstOrNull { !it.completed } ?: break
+            runCatching { next.latch.await(sliceMs, TimeUnit.MILLISECONDS) }
         }
         return System.currentTimeMillis() - startedAt
     }
@@ -3802,7 +3845,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (existing != null && (!existing.completed || (!existing.failed && now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS))) {
                 existing
             } else {
-                OfficialNewWorkCoverFetchState(key, detailUrl).also { officialNewWorkCoverFetchStates[key] = it }
+                OfficialNewWorkCoverFetchState(key, detailUrl, clearEpoch = homeCoverRuntimeClearEpoch).also { officialNewWorkCoverFetchStates[key] = it }
             }
         }
         submitOfficialNewWorkCoverFetch(state, priority)
@@ -3829,7 +3872,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         while (iterator.hasNext()) {
             val entry = iterator.next()
             val state = entry.value
-            if (state.completed && now - state.createdAt > OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS) {
+            if (state.clearEpoch != homeCoverRuntimeClearEpoch || state.completed && now - state.createdAt > OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS) {
                 iterator.remove()
             }
         }
@@ -3848,6 +3891,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt = System.currentTimeMillis()
         var failed = false
         val requestUrl = state.detailUrl.ifBlank { "$baseUrl/episodeList?titleNo=$titleNo" }
+        if (state.clearEpoch != homeCoverRuntimeClearEpoch) {
+            dlog(
+                "officialCoverFetchResultDiscarded reason=stale-clear-epoch titleNo=$titleNo " +
+                    "fetchEpoch=${state.clearEpoch} currentEpoch=$homeCoverRuntimeClearEpoch fetchKind=$fetchKind stage=before-network"
+            )
+            synchronized(state) {
+                state.failed = true
+                state.failureReason = "staleClearEpoch:${state.clearEpoch}:$homeCoverRuntimeClearEpoch"
+                state.completed = true
+                state.running = false
+            }
+            state.latch.countDown()
+            return
+        }
         try {
             val requestHeaders = headersBuilder()
                 .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -3860,7 +3917,16 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 val responseAt = System.currentTimeMillis()
                 val scan = scanOfficialCoverMetaFast(response, titleNo)
                 val scanEndedAt = System.currentTimeMillis()
-                if (scan.coverUrl.isNotBlank()) {
+                if (state.clearEpoch != homeCoverRuntimeClearEpoch) {
+                    failed = true
+                    state.failureReason = "staleClearEpoch:${state.clearEpoch}:$homeCoverRuntimeClearEpoch"
+                    dlog(
+                        "officialCoverFetchResultDiscarded reason=stale-clear-epoch titleNo=$titleNo " +
+                            "fetchEpoch=${state.clearEpoch} currentEpoch=$homeCoverRuntimeClearEpoch fetchKind=$fetchKind " +
+                            "code=${response.code} requestedUrl=$requestUrl finalUrl=${response.request.url} " +
+                            "elapsed=${scanEndedAt - startedAt}ms coverPresent=${scan.coverUrl.isNotBlank()}"
+                    )
+                } else if (scan.coverUrl.isNotBlank()) {
                     val remembered = rememberVerifiedDetailOfficialCover(titleNo, scan.coverUrl)
                     state.coverUrl = remembered
                     state.failureReason = if (remembered.isNotBlank()) "" else "unverified"
@@ -5150,6 +5216,10 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
         private const val OFFICIAL_FIRST_COVER_LIMIT = 8
         private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_800L
+        private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_READY = 3
+        private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS = 900L
+        private const val OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS = 240L
+        private const val OFFICIAL_FIRST_COVER_ADAPTIVE_POLL_MS = 100L
         private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
         private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
