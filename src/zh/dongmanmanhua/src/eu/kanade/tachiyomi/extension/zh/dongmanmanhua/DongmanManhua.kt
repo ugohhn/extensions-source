@@ -3184,7 +3184,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val normalList = items.count { !it.officialTarget && it.finalThumbnail.isNotBlank() }
         val missing = items.count { it.finalThumbnail.isBlank() }
         dlog(
-            "homeCoverExperimentPlan version=v100.7.30 mode=$mode items=${items.size} emitted=$emittedCount " +
+            "homeCoverExperimentPlan version=v100.7.31 mode=$mode items=${items.size} emitted=$emittedCount " +
                 "officialTargets=$officialTargets normalList=$normalList missing=$missing total=${totalMs}ms " +
                 "urlChange=false orderChange=false warmup=false extraProbe=${getHomeCoverDiagnosticProbeEnable()}"
         )
@@ -5428,6 +5428,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS = 900L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS = 240L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_POLL_MS = 100L
+        private const val OFFICIAL_COVER_VISIBLE_OUTCOME_MAX_WINDOW_MS = 2_000L
         private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
         private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
