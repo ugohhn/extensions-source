@@ -879,23 +879,21 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawElements = collectPopularMangaElements(document)
         val afterCollectAt = System.currentTimeMillis()
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
+        val elements = selectPopularMangaElements(rawElements)
+        val afterSelectAt = System.currentTimeMillis()
+        val coverMode = getHomeCoverMode()
+        val warmupStats = prepareOfficialNewWorkCoversForPopularFrontFastRace(elements)
+        val afterCoverRaceAt = System.currentTimeMillis()
         // 这里只整理同一次 home HTML 中普通模块本来就有的资料；
         // “新作登场”不会读取该内存资料，而是直接验证自己的事件字段。
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
-        val elements = selectPopularMangaElements(rawElements)
-        val coverMode = getHomeCoverMode()
-        val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
-            prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
-        } else {
-            prepareOfficialNewWorkCoversForPopularVisibleNoBlank(elements)
-        }
         val backgroundOfficialStats = OfficialCoverWaitStats()
         dlog(
             "officialCoverQueuePruned origin=popular mode=$coverMode " +
-                "backgroundQueue=false prefetchQueue=false reason=single-visible-batch-only"
+                "backgroundQueue=false prefetchQueue=false reason=front-visible-race-only"
         )
-        val afterCoverWaitAt = System.currentTimeMillis()
+        val afterCoverWaitAt = afterCoverRaceAt
         val diagnosticOfficialTargets = if (getHomeCoverDiagnosticLogEnable()) {
             selectedOfficialNewWorkTargets(elements).mapTo(mutableSetOf()) { it.titleNo }
         } else {
@@ -918,7 +916,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             stats = warmupStats,
             mode = coverMode,
             emitAt = afterEntriesAt,
-            waitStartedAt = afterHomeMetaAt,
+            waitStartedAt = afterSelectAt,
             waitEndedAt = afterCoverWaitAt,
             parseStartedAt = parseStartedAt,
         )
@@ -929,9 +927,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
-                "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
-                "officialCoverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
-                "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
+                "select=${afterSelectAt - afterCollectAt}ms " +
+                "officialCoverRace=${afterCoverRaceAt - afterSelectAt}ms " +
+                "homeMeta=${afterHomeMetaAt - afterCoverRaceAt}ms " +
+                "officialCoverWait=0ms " +
+                "nativeBuild=${afterEntriesAt - afterHomeMetaAt}ms " +
                 "mainpathExtraRequests=0 " +
                 "mainpathOfficialDetailRequests=0 " +
                 "warmupTargets=${warmupStats.titleNos} " +
@@ -942,7 +942,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "backgroundOfficialScheduled=${backgroundOfficialStats.scheduled} " +
                 "backgroundOfficialQueue=false prefetchQueue=false " +
                 "coverMode=$coverMode " +
-                "coverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
+                "coverWait=0ms " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -3184,7 +3184,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val normalList = items.count { !it.officialTarget && it.finalThumbnail.isNotBlank() }
         val missing = items.count { it.finalThumbnail.isBlank() }
         dlog(
-            "homeCoverExperimentPlan version=v100.7.31 mode=$mode items=${items.size} emitted=$emittedCount " +
+            "homeCoverExperimentPlan version=v100.7.32 mode=$mode items=${items.size} emitted=$emittedCount " +
                 "officialTargets=$officialTargets normalList=$normalList missing=$missing total=${totalMs}ms " +
                 "urlChange=false orderChange=false warmup=false extraProbe=${getHomeCoverDiagnosticProbeEnable()}"
         )
@@ -3691,6 +3691,22 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
     }
 
+
+    private fun prepareOfficialNewWorkCoversForPopularFrontFastRace(elements: List<Element>): OfficialCoverWaitStats {
+        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_FRONT_RACE_COVER_LIMIT)
+        dlog(
+            "officialCoverFrontRacePlan mode=${getHomeCoverMode()} origin=popular-front-race " +
+                "targets=${targets.size} limit=$OFFICIAL_FRONT_RACE_COVER_LIMIT waitMs=0 " +
+                "stage=after-select before-home-meta noBlocking=true " +
+                "titleNos=${targets.joinToString("|") { it.titleNo }}"
+        )
+        return prepareOfficialCoverTargetsForListBlocking(
+            origin = "popular-front-race",
+            targets = targets,
+            waitMs = 0L,
+            limitForLog = OFFICIAL_FRONT_RACE_COVER_LIMIT,
+        )
+    }
 
     private fun prepareOfficialNewWorkCoversForPopularOfficialFirst(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_FIRST_COVER_LIMIT)
@@ -5422,6 +5438,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
+        private const val OFFICIAL_FRONT_RACE_COVER_LIMIT = 6
         private const val OFFICIAL_FIRST_COVER_LIMIT = 8
         private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_800L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_READY = 3
