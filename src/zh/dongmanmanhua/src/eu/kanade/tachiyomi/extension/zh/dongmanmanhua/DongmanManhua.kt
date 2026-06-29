@@ -879,21 +879,23 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val rawElements = collectPopularMangaElements(document)
         val afterCollectAt = System.currentTimeMillis()
         rememberCanonicalMangaIdentitiesFromElements(rawElements)
-        val elements = selectPopularMangaElements(rawElements)
-        val afterSelectAt = System.currentTimeMillis()
-        val coverMode = getHomeCoverMode()
-        val warmupStats = prepareOfficialNewWorkCoversForPopularFrontFastRace(elements)
-        val afterCoverRaceAt = System.currentTimeMillis()
         // 这里只整理同一次 home HTML 中普通模块本来就有的资料；
         // “新作登场”不会读取该内存资料，而是直接验证自己的事件字段。
         preseedOfficialMetaFromPopularRawElements(rawElements)
         val afterHomeMetaAt = System.currentTimeMillis()
+        val elements = selectPopularMangaElements(rawElements)
+        val coverMode = getHomeCoverMode()
+        val warmupStats = if (coverMode == HOME_COVER_MODE_OFFICIAL_FIRST) {
+            prepareOfficialNewWorkCoversForPopularOfficialFirst(elements)
+        } else {
+            prepareOfficialNewWorkCoversForPopularVisibleNoBlank(elements)
+        }
         val backgroundOfficialStats = OfficialCoverWaitStats()
         dlog(
             "officialCoverQueuePruned origin=popular mode=$coverMode " +
-                "backgroundQueue=false prefetchQueue=false reason=front-visible-race-only"
+                "backgroundQueue=false prefetchQueue=false reason=single-visible-batch-only"
         )
-        val afterCoverWaitAt = afterCoverRaceAt
+        val afterCoverWaitAt = System.currentTimeMillis()
         val diagnosticOfficialTargets = if (getHomeCoverDiagnosticLogEnable()) {
             selectedOfficialNewWorkTargets(elements).mapTo(mutableSetOf()) { it.titleNo }
         } else {
@@ -916,7 +918,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             stats = warmupStats,
             mode = coverMode,
             emitAt = afterEntriesAt,
-            waitStartedAt = afterSelectAt,
+            waitStartedAt = afterHomeMetaAt,
             waitEndedAt = afterCoverWaitAt,
             parseStartedAt = parseStartedAt,
         )
@@ -927,11 +929,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         dlog(
             "popularPerf parse document=${afterDocumentAt - parseStartedAt}ms " +
                 "collect=${afterCollectAt - afterDocumentAt}ms " +
-                "select=${afterSelectAt - afterCollectAt}ms " +
-                "officialCoverRace=${afterCoverRaceAt - afterSelectAt}ms " +
-                "homeMeta=${afterHomeMetaAt - afterCoverRaceAt}ms " +
-                "officialCoverWait=0ms " +
-                "nativeBuild=${afterEntriesAt - afterHomeMetaAt}ms " +
+                "homeMeta=${afterHomeMetaAt - afterCollectAt}ms " +
+                "officialCoverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
+                "nativeBuild=${afterEntriesAt - afterCoverWaitAt}ms " +
                 "mainpathExtraRequests=0 " +
                 "mainpathOfficialDetailRequests=0 " +
                 "warmupTargets=${warmupStats.titleNos} " +
@@ -942,7 +942,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 "backgroundOfficialScheduled=${backgroundOfficialStats.scheduled} " +
                 "backgroundOfficialQueue=false prefetchQueue=false " +
                 "coverMode=$coverMode " +
-                "coverWait=0ms " +
+                "coverWait=${afterCoverWaitAt - afterHomeMetaAt}ms " +
                 "marketingRequests=0 " +
                 "total=${afterEntriesAt - parseStartedAt}ms"
         )
@@ -1281,13 +1281,17 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                 source = "new-page-list",
             )
             val newItems = document.select(".new_works_items")
-            val newPageCoverWaitStats = prepareOfficialNewWorkCoversForNewPageVisibleNoBlank(newItems)
+            val newPageCoverWaitStats = if (isHomeCoverOfficialFirst()) {
+                prepareOfficialNewWorkCoversForNewPageOfficialFirst(newItems)
+            } else {
+                prepareOfficialNewWorkCoversForNewPageVisibleNoBlank(newItems)
+            }
             dlog(
                 "latestUpdatesParse NEW coverWait mode=${getHomeCoverMode()} " +
                     "targets=${newPageCoverWaitStats.titleNos} alreadyReady=${newPageCoverWaitStats.alreadyReady} " +
                     "scheduled=${newPageCoverWaitStats.scheduled} success=${newPageCoverWaitStats.success} " +
                     "missing=${newPageCoverWaitStats.missing} waited=${newPageCoverWaitStats.waitedMs}ms " +
-                    "noVirtual=true noBlank=true marketingRequests=0"
+                    "officialFirst=${isHomeCoverOfficialFirst()} noVirtual=true noBlank=true marketingRequests=0"
             )
             val cachedItems = newItems
                 .mapNotNull { item ->
@@ -1769,9 +1773,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
 
     private fun isDetailCoverRefreshPreserve(): Boolean = getDetailCoverRefreshMode() == DETAIL_COVER_REFRESH_PRESERVE
 
-    // v100.7.7：所有列表模式都禁用虚拟官方封面回退。
-    // 列表 thumbnail_url 只能是站点真实图片 URL；详情最终封面由详情 HTML 覆盖。
-    // 速度优先也先等可见官方封面，避免 __mihon_official_cover 和 blank 两个旧坑复发。
+    // v100.7.34：继续禁止列表阶段生成新的虚拟封面 URL。
+    // 注意：client 里的 OFFICIAL_COVER_VIRTUAL_PATH 拦截器仍要保留，用于处理历史/运行中可能残留的虚拟请求并安全返回真实图片或 404。
+    // 这里控制的是“列表是否生成虚拟 thumbnail_url”，不是“是否拦截虚拟请求”。
     private fun allowVirtualOfficialCoverFallbackInList(): Boolean = false
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -3184,7 +3188,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val normalList = items.count { !it.officialTarget && it.finalThumbnail.isNotBlank() }
         val missing = items.count { it.finalThumbnail.isBlank() }
         dlog(
-            "homeCoverExperimentPlan version=v100.7.32 mode=$mode items=${items.size} emitted=$emittedCount " +
+            "homeCoverExperimentPlan version=v100.7.34 mode=$mode items=${items.size} emitted=$emittedCount " +
                 "officialTargets=$officialTargets normalList=$normalList missing=$missing total=${totalMs}ms " +
                 "urlChange=false orderChange=false warmup=false extraProbe=${getHomeCoverDiagnosticProbeEnable()}"
         )
@@ -3692,22 +3696,6 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
 
-    private fun prepareOfficialNewWorkCoversForPopularFrontFastRace(elements: List<Element>): OfficialCoverWaitStats {
-        val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_FRONT_RACE_COVER_LIMIT)
-        dlog(
-            "officialCoverFrontRacePlan mode=${getHomeCoverMode()} origin=popular-front-race " +
-                "targets=${targets.size} limit=$OFFICIAL_FRONT_RACE_COVER_LIMIT waitMs=0 " +
-                "stage=after-select before-home-meta noBlocking=true " +
-                "titleNos=${targets.joinToString("|") { it.titleNo }}"
-        )
-        return prepareOfficialCoverTargetsForListBlocking(
-            origin = "popular-front-race",
-            targets = targets,
-            waitMs = 0L,
-            limitForLog = OFFICIAL_FRONT_RACE_COVER_LIMIT,
-        )
-    }
-
     private fun prepareOfficialNewWorkCoversForPopularOfficialFirst(elements: List<Element>): OfficialCoverWaitStats {
         val targets = selectedOfficialNewWorkTargets(elements).take(OFFICIAL_FIRST_COVER_LIMIT)
         return prepareOfficialCoverTargetsForListBlocking(
@@ -3789,7 +3777,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             }
         }
         val waitStartedAt = System.currentTimeMillis()
-        val adaptiveMinReady = if (origin == "popular" && getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST) {
+        val adaptiveMinReady = if (
+            origin == "popular" &&
+            getHomeCoverMode() == HOME_COVER_MODE_OFFICIAL_FIRST &&
+            waitMs >= OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS
+        ) {
             minOf(OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_READY, targets.size)
         } else {
             Int.MAX_VALUE
@@ -4209,7 +4201,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             html.append(String(buffer, 0, read, Charsets.UTF_8))
             val cover = verifiedDetailOfficialCoverFromHtmlSnippet(html.toString())
             if (cover.isNotBlank()) {
-                return FastOfficialCoverScanResult(cover, bytesScanned, true, "detail-meta-fast-og-twitter-cdn-sns")
+                return FastOfficialCoverScanResult(cover, bytesScanned, true, "detail-meta-fast-og-twitter-wechat-cdn-sns")
             }
             if (html.contains("</head>", ignoreCase = true)) break
         }
@@ -4218,7 +4210,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             cover,
             bytesScanned,
             cover.isNotBlank(),
-            if (cover.isNotBlank()) "detail-meta-fast-og-twitter-cdn-sns" else "detail-meta-fast-unverified",
+            if (cover.isNotBlank()) "detail-meta-fast-og-twitter-wechat-cdn-sns" else "detail-meta-fast-unverified",
         )
     }
 
@@ -4226,6 +4218,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         if (html.isBlank()) return ""
         var ogImage = ""
         var twitterImage = ""
+        var wechatImage = ""
         Regex("""<meta\b[^>]*>""", RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
             val tag = match.value
             val property = htmlAttributeValue(tag, "property").lowercase(Locale.ROOT)
@@ -4235,15 +4228,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             when {
                 property == "og:image" -> ogImage = buildThumbnailUrl(content, cdnBase)
                 name == "twitter:image" -> twitterImage = buildThumbnailUrl(content, cdnBase)
+                property == "wechat:image" || name == "wechat:image" -> wechatImage = buildThumbnailUrl(content, cdnBase)
             }
         }
-        val normalizedOg = stripImageProcessParams(ogImage)
-        val normalizedTwitter = stripImageProcessParams(twitterImage)
-        return normalizedOg.takeIf {
-            it.isNotBlank() &&
-                it == normalizedTwitter &&
-                isVerifiedDetailOfficialCoverUrl(it)
-        }.orEmpty()
+        return listOf(ogImage, twitterImage, wechatImage)
+            .asSequence()
+            .map { stripImageProcessParams(it) }
+            .firstOrNull { it.isNotBlank() && isVerifiedDetailOfficialCoverUrl(it) }
+            .orEmpty()
     }
 
     private fun htmlAttributeValue(tag: String, name: String): String {
@@ -4350,13 +4342,18 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty(),
             cdnBase,
         )
-        val normalizedOg = stripImageProcessParams(ogImage)
-        val normalizedTwitter = stripImageProcessParams(twitterImage)
-        return normalizedOg.takeIf {
-            it.isNotBlank() &&
-                it == normalizedTwitter &&
-                isVerifiedDetailOfficialCoverUrl(it)
-        }.orEmpty()
+        val wechatImage = buildThumbnailUrl(
+            listOf(
+                document.selectFirst("meta[property=wechat:image]")?.attr("content").orEmpty(),
+                document.selectFirst("meta[name=wechat:image]")?.attr("content").orEmpty(),
+            ).firstOrNull { it.isNotBlank() }.orEmpty(),
+            cdnBase,
+        )
+        return listOf(ogImage, twitterImage, wechatImage)
+            .asSequence()
+            .map { stripImageProcessParams(it) }
+            .firstOrNull { it.isNotBlank() && isVerifiedDetailOfficialCoverUrl(it) }
+            .orEmpty()
     }
 
     private fun rememberVerifiedDetailOfficialCover(titleNo: String?, thumbnailUrl: String): String {
@@ -5267,9 +5264,12 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     }
 
     private fun extractDetailThumbnailUrl(document: org.jsoup.nodes.Document): String {
-        val metaUrl = document.selectFirst("meta[property=og:image]")?.attr("content")
-            ?.ifBlank { document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty() }
-            .orEmpty()
+        val metaUrl = listOf(
+            document.selectFirst("meta[property=og:image]")?.attr("content").orEmpty(),
+            document.selectFirst("meta[name=twitter:image]")?.attr("content").orEmpty(),
+            document.selectFirst("meta[property=wechat:image]")?.attr("content").orEmpty(),
+            document.selectFirst("meta[name=wechat:image]")?.attr("content").orEmpty(),
+        ).firstOrNull { it.isNotBlank() }.orEmpty()
         if (metaUrl.isNotBlank()) return buildThumbnailUrl(metaUrl, cdnBase)
 
         val img = document.selectFirst(
@@ -5438,15 +5438,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         private const val DETAIL_NEW_PAGE_SNAPSHOT_TTL_MS = 2 * 60 * 1000L
         private const val OFFICIAL_NEW_WORK_COVER_DEMAND_PARALLELISM = 4
         private const val OFFICIAL_NEW_WORK_COVER_REQUEST_TIMEOUT_MS = 6_000L
-        private const val OFFICIAL_FRONT_RACE_COVER_LIMIT = 6
-        private const val OFFICIAL_FIRST_COVER_LIMIT = 8
-        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 1_800L
+        private const val OFFICIAL_FIRST_COVER_LIMIT = 4
+        private const val OFFICIAL_FIRST_COVER_WAIT_MS = 600L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_READY = 3
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS = 900L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS = 240L
         private const val OFFICIAL_FIRST_COVER_ADAPTIVE_POLL_MS = 100L
         private const val OFFICIAL_COVER_VISIBLE_OUTCOME_MAX_WINDOW_MS = 2_000L
-        private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 4
+        private const val OFFICIAL_FAST_COVER_WAIT_LIMIT = 2
         private const val OFFICIAL_FAST_COVER_WAIT_MS = 0L
         private const val OFFICIAL_COVER_VIRTUAL_INFLIGHT_WAIT_MS = 3_000L
         private const val OFFICIAL_NEW_WORK_COVER_META_SCAN_MAX_BYTES = 64 * 1024
