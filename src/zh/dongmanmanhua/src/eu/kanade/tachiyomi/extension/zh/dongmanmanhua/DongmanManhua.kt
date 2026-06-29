@@ -914,6 +914,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             .filter { it.title.isNotEmpty() }
             .distinctBy { mangaIdentityDedupKey(titleNoFromUrl(it.url), it.url) }
         val afterEntriesAt = System.currentTimeMillis()
+        logOfficialCoverVisibleOutcome(
+            stats = warmupStats,
+            mode = coverMode,
+            emitAt = afterEntriesAt,
+            waitStartedAt = afterHomeMetaAt,
+            waitEndedAt = afterCoverWaitAt,
+            parseStartedAt = parseStartedAt,
+        )
         if (getHomeCoverDiagnosticLogEnable()) {
             logPopularCoverDiagnostics(diagnosticItems, entries.size, coverMode, afterEntriesAt - parseStartedAt)
         }
@@ -1484,6 +1492,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         @Volatile
         var submittedAt: Long = 0L
 
+        @Volatile
+        var completedAt: Long = 0L
+
         val latch = CountDownLatch(1)
     }
 
@@ -1500,6 +1511,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val success: Int = 0,
         val missing: Int = 0,
         val waitedMs: Long = 0L,
+        val origin: String = "",
+        val targets: List<OfficialNewWorkCoverTarget> = emptyList(),
+        val states: List<OfficialNewWorkCoverFetchState> = emptyList(),
     )
 
     private data class OfficialNewWorkCoverTarget(
@@ -3170,7 +3184,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val normalList = items.count { !it.officialTarget && it.finalThumbnail.isNotBlank() }
         val missing = items.count { it.finalThumbnail.isBlank() }
         dlog(
-            "homeCoverExperimentPlan version=v100.7.26 mode=$mode items=${items.size} emitted=$emittedCount " +
+            "homeCoverExperimentPlan version=v100.7.30 mode=$mode items=${items.size} emitted=$emittedCount " +
                 "officialTargets=$officialTargets normalList=$normalList missing=$missing total=${totalMs}ms " +
                 "urlChange=false orderChange=false warmup=false extraProbe=${getHomeCoverDiagnosticProbeEnable()}"
         )
@@ -3736,7 +3750,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     ): OfficialCoverWaitStats {
         if (targets.isEmpty()) {
             dlog("coverModeProbe mode=${getHomeCoverMode()} origin=$origin targets=0 waited=0ms success=0 missing=0")
-            return OfficialCoverWaitStats()
+            return OfficialCoverWaitStats(origin = origin)
         }
         var alreadyReady = 0
         val states = mutableListOf<OfficialNewWorkCoverFetchState>()
@@ -3797,7 +3811,98 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             success = success,
             missing = missing,
             waitedMs = System.currentTimeMillis() - waitStartedAt,
+            origin = origin,
+            targets = targets,
+            states = states,
         )
+    }
+
+    private fun logOfficialCoverVisibleOutcome(
+        stats: OfficialCoverWaitStats,
+        mode: String,
+        emitAt: Long,
+        waitStartedAt: Long,
+        waitEndedAt: Long,
+        parseStartedAt: Long,
+    ) {
+        if (stats.targets.isEmpty()) return
+        val targetTitleNos = stats.targets.joinToString("|") { it.titleNo }
+        val readyAtEmitTitleNos = stats.targets
+            .filter { isOfficialCoverReadyForTitleNo(it.titleNo) }
+            .map { it.titleNo }
+        val blankAtEmitTitleNos = stats.targets
+            .filterNot { isOfficialCoverReadyForTitleNo(it.titleNo) }
+            .map { it.titleNo }
+        val pendingAtEmit = stats.states.count { !it.completed }
+        val completedAtEmit = stats.states.count { it.completed }
+        dlog(
+            "officialCoverVisibleOutcomeEmit mode=$mode origin=${stats.origin} targets=${stats.targets.size} " +
+                "readyAtEmit=${readyAtEmitTitleNos.size} blankAtEmit=${blankAtEmitTitleNos.size} " +
+                "completedAtEmit=$completedAtEmit pendingAtEmit=$pendingAtEmit failedAtEmit=${stats.states.count { it.failed }} " +
+                "emitAfterWaitMs=${emitAt - waitEndedAt} waitMs=${waitEndedAt - waitStartedAt} " +
+                "totalBeforeEmitMs=${emitAt - parseStartedAt} titleNos=$targetTitleNos " +
+                "readyAtEmitTitleNos=${readyAtEmitTitleNos.joinToString("|")} " +
+                "blankAtEmitTitleNos=${blankAtEmitTitleNos.joinToString("|")}"
+        )
+        Handler(Looper.getMainLooper()).postDelayed({
+            logOfficialCoverVisibleOutcomeDelayed(
+                stats = stats,
+                mode = mode,
+                emitAt = emitAt,
+                waitStartedAt = waitStartedAt,
+                waitEndedAt = waitEndedAt,
+                parseStartedAt = parseStartedAt,
+            )
+        }, OFFICIAL_COVER_VISIBLE_OUTCOME_MAX_WINDOW_MS)
+    }
+
+    private fun logOfficialCoverVisibleOutcomeDelayed(
+        stats: OfficialCoverWaitStats,
+        mode: String,
+        emitAt: Long,
+        waitStartedAt: Long,
+        waitEndedAt: Long,
+        parseStartedAt: Long,
+    ) {
+        val completedWithCoverAfterEmit = stats.states.filter {
+            it.coverUrl.isNotBlank() && it.completedAt > emitAt
+        }
+        fun completedWithin(windowMs: Long): Int = completedWithCoverAfterEmit.count {
+            it.completedAt <= emitAt + windowMs
+        }
+        val stillMissingTitleNos = stats.targets
+            .filterNot { isOfficialCoverReadyForTitleNo(it.titleNo) }
+            .map { it.titleNo }
+        val completedAfterEmitTitleNos = completedWithCoverAfterEmit
+            .sortedBy { it.completedAt }
+            .joinToString("|") { "${it.titleNo}:${it.completedAt - emitAt}ms" }
+        dlog(
+            "officialCoverVisibleOutcome mode=$mode origin=${stats.origin} targets=${stats.targets.size} " +
+                "readyAtEmit=${stats.targets.count { isOfficialCoverReadyAtEmitApprox(it.titleNo, emitAt, stats.states) }} " +
+                "blankAtEmit=${stats.targets.count { !isOfficialCoverReadyAtEmitApprox(it.titleNo, emitAt, stats.states) }} " +
+                "completedAfterEmit300=${completedWithin(300L)} " +
+                "completedAfterEmit600=${completedWithin(600L)} " +
+                "completedAfterEmit1000=${completedWithin(1_000L)} " +
+                "completedAfterEmit2000=${completedWithin(2_000L)} " +
+                "stillMissingAfter2000=${stillMissingTitleNos.size} " +
+                "emitAfterWaitMs=${emitAt - waitEndedAt} waitMs=${waitEndedAt - waitStartedAt} " +
+                "totalBeforeEmitMs=${emitAt - parseStartedAt} " +
+                "completedAfterEmitTitleNos=$completedAfterEmitTitleNos " +
+                "stillMissingTitleNos=${stillMissingTitleNos.joinToString("|")}"
+        )
+    }
+
+    private fun isOfficialCoverReadyForTitleNo(titleNo: String): Boolean {
+        return verifiedDetailOfficialCoverForTitleNo(titleNo).isNotBlank() || trustedRuntimeOfficialCoverForTitleNo(titleNo).isNotBlank()
+    }
+
+    private fun isOfficialCoverReadyAtEmitApprox(
+        titleNo: String,
+        emitAt: Long,
+        states: List<OfficialNewWorkCoverFetchState>,
+    ): Boolean {
+        val state = states.firstOrNull { it.titleNo == titleNo }
+        return state == null || (state.coverUrl.isNotBlank() && state.completedAt in 1L..emitAt)
     }
 
     // v100.7.23：删掉首页官方封面的后台/预取/旧等待外壳。
@@ -3997,6 +4102,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             synchronized(state) {
                 state.failed = true
                 state.failureReason = "staleClearEpoch:${state.clearEpoch}:$homeCoverRuntimeClearEpoch"
+                state.completedAt = System.currentTimeMillis()
                 state.completed = true
                 state.running = false
             }
@@ -4065,6 +4171,7 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         } finally {
             synchronized(state) {
                 state.failed = failed
+                state.completedAt = System.currentTimeMillis()
                 state.completed = true
                 state.running = false
             }
