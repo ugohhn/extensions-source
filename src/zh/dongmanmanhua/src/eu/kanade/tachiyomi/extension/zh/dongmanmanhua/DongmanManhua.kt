@@ -1481,6 +1481,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         @Volatile
         var fetchKind: String = "demand-inflight"
 
+        @Volatile
+        var submittedAt: Long = 0L
+
         val latch = CountDownLatch(1)
     }
 
@@ -3737,9 +3740,20 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         }
         var alreadyReady = 0
         val states = mutableListOf<OfficialNewWorkCoverFetchState>()
+        dlog(
+            "officialCoverBatchPlan mode=${getHomeCoverMode()} origin=$origin targets=${targets.size} waitMs=$waitMs " +
+                "limit=$limitForLog clearEpoch=$homeCoverRuntimeClearEpoch targetTitleNos=${targets.joinToString("|") { it.titleNo }} " +
+                "targetDetailUrls=${targets.joinToString("|") { it.detailUrl }}"
+        )
         targets.forEach { target ->
-            if (verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank() || trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank()) {
+            val verifiedReady = verifiedDetailOfficialCoverForTitleNo(target.titleNo).isNotBlank()
+            val trustedReady = trustedRuntimeOfficialCoverForTitleNo(target.titleNo).isNotBlank()
+            if (verifiedReady || trustedReady) {
                 alreadyReady += 1
+                dlog(
+                    "officialCoverTargetReady titleNo=${target.titleNo} origin=$origin verifiedReady=$verifiedReady trustedReady=$trustedReady " +
+                        "detailUrl=${target.detailUrl} mode=${getHomeCoverMode()}"
+                )
             } else {
                 ensureOfficialNewWorkCoverFetchStarted(target.titleNo, target.detailUrl, OfficialCoverFetchPriority.VISIBLE)?.let { states.add(it) }
             }
@@ -3799,6 +3813,14 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt = System.currentTimeMillis()
         var lastReady = initialReady + states.count { it.completed && it.coverUrl.isNotBlank() }
         var lastProgressAt = startedAt
+        var stopReason = "timeout"
+        dlog(
+            "officialCoverWaitStart mode=${getHomeCoverMode()} states=${states.size} initialReady=$initialReady " +
+                "readyAtStart=$lastReady waitLimitMs=$timeoutMs adaptiveMinReady=$adaptiveMinReady " +
+                "adaptiveMinWaitMs=$OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS " +
+                "adaptiveQuietMs=$OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS " +
+                "titleNos=${states.joinToString("|") { it.titleNo }}"
+        )
         while (true) {
             val now = System.currentTimeMillis()
             val elapsed = now - startedAt
@@ -3807,19 +3829,27 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             if (ready > lastReady) {
                 lastReady = ready
                 lastProgressAt = now
+                dlog(
+                    "officialCoverWaitProgress mode=${getHomeCoverMode()} ready=$ready pending=${states.count { !it.completed }} " +
+                        "waited=${elapsed}ms progressedTitleNos=${states.filter { it.completed && it.coverUrl.isNotBlank() }.joinToString("|") { it.titleNo }}"
+                )
             }
             val pending = states.count { !it.completed }
-            if (pending <= 0) break
+            if (pending <= 0) {
+                stopReason = "all-completed"
+                break
+            }
             if (
                 adaptiveMinReady != Int.MAX_VALUE &&
                 elapsed >= OFFICIAL_FIRST_COVER_ADAPTIVE_MIN_WAIT_MS &&
                 ready >= adaptiveMinReady &&
                 now - lastProgressAt >= OFFICIAL_FIRST_COVER_ADAPTIVE_QUIET_MS
             ) {
+                stopReason = "ready-and-quiet"
                 dlog(
                     "officialCoverAdaptiveWaitStop mode=${getHomeCoverMode()} ready=$ready pending=$pending " +
                         "waited=${elapsed}ms waitLimitMs=$timeoutMs minReady=$adaptiveMinReady " +
-                        "quietMs=${now - lastProgressAt} reason=ready-and-quiet"
+                        "quietMs=${now - lastProgressAt} reason=$stopReason"
                 )
                 break
             }
@@ -3827,7 +3857,13 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             val next = states.firstOrNull { !it.completed } ?: break
             runCatching { next.latch.await(sliceMs, TimeUnit.MILLISECONDS) }
         }
-        return System.currentTimeMillis() - startedAt
+        val waitedMs = System.currentTimeMillis() - startedAt
+        dlog(
+            "officialCoverWaitDone mode=${getHomeCoverMode()} waited=${waitedMs}ms reason=$stopReason " +
+                "ready=$lastReady pending=${states.count { !it.completed }} failed=${states.count { it.failed }} " +
+                "completed=${states.count { it.completed }} titleNos=${states.joinToString("|") { it.titleNo }}"
+        )
+        return waitedMs
     }
 
     private fun ensureOfficialNewWorkCoverFetchStarted(
@@ -3837,17 +3873,37 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
     ): OfficialNewWorkCoverFetchState? {
         val key = titleNo.trim()
         if (key.isBlank()) return null
-        if (verifiedDetailOfficialCoverForTitleNo(key).isNotBlank()) return null
+        val verifiedCover = verifiedDetailOfficialCoverForTitleNo(key)
+        if (verifiedCover.isNotBlank()) {
+            dlog(
+                "officialCoverFetchEnsureSkip titleNo=$key reason=verified-ready priority=$priority " +
+                    "mode=${getHomeCoverMode()} coverHost=${hostOfUrl(verifiedCover)}"
+            )
+            return null
+        }
         val now = System.currentTimeMillis()
+        var stateCreated = false
         val state = synchronized(officialNewWorkCoverFetchStates) {
             pruneOfficialNewWorkCoverFetchStatesLocked(now)
             val existing = officialNewWorkCoverFetchStates[key]
-            if (existing != null && (!existing.completed || (!existing.failed && now - existing.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS))) {
-                existing
+            val existingPending = existing?.completed == false
+            val existingFreshSuccess = existing?.let {
+                it.completed && !it.failed && now - it.createdAt <= OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS
+            } == true
+            val reusableExisting = if (existingPending || existingFreshSuccess) existing else null
+            if (reusableExisting != null) {
+                reusableExisting
             } else {
+                stateCreated = true
                 OfficialNewWorkCoverFetchState(key, detailUrl, clearEpoch = homeCoverRuntimeClearEpoch).also { officialNewWorkCoverFetchStates[key] = it }
             }
         }
+        dlog(
+            "officialCoverFetchEnsure titleNo=$key action=${if (stateCreated) "create" else "reuse"} priority=$priority " +
+                "mode=${getHomeCoverMode()} epoch=${state.clearEpoch} currentEpoch=$homeCoverRuntimeClearEpoch " +
+                "age=${now - state.createdAt}ms completed=${state.completed} failed=${state.failed} running=${state.running} " +
+                "submitted=${state.submitted} fetchKind=${state.fetchKind} detailUrl=${state.detailUrl}"
+        )
         submitOfficialNewWorkCoverFetch(state, priority)
         return state
     }
@@ -3856,29 +3912,66 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         state: OfficialNewWorkCoverFetchState,
         priority: OfficialCoverFetchPriority,
     ) {
+        var shouldSubmit = false
+        var skipReason = "already-submitted"
         synchronized(state) {
-            if (state.completed) return
-            if (!state.demandSubmitted && !state.running) {
+            if (state.completed) {
+                skipReason = "completed"
+            } else if (state.demandSubmitted || state.running) {
+                skipReason = "already-running-or-submitted"
+            } else {
                 state.demandSubmitted = true
                 state.submitted = true
+                state.submittedAt = System.currentTimeMillis()
                 state.fetchKind = if (priority == OfficialCoverFetchPriority.VISIBLE) "visible-inflight" else "demand-inflight"
-                officialNewWorkCoverDemandExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
+                shouldSubmit = true
             }
+        }
+        if (shouldSubmit) {
+            dlog(
+                "officialCoverFetchSubmit titleNo=${state.titleNo} fetchKind=${state.fetchKind} priority=$priority " +
+                    "mode=${getHomeCoverMode()} epoch=${state.clearEpoch} currentEpoch=$homeCoverRuntimeClearEpoch " +
+                    "age=${System.currentTimeMillis() - state.createdAt}ms detailUrl=${state.detailUrl}"
+            )
+            officialNewWorkCoverDemandExecutor.execute { fetchOfficialNewWorkCoverFromDetail(state.titleNo, state) }
+        } else {
+            dlog(
+                "officialCoverFetchSubmitSkip titleNo=${state.titleNo} reason=$skipReason priority=$priority " +
+                    "mode=${getHomeCoverMode()} completed=${state.completed} failed=${state.failed} running=${state.running} " +
+                    "submitted=${state.submitted} fetchKind=${state.fetchKind} age=${System.currentTimeMillis() - state.createdAt}ms"
+            )
         }
     }
 
     private fun pruneOfficialNewWorkCoverFetchStatesLocked(now: Long) {
+        var prunedStaleEpoch = 0
+        var prunedExpired = 0
+        var prunedOverflow = 0
         val iterator = officialNewWorkCoverFetchStates.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
             val state = entry.value
-            if (state.clearEpoch != homeCoverRuntimeClearEpoch || state.completed && now - state.createdAt > OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS) {
+            val staleEpoch = state.clearEpoch != homeCoverRuntimeClearEpoch
+            val expiredCompleted = state.completed && (now - state.createdAt > OFFICIAL_NEW_WORK_COVER_FETCH_RETRY_TTL_MS)
+            if (staleEpoch || expiredCompleted) {
+                if (staleEpoch) {
+                    prunedStaleEpoch += 1
+                } else {
+                    prunedExpired += 1
+                }
                 iterator.remove()
             }
         }
         while (officialNewWorkCoverFetchStates.size > OFFICIAL_NEW_WORK_COVER_FETCH_MAX_STATES) {
             val firstKey = officialNewWorkCoverFetchStates.keys.firstOrNull() ?: break
             officialNewWorkCoverFetchStates.remove(firstKey)
+            prunedOverflow += 1
+        }
+        if (prunedStaleEpoch > 0 || prunedExpired > 0 || prunedOverflow > 0) {
+            dlog(
+                "officialCoverFetchStatePruned staleEpoch=$prunedStaleEpoch expired=$prunedExpired overflow=$prunedOverflow " +
+                    "remaining=${officialNewWorkCoverFetchStates.size} epoch=$homeCoverRuntimeClearEpoch"
+            )
         }
     }
 
@@ -3891,6 +3984,11 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
         val startedAt = System.currentTimeMillis()
         var failed = false
         val requestUrl = state.detailUrl.ifBlank { "$baseUrl/episodeList?titleNo=$titleNo" }
+        dlog(
+            "officialCoverFetchStart titleNo=$titleNo fetchKind=$fetchKind mode=${getHomeCoverMode()} " +
+                "epoch=${state.clearEpoch} currentEpoch=$homeCoverRuntimeClearEpoch queued=${startedAt - state.submittedAt}ms " +
+                "age=${startedAt - state.createdAt}ms requestUrl=$requestUrl directDetail=${!requestUrl.contains("/episodeList")}"
+        )
         if (state.clearEpoch != homeCoverRuntimeClearEpoch) {
             dlog(
                 "officialCoverFetchResultDiscarded reason=stale-clear-epoch titleNo=$titleNo " +
@@ -3932,7 +4030,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     state.failureReason = if (remembered.isNotBlank()) "" else "unverified"
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=${remembered.isNotBlank()} " +
-                            "source=${scan.source} fetchKind=$fetchKind code=${response.code} requestedUrl=$requestUrl " +
+                            "source=${scan.source} fetchKind=$fetchKind code=${response.code} epoch=${state.clearEpoch} " +
+                            "queued=${startedAt - state.submittedAt}ms age=${scanEndedAt - state.createdAt}ms requestedUrl=$requestUrl " +
                             "finalUrl=${response.request.url} ttfb=${responseAt - startedAt}ms " +
                             "readMeta=${scanEndedAt - responseAt}ms elapsed=${scanEndedAt - startedAt}ms " +
                             "bytesScanned=${scan.bytesScanned} earlyClose=${scan.earlyClose} " +
@@ -3945,7 +4044,8 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
                     state.failureReason = "noMeta:${scan.source.ifBlank { "detail-meta-fast-unverified" }}"
                     dlog(
                         "officialNewWorkCoverFetchResult titleNo=$titleNo coverPresent=false " +
-                            "source=${scan.source.ifBlank { "detail-meta-fast-unverified" }} code=${response.code} " +
+                            "source=${scan.source.ifBlank { "detail-meta-fast-unverified" }} fetchKind=$fetchKind code=${response.code} " +
+                            "epoch=${state.clearEpoch} queued=${startedAt - state.submittedAt}ms age=${scanEndedAt - state.createdAt}ms " +
                             "requestedUrl=$requestUrl finalUrl=${response.request.url} " +
                             "ttfb=${responseAt - startedAt}ms readMeta=${scanEndedAt - responseAt}ms " +
                             "elapsed=${scanEndedAt - startedAt}ms bytesScanned=${scan.bytesScanned} " +
@@ -3957,8 +4057,9 @@ class DongmanManhua : HttpSource(), ConfigurableSource {
             failed = true
             state.failureReason = "networkError:${e.javaClass.simpleName}"
             wlog(
-                "officialNewWorkCoverFetchFailed titleNo=$titleNo " +
-                    "requestedUrl=$requestUrl elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
+                "officialNewWorkCoverFetchFailed titleNo=$titleNo fetchKind=$fetchKind epoch=${state.clearEpoch} " +
+                    "queued=${startedAt - state.submittedAt}ms requestedUrl=$requestUrl " +
+                    "elapsed=${System.currentTimeMillis() - startedAt}ms error=${e.javaClass.simpleName}",
                 e,
             )
         } finally {
